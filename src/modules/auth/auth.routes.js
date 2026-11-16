@@ -1,18 +1,20 @@
 /**
  * @file auth.routes.js
- * @description Enrutador para las operaciones de autenticación (registro y login).
+ * @description Enrutador para las operaciones de autenticación y gestión de accesos maestros.
  * @location /trustlink-backend/src/modules/auth/auth.routes.js
  */
-
 const { Router } = require('express');
-const { register, login } = require('./auth.controller');
-
+const { register, login, getPrivilegedUsers } = require('./auth.controller');
+const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
 const router = Router();
 
-// Endpoint de Registro: POST /api/v1/auth/register
+// Ruta de Registro Público: POST /api/v1/auth/register
 router.post('/register', register);
 
-// Endpoint de Login: POST /api/v1/auth/login
+// Ruta de Login: POST /api/v1/auth/login
 router.post('/login', login);
+
+// Ruta protegida para listar usuarios con privilegios (Exclusivo Superadmin): GET /api/v1/auth/users/privileged
+router.get('/users/privileged', verifyToken, verifyRole(['superadmin']), getPrivilegedUsers);
 
 module.exports = router;
