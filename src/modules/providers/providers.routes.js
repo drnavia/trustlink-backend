@@ -27,4 +27,5 @@ router.get('/all', verifyToken, verifyRole(['superadmin']), listAllProvidersForO
 router.patch('/compliance', verifyToken, verifyRole(['superadmin']), updateComplianceStatus);
 router.get('/directory', verifyToken, verifyRole(['owner', 'family', 'admin', 'superadmin']), listVerifiedProviders);
 
+// Exports
 module.exports = router;

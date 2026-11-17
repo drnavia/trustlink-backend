@@ -288,6 +288,7 @@ const listVerifiedProviders = async (req, res) => {
   }
 };
 
+// Exports
 module.exports = {
   updateProviderProfile,
   editProviderProfile,
