@@ -1,7 +1,7 @@
 /**
  * @file providers.controller.js
  * @description Lógica de negocio completa para la gestión de prestadores, subida de documentación
- * de compliance (antecedentes penales, seguros), asociación de vehículos y aprobación por parte de Ops TrustLink.
+ * de compliance, asociación de vehículos y auditoría global por Ops TrustLink.
  * @location /trustlink-backend/src/modules/providers/providers.controller.js
  */
 const db = require('../../config/db');
@@ -88,26 +88,30 @@ const addVehicle = async (req, res) => {
 };
 
 /**
- * Lista todos los prestadores con estado pendiente de compliance para Ops TrustLink.
+ * Lista TODOS los prestadores del sistema (partiendo de users con rol 'provider' y LEFT JOIN a providers)
+ * para que Ops TrustLink muestre incluso a quienes aún no han completado su perfil.
  * Roles permitidos: 'superadmin'
  */
-const listPendingProviders = async (req, res) => {
+const listAllProvidersForOps = async (req, res) => {
   try {
     const query = `
       SELECT 
+        u.id AS user_id,
         p.id AS provider_id,
         u.first_name,
         u.last_name,
         u.dni,
         u.email,
-        p.specialty,
+        COALESCE(p.specialty, 'Sin especificar (Perfil Incompleto)') AS specialty,
         p.criminal_record_url,
         p.insurance_policy_url,
-        p.status
-      FROM providers p
-      JOIN users u ON p.user_id = u.id
-      WHERE p.status = 'pending'
-      ORDER BY p.created_at DESC;
+        COALESCE(p.status::text, 'sin_perfil') AS status,
+        COALESCE(p.rating_avg, 0.00) AS rating_avg,
+        COALESCE(p.created_at, u.created_at) AS created_at
+      FROM users u
+      LEFT JOIN providers p ON p.user_id = u.id
+      WHERE u.role = 'provider'
+      ORDER BY u.created_at DESC;
     `;
     const result = await db.query(query);
 
@@ -116,21 +120,41 @@ const listPendingProviders = async (req, res) => {
       providers: result.rows
     });
   } catch (error) {
-    console.error('Error al listar prestadores pendientes:', error);
-    return res.status(500).json({ error: 'Error interno del servidor al consultar prestadores pendientes.' });
+    console.error('Error al listar todos los prestadores para Ops:', error);
+    return res.status(500).json({ error: 'Error interno del servidor al consultar prestadores.' });
   }
 };
 
 /**
- * Actualiza el estado de compliance de un prestador (Aprobado o Rechazado).
+ * Actualiza el estado de compliance de un prestador. Si el usuario aún no tenía registro
+ * en la tabla 'providers' (estado 'sin_perfil'), se crea automáticamente al interactuar.
  * Roles permitidos: 'superadmin'
  */
 const updateComplianceStatus = async (req, res) => {
   try {
-    const { provider_id, status } = req.body;
+    const { provider_id, user_id, status } = req.body;
 
-    if (!provider_id || !['approved', 'rejected', 'pending'].includes(status)) {
-      return res.status(400).json({ error: 'Parámetros inválidos. Especifique un provider_id y un estado válido (approved, rejected, pending).' });
+    if (!['approved', 'rejected', 'pending'].includes(status)) {
+      return res.status(400).json({ error: 'Estado de compliance inválido.' });
+    }
+
+    let targetProviderId = provider_id;
+
+    if (!targetProviderId && user_id) {
+      const existing = await db.query('SELECT id FROM providers WHERE user_id = $1', [user_id]);
+      if (existing.rows.length > 0) {
+        targetProviderId = existing.rows[0].id;
+      } else {
+        const newProv = await db.query(
+          `INSERT INTO providers (user_id, specialty, status) VALUES ($1, 'Servicios Generales', $2) RETURNING id`,
+          [user_id, status]
+        );
+        targetProviderId = newProv.rows[0].id;
+      }
+    }
+
+    if (!targetProviderId) {
+      return res.status(400).json({ error: 'Debe especificar un provider_id o user_id válido.' });
     }
 
     const updateQuery = `
@@ -139,7 +163,7 @@ const updateComplianceStatus = async (req, res) => {
       WHERE id = $2
       RETURNING id, user_id, specialty, status;
     `;
-    const result = await db.query(updateQuery, [status, provider_id]);
+    const result = await db.query(updateQuery, [status, targetProviderId]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Prestador no encontrado.' });
@@ -160,7 +184,6 @@ const updateComplianceStatus = async (req, res) => {
  */
 const listVerifiedProviders = async (req, res) => {
   try {
-    const countryId = req.user.countryId || 1;
     const query = `
       SELECT 
         p.id AS provider_id,
@@ -190,7 +213,7 @@ const listVerifiedProviders = async (req, res) => {
 module.exports = {
   updateProviderProfile,
   addVehicle,
-  listPendingProviders,
+  listAllProvidersForOps,
   updateComplianceStatus,
   listVerifiedProviders
 };

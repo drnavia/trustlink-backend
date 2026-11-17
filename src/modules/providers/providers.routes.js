@@ -7,7 +7,7 @@ const { Router } = require('express');
 const {
   updateProviderProfile,
   addVehicle,
-  listPendingProviders,
+  listAllProvidersForOps,
   updateComplianceStatus,
   listVerifiedProviders
 } = require('./providers.controller');
@@ -18,8 +18,8 @@ const router = Router();
 router.post('/profile', verifyToken, verifyRole(['provider']), updateProviderProfile);
 router.post('/vehicle', verifyToken, verifyRole(['provider']), addVehicle);
 
-// Endpoints exclusivos para Ops TrustLink / Superadmin (Compliance de prestadores)
-router.get('/pending', verifyToken, verifyRole(['superadmin']), listPendingProviders);
+// Endpoints exclusivos para Ops TrustLink / Superadmin (Auditoría global de todos los prestadores)
+router.get('/all', verifyToken, verifyRole(['superadmin']), listAllProvidersForOps);
 router.patch('/compliance', verifyToken, verifyRole(['superadmin']), updateComplianceStatus);
 
 // Directorio para residentes
