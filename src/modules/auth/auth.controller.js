@@ -1,35 +1,28 @@
 /**
  * @file auth.controller.js
- * @description Lógica de negocio para autenticación, registro y gestión de usuarios privilegiados (superadmin/admin).
+ * @description Lógica de negocio para autenticación, registro, listado y actualización completa de usuarios privilegiados.
  * @location /trustlink-backend/src/modules/auth/auth.controller.js
  */
 const db = require('../../config/db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
-/**
- * Registra un nuevo usuario en el sistema.
- */
 const register = async (req, res) => {
   try {
     const { country_id, role, first_name, last_name, dni, email, password, phone, fraction_number, lot_number } = req.body;
 
-    // 1. Validar campos obligatorios
     if (!role || !first_name || !last_name || !dni || !email || !password) {
       return res.status(400).json({ error: 'Faltan campos obligatorios para el registro.' });
     }
 
-    // 2. Verificar si el usuario ya existe por email o DNI
     const userExists = await db.query('SELECT id FROM users WHERE email = $1 OR dni = $2', [email, dni]);
     if (userExists.rows.length > 0) {
       return res.status(400).json({ error: 'Ya existe un usuario registrado con ese correo electrónico o DNI.' });
     }
 
-    // 3. Encriptar contraseña
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    // 4. Insertar nuevo usuario en la base de datos
     const query = `
       INSERT INTO users (country_id, role, first_name, last_name, dni, email, password_hash, phone, fraction_number, lot_number)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -60,9 +53,6 @@ const register = async (req, res) => {
   }
 };
 
-/**
- * Autentica al usuario y genera un token JWT.
- */
 const login = async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -109,9 +99,6 @@ const login = async (req, res) => {
   }
 };
 
-/**
- * Obtiene la lista de cuentas con privilegios (superadmin y admin).
- */
 const getPrivilegedUsers = async (req, res) => {
   try {
     const query = `
@@ -132,8 +119,53 @@ const getPrivilegedUsers = async (req, res) => {
   }
 };
 
+const updatePrivilegedUser = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { first_name, last_name, email, dni, password, role, is_active } = req.body;
+
+    let passwordHashQuery = '';
+    let values = [first_name, last_name, email, dni, role, is_active, id];
+
+    if (password && password.trim() !== '') {
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(password, salt);
+      passwordHashQuery = ', password_hash = $8';
+      values.push(hashedPassword);
+    }
+
+    const query = `
+      UPDATE users
+      SET first_name = COALESCE($1, first_name),
+          last_name = COALESCE($2, last_name),
+          email = COALESCE($3, email),
+          dni = COALESCE($4, dni),
+          role = COALESCE($5, role),
+          is_active = COALESCE($6, is_active)
+          ${passwordHashQuery}
+      WHERE id = $7 AND role IN ('superadmin', 'admin')
+      RETURNING id, first_name, last_name, email, dni, role, is_active, created_at;
+    `;
+
+    const result = await db.query(query, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario privilegiado no encontrado.' });
+    }
+
+    return res.status(200).json({
+      message: 'Usuario actualizado exitosamente.',
+      user: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Error al actualizar usuario privilegiado:', error);
+    return res.status(500).json({ error: 'Error interno del servidor al actualizar el usuario.' });
+  }
+};
+
 module.exports = {
   register,
   login,
-  getPrivilegedUsers
+  getPrivilegedUsers,
+  updatePrivilegedUser
 };

@@ -1,10 +1,10 @@
 /**
  * @file auth.routes.js
- * @description Enrutador para las operaciones de autenticación y gestión de accesos maestros.
+ * @description Enrutador para operaciones de autenticación y gestión maestra de accesos.
  * @location /trustlink-backend/src/modules/auth/auth.routes.js
  */
 const { Router } = require('express');
-const { register, login, getPrivilegedUsers } = require('./auth.controller');
+const { register, login, getPrivilegedUsers, updatePrivilegedUser } = require('./auth.controller');
 const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
 const router = Router();
 
@@ -16,5 +16,7 @@ router.post('/login', login);
 
 // Ruta protegida para listar usuarios con privilegios (Exclusivo Superadmin): GET /api/v1/auth/users/privileged
 router.get('/users/privileged', verifyToken, verifyRole(['superadmin']), getPrivilegedUsers);
+
+router.patch('/users/privileged/:id', verifyToken, verifyRole(['superadmin']), updatePrivilegedUser);
 
 module.exports = router;

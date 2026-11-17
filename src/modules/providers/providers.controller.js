@@ -4,7 +4,6 @@
  * de compliance (antecedentes penales, seguros), asociación de vehículos y aprobación por parte de la administración.
  * @location /trustlink-backend/src/modules/providers/providers.controller.js
  */
-
 const db = require('../../config/db');
 
 /**
@@ -22,15 +21,14 @@ const updateProviderProfile = async (req, res) => {
 
     // 1. Verificar si ya existe un perfil de prestador para este usuario
     const existingProvider = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
-
     let providerResult;
 
     if (existingProvider.rows.length > 0) {
       // Actualizar perfil existente y ponerlo en 'pending' nuevamente si cambia documentos críticos
       const updateQuery = `
-        UPDATE providers 
-        SET specialty = $1, 
-            criminal_record_url = COALESCE($2, criminal_record_url), 
+        UPDATE providers
+        SET specialty = $1,
+            criminal_record_url = COALESCE($2, criminal_record_url),
             insurance_policy_url = COALESCE($3, insurance_policy_url),
             status = 'pending'
         WHERE user_id = $4
@@ -51,7 +49,6 @@ const updateProviderProfile = async (req, res) => {
       message: 'Perfil de compliance del prestador actualizado con éxito. Su estado actual es pendiente de aprobación.',
       provider: providerResult.rows[0]
     });
-
   } catch (error) {
     console.error('Error al actualizar perfil de prestador:', error);
     return res.status(500).json({ error: 'Error interno del servidor al actualizar el perfil.' });
@@ -71,46 +68,34 @@ const addVehicle = async (req, res) => {
       return res.status(400).json({ error: 'Faltan datos obligatorios del vehículo (marca, modelo, color, patente).' });
     }
 
-    // 1. Obtener el id del prestador asociado al usuario
-    const providerQuery = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
-    if (providerQuery.rows.length === 0) {
-      return res.status(404).json({ error: 'Debe completar su perfil de prestador antes de registrar vehículos.' });
+    // Obtener el ID del prestador asociado al usuario
+    const providerRes = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
+    if (providerRes.rows.length === 0) {
+      return res.status(404).json({ error: 'El usuario no tiene un perfil de prestador registrado.' });
     }
-    const providerId = providerQuery.rows.id;
+    const providerId = providerRes.rows[0].id;
 
-    // 2. Insertar el vehículo
-    const vehicleQuery = `
+    const insertQuery = `
       INSERT INTO provider_vehicles (provider_id, brand, model, color, plate, vehicle_insurance_url)
       VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING id, brand, model, color, plate, vehicle_insurance_url, created_at;
     `;
-
-    const newVehicle = await db.query(vehicleQuery, [
-      providerId, 
-      brand, 
-      model, 
-      color, 
-      plate.toUpperCase(), 
-      vehicle_insurance_url || null
-    ]);
+    const values = [providerId, brand, model, color, plate, vehicle_insurance_url || null];
+    const newVehicle = await db.query(insertQuery, values);
 
     return res.status(201).json({
-      message: 'Vehículo asociado exitosamente al prestador.',
+      message: 'Vehículo registrado y asociado exitosamente.',
       vehicle: newVehicle.rows[0]
     });
-
   } catch (error) {
-    if (error.code === '23505') { // Violación de unicidad en patente
-      return res.status(400).json({ error: 'La patente ingresada ya se encuentra registrada en el sistema.' });
-    }
     console.error('Error al agregar vehículo:', error);
     return res.status(500).json({ error: 'Error interno del servidor al registrar el vehículo.' });
   }
 };
 
 /**
- * Permite a un administrador cambiar el estado de compliance de un prestador ('approved' o 'rejected').
- * Roles permitidos: 'admin', 'superadmin'
+ * Actualiza el estado de compliance de un prestador (Aprobado o Rechazado).
+ * Roles permitidos: 'superadmin' (Operaciones Centrales TrustLink)
  */
 const updateComplianceStatus = async (req, res) => {
   try {
@@ -121,12 +106,11 @@ const updateComplianceStatus = async (req, res) => {
     }
 
     const updateQuery = `
-      UPDATE providers 
-      SET status = $1 
-      WHERE id = $2 
+      UPDATE providers
+      SET status = $1
+      WHERE id = $2
       RETURNING id, user_id, specialty, status;
     `;
-
     const result = await db.query(updateQuery, [status, provider_id]);
 
     if (result.rows.length === 0) {
@@ -137,7 +121,6 @@ const updateComplianceStatus = async (req, res) => {
       message: `El estado de compliance del prestador fue actualizado a: ${status}`,
       provider: result.rows[0]
     });
-
   } catch (error) {
     console.error('Error al actualizar compliance:', error);
     return res.status(500).json({ error: 'Error interno del servidor al procesar la solicitud.' });
@@ -150,8 +133,7 @@ const updateComplianceStatus = async (req, res) => {
  */
 const listVerifiedProviders = async (req, res) => {
   try {
-    const countryId = req.user.countryId;
-
+    const countryId = req.user.countryId || 1;
     const query = `
       SELECT 
         p.id AS provider_id,
@@ -166,16 +148,14 @@ const listVerifiedProviders = async (req, res) => {
       JOIN users u ON p.user_id = u.id
       WHERE u.country_id = $1 AND p.status = 'approved';
     `;
-
     const result = await db.query(query, [countryId]);
 
     return res.status(200).json({
       count: result.rows.length,
       providers: result.rows
     });
-
   } catch (error) {
-    console.error('Error al listar prestadores:', error);
+    console.error('Error al listar prestadores verificados:', error);
     return res.status(500).json({ error: 'Error interno del servidor al obtener el directorio.' });
   }
 };
