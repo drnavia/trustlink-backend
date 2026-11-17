@@ -1,7 +1,7 @@
 /**
  * @file providers.controller.js
  * @description Lógica de negocio completa para la gestión de prestadores, subida de documentación
- * de compliance, asociación de vehículos y auditoría global por Ops TrustLink.
+ * de compliance (antecedentes penales, seguros), asociación de vehículos y auditoría global por Ops TrustLink.
  * @location /trustlink-backend/src/modules/providers/providers.controller.js
  */
 const db = require('../../config/db');
@@ -180,6 +180,39 @@ const updateComplianceStatus = async (req, res) => {
 };
 
 /**
+ * Obtiene el perfil de compliance y los vehículos asociados del prestador logueado.
+ */
+const getMyProviderProfile = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const providerRes = await db.query(
+      `SELECT id, specialty, criminal_record_url, insurance_policy_url, status, rating_avg FROM providers WHERE user_id = $1`,
+      [userId]
+    );
+
+    let provider = providerRes.rows[0] || null;
+    let vehicles = [];
+
+    if (provider) {
+      const vehiclesRes = await db.query(
+        `SELECT id, brand, model, color, plate, vehicle_insurance_url FROM provider_vehicles WHERE provider_id = $1`,
+        [provider.id]
+      );
+      vehicles = vehiclesRes.rows;
+    }
+
+    return res.status(200).json({
+      provider,
+      vehicles
+    });
+  } catch (error) {
+    console.error('Error al obtener perfil del prestador:', error);
+    return res.status(500).json({ error: 'Error interno del servidor.' });
+  }
+};
+
+/**
  * Lista todos los prestadores aprobados dentro del country para el directorio del residente.
  */
 const listVerifiedProviders = async (req, res) => {
@@ -215,5 +248,6 @@ module.exports = {
   addVehicle,
   listAllProvidersForOps,
   updateComplianceStatus,
+  getMyProviderProfile,
   listVerifiedProviders
 };

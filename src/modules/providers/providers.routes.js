@@ -9,16 +9,18 @@ const {
   addVehicle,
   listAllProvidersForOps,
   updateComplianceStatus,
+  getMyProviderProfile,
   listVerifiedProviders
 } = require('./providers.controller');
 const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
 const router = Router();
 
 // Perfil y vehículos del prestador
+router.get('/me', verifyToken, verifyRole(['provider', 'superadmin']), getMyProviderProfile);
 router.post('/profile', verifyToken, verifyRole(['provider']), updateProviderProfile);
 router.post('/vehicle', verifyToken, verifyRole(['provider']), addVehicle);
 
-// Endpoints exclusivos para Ops TrustLink / Superadmin (Auditoría global de todos los prestadores)
+// Endpoints exclusivos para Ops TrustLink / Superadmin
 router.get('/all', verifyToken, verifyRole(['superadmin']), listAllProvidersForOps);
 router.patch('/compliance', verifyToken, verifyRole(['superadmin']), updateComplianceStatus);
 
