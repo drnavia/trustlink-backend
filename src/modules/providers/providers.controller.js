@@ -1,14 +1,13 @@
 /**
  * @file providers.controller.js
  * @description Lógica de negocio completa para la gestión de prestadores, subida de documentación
- * de compliance (antecedentes penales, seguros), asociación de vehículos y aprobación por parte de la administración.
+ * de compliance (antecedentes penales, seguros), asociación de vehículos y aprobación por parte de Ops TrustLink.
  * @location /trustlink-backend/src/modules/providers/providers.controller.js
  */
 const db = require('../../config/db');
 
 /**
  * Registra o actualiza la información de compliance y especialidad de un usuario con rol 'provider'.
- * Roles permitidos: 'provider'
  */
 const updateProviderProfile = async (req, res) => {
   try {
@@ -19,12 +18,10 @@ const updateProviderProfile = async (req, res) => {
       return res.status(400).json({ error: 'La especialidad del prestador es obligatoria.' });
     }
 
-    // 1. Verificar si ya existe un perfil de prestador para este usuario
     const existingProvider = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
     let providerResult;
 
     if (existingProvider.rows.length > 0) {
-      // Actualizar perfil existente y ponerlo en 'pending' nuevamente si cambia documentos críticos
       const updateQuery = `
         UPDATE providers
         SET specialty = $1,
@@ -36,7 +33,6 @@ const updateProviderProfile = async (req, res) => {
       `;
       providerResult = await db.query(updateQuery, [specialty, criminal_record_url || null, insurance_policy_url || null, userId]);
     } else {
-      // Crear nuevo perfil de prestador
       const insertQuery = `
         INSERT INTO providers (user_id, specialty, criminal_record_url, insurance_policy_url, status)
         VALUES ($1, $2, $3, $4, 'pending')
@@ -57,7 +53,6 @@ const updateProviderProfile = async (req, res) => {
 
 /**
  * Agrega un vehículo a la flota del prestador para el control de patentes en garita.
- * Roles permitidos: 'provider'
  */
 const addVehicle = async (req, res) => {
   try {
@@ -68,7 +63,6 @@ const addVehicle = async (req, res) => {
       return res.status(400).json({ error: 'Faltan datos obligatorios del vehículo (marca, modelo, color, patente).' });
     }
 
-    // Obtener el ID del prestador asociado al usuario
     const providerRes = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
     if (providerRes.rows.length === 0) {
       return res.status(404).json({ error: 'El usuario no tiene un perfil de prestador registrado.' });
@@ -94,8 +88,42 @@ const addVehicle = async (req, res) => {
 };
 
 /**
+ * Lista todos los prestadores con estado pendiente de compliance para Ops TrustLink.
+ * Roles permitidos: 'superadmin'
+ */
+const listPendingProviders = async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        p.id AS provider_id,
+        u.first_name,
+        u.last_name,
+        u.dni,
+        u.email,
+        p.specialty,
+        p.criminal_record_url,
+        p.insurance_policy_url,
+        p.status
+      FROM providers p
+      JOIN users u ON p.user_id = u.id
+      WHERE p.status = 'pending'
+      ORDER BY p.created_at DESC;
+    `;
+    const result = await db.query(query);
+
+    return res.status(200).json({
+      count: result.rows.length,
+      providers: result.rows
+    });
+  } catch (error) {
+    console.error('Error al listar prestadores pendientes:', error);
+    return res.status(500).json({ error: 'Error interno del servidor al consultar prestadores pendientes.' });
+  }
+};
+
+/**
  * Actualiza el estado de compliance de un prestador (Aprobado o Rechazado).
- * Roles permitidos: 'superadmin' (Operaciones Centrales TrustLink)
+ * Roles permitidos: 'superadmin'
  */
 const updateComplianceStatus = async (req, res) => {
   try {
@@ -128,8 +156,7 @@ const updateComplianceStatus = async (req, res) => {
 };
 
 /**
- * Lista todos los prestadores aprobados dentro del country para que los residentes puedan contratarlos.
- * Roles permitidos: 'owner', 'family', 'admin', 'superadmin'
+ * Lista todos los prestadores aprobados dentro del country para el directorio del residente.
  */
 const listVerifiedProviders = async (req, res) => {
   try {
@@ -146,9 +173,9 @@ const listVerifiedProviders = async (req, res) => {
         p.status
       FROM providers p
       JOIN users u ON p.user_id = u.id
-      WHERE u.country_id = $1 AND p.status = 'approved';
+      WHERE p.status = 'approved';
     `;
-    const result = await db.query(query, [countryId]);
+    const result = await db.query(query);
 
     return res.status(200).json({
       count: result.rows.length,
@@ -163,6 +190,7 @@ const listVerifiedProviders = async (req, res) => {
 module.exports = {
   updateProviderProfile,
   addVehicle,
+  listPendingProviders,
   updateComplianceStatus,
   listVerifiedProviders
 };

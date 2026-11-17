@@ -1,6 +1,6 @@
 /**
  * @file auth.controller.js
- * @description Lógica de negocio para autenticación, registro, listado y actualización completa de usuarios privilegiados.
+ * @description Lógica de negocio para autenticación, registro, listado y actualización de cuentas privilegiadas (Ops Master).
  * @location /trustlink-backend/src/modules/auth/auth.controller.js
  */
 const db = require('../../config/db');
@@ -9,7 +9,7 @@ const jwt = require('jsonwebtoken');
 
 const register = async (req, res) => {
   try {
-    const { country_id, role, first_name, last_name, dni, email, password, phone, fraction_number, lot_number } = req.body;
+    const { country_id, role, first_name, last_name, dni, email, password, phone, fraction_number, lot_number, driver_license_url } = req.body;
 
     if (!role || !first_name || !last_name || !dni || !email || !password) {
       return res.status(400).json({ error: 'Faltan campos obligatorios para el registro.' });
@@ -24,8 +24,8 @@ const register = async (req, res) => {
     const passwordHash = await bcrypt.hash(password, salt);
 
     const query = `
-      INSERT INTO users (country_id, role, first_name, last_name, dni, email, password_hash, phone, fraction_number, lot_number)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      INSERT INTO users (country_id, role, first_name, last_name, dni, email, password_hash, phone, fraction_number, lot_number, driver_license_url)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING id, country_id, role, first_name, last_name, dni, email, phone, is_active, created_at;
     `;
     const values = [
@@ -38,7 +38,8 @@ const register = async (req, res) => {
       passwordHash,
       phone || null,
       fraction_number || null,
-      lot_number || null
+      lot_number || null,
+      driver_license_url || null
     ];
 
     const newUser = await db.query(query, values);
