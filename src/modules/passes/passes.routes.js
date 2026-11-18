@@ -1,6 +1,6 @@
 /**
  * @file passes.routes.js
- * @description Enrutador completo para la gestión y validación de pases de acceso (QR).
+ * @description Enrutador para la emisión de pases QR por residentes y validación perimetral en garita.
  * @location /trustlink-backend/src/modules/passes/passes.routes.js
  */
 
@@ -10,10 +10,10 @@ const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware')
 
 const router = Router();
 
-// Endpoint para que un residente genere un pase (Requiere token y rol 'owner' o 'family')
+// Generar pase de acceso con QR (Roles: owner, family)
 router.post('/create', verifyToken, verifyRole(['owner', 'family']), createPass);
 
-// Endpoint universal para la garita / tótem de validación (Requiere token y rol 'security', 'admin' o 'superadmin')
+// Validar pase QR en garita o tótem (Roles: security, admin, superadmin)
 router.post('/verify', verifyToken, verifyRole(['security', 'admin', 'superadmin']), verifyPassByQR);
 
 module.exports = router;

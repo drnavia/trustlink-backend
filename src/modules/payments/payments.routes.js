@@ -1,7 +1,6 @@
 /**
  * @file payments.routes.js
- * @description Enrutador completo para cotizaciones presenciales, consulta de contratos pendientes,
- * órdenes de pago y pasarela.
+ * @description Enrutador para consulta de contratos pendientes, cotizaciones con Take Rate y webhooks de pago.
  * @location /trustlink-backend/src/modules/payments/payments.routes.js
  */
 
@@ -11,13 +10,13 @@ const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware')
 
 const router = Router();
 
-// Endpoint para que el residente consulte sus contratos pendientes de pago (Rol: owner, family)
+// Consultar contratos pendientes de pago del residente (Roles: owner, family)
 router.get('/pending', verifyToken, verifyRole(['owner', 'family']), getPendingContracts);
 
-// Endpoint para que el prestador cargue el presupuesto acordado in situ (Rol: provider)
-router.post('/quote', verifyToken, verifyRole(['provider']), createOrUpdateQuote);
+// Registrar o actualizar cotización y generar orden de pago (Roles: provider, owner, family)
+router.post('/quote', verifyToken, verifyRole(['provider', 'owner', 'family']), createOrUpdateQuote);
 
-// Endpoint webhook o confirmación de pago de la pasarela (Público con validación de pasarela)
+// Confirmación / webhook de pasarela de pagos
 router.post('/webhook', confirmPayment);
 
 module.exports = router;
