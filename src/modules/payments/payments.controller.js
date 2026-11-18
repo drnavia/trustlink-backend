@@ -25,7 +25,10 @@ const getPendingContracts = async (req, res) => {
         sc.agreed_amount,
         sc.status,
         sc.created_at,
-        u.first_name || ' ' || u.last_name AS provider_name
+        u.first_name || ' ' || u.last_name AS provider_name,
+        COALESCE(p.specialty, 'Profesional Verificado') AS specialty,
+        p.rating_avg,
+        p.status AS provider_status
       FROM service_contracts sc
       JOIN providers p ON sc.provider_id = p.id
       JOIN users u ON p.user_id = u.id
