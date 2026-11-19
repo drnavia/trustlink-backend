@@ -1,7 +1,8 @@
 /**
  * @file external.controller.js
  * @description Endpoint de integración para aplicaciones y sistemas de garita de barrios privados,
- * diagnóstico técnico, gestión de pases QR y administración de comunidades para el rol superadmin.
+ * diagnóstico técnico, gestión paginada/filtrada de pases QR y administración paginada/filtrada
+ * de comunidades para superadmin.
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
 
@@ -70,19 +71,71 @@ const getExternalDiagnostics = async (req, res) => {
 };
 
 /**
- * Lista todas las comunidades (countries) registradas en PostgreSQL.
+ * Lista las comunidades (countries) con paginación y filtros por estado y búsqueda.
  * Uso exclusivo: rol 'superadmin'.
  */
 const listCountries = async (req, res) => {
   try {
+    const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1);
+    const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit || '6', 10) || 6));
+    const statusFilter = String(req.query.status || 'all').trim().toLowerCase();
+    const searchFilter = String(req.query.search || '').trim().toLowerCase();
+
+    const whereClauses = [];
+    const params = [];
+
+    if (statusFilter === 'active') {
+      whereClauses.push('is_active = true');
+    } else if (statusFilter === 'inactive') {
+      whereClauses.push('is_active = false');
+    }
+
+    if (searchFilter) {
+      params.push(`%${searchFilter}%`);
+      const idx = params.length;
+      whereClauses.push(`(
+        CAST(id AS TEXT) ILIKE $${idx}
+        OR COALESCE(name, '') ILIKE $${idx}
+        OR COALESCE(location, '') ILIKE $${idx}
+      )`);
+    }
+
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM countries
+      ${whereSql};
+    `;
+    const countResult = await db.query(countQuery, params);
+    const total = countResult.rows[0]?.total || 0;
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    const safePage = Math.min(page, totalPages);
+    const offset = (safePage - 1) * limit;
+
+    const dataParams = [...params, limit, offset];
+    const limitParamIdx = params.length + 1;
+    const offsetParamIdx = params.length + 2;
+
     const query = `
       SELECT id, name, location, is_active, created_at
       FROM countries
-      ORDER BY id ASC;
+      ${whereSql}
+      ORDER BY id ASC
+      LIMIT $${limitParamIdx} OFFSET $${offsetParamIdx};
     `;
-    const result = await db.query(query);
+    const result = await db.query(query, dataParams);
+
+    const activeCountRes = await db.query('SELECT COUNT(*)::int AS active_count FROM countries WHERE is_active = true;');
+    const activeCount = activeCountRes.rows[0]?.active_count || 0;
+
     return res.status(200).json({
       count: result.rows.length,
+      total,
+      active_count: activeCount,
+      page: safePage,
+      limit,
+      totalPages,
       countries: result.rows
     });
   } catch (error) {
@@ -226,12 +279,60 @@ const toggleCountryStatus = async (req, res) => {
 };
 
 /**
- * Lista los pases QR recientes en la plataforma para auditoría y gestión del superadmin.
+ * Lista los pases QR con paginación y filtros por estado y búsqueda.
  * Uso exclusivo: rol 'superadmin'.
  */
 const listRecentPasses = async (req, res) => {
   try {
-    const query = `
+    const page = Math.max(1, Number.parseInt(req.query.page || '1', 10) || 1);
+    const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit || '8', 10) || 8));
+    const statusFilter = String(req.query.status || 'all').trim().toLowerCase();
+    const searchFilter = String(req.query.search || '').trim().toLowerCase();
+
+    const whereClauses = [];
+    const params = [];
+
+    if (statusFilter && statusFilter !== 'all') {
+      params.push(statusFilter);
+      whereClauses.push(`LOWER(COALESCE(ap.status::text, '')) = $${params.length}`);
+    }
+
+    if (searchFilter) {
+      params.push(`%${searchFilter}%`);
+      const idx = params.length;
+      whereClauses.push(`(
+        CAST(ap.id AS TEXT) ILIKE $${idx}
+        OR COALESCE(u_prov.first_name || ' ' || u_prov.last_name, '') ILIKE $${idx}
+        OR COALESCE(p.specialty, '') ILIKE $${idx}
+        OR COALESCE(c.name, '') ILIKE $${idx}
+        OR COALESCE(ap.fraction_number, '') ILIKE $${idx}
+        OR COALESCE(ap.lot_number, '') ILIKE $${idx}
+      )`);
+    }
+
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM access_passes ap
+      LEFT JOIN countries c ON ap.country_id = c.id
+      LEFT JOIN providers p ON ap.provider_id = p.id
+      LEFT JOIN users u_prov ON p.user_id = u_prov.id
+      LEFT JOIN users u_owner ON ap.owner_id = u_owner.id
+      ${whereSql};
+    `;
+
+    const countResult = await db.query(countQuery, params);
+    const total = countResult.rows[0]?.total || 0;
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    const safePage = Math.min(page, totalPages);
+    const offset = (safePage - 1) * limit;
+
+    const dataParams = [...params, limit, offset];
+    const limitParamIdx = params.length + 1;
+    const offsetParamIdx = params.length + 2;
+
+    const dataQuery = `
       SELECT
         ap.id,
         ap.qr_token,
@@ -252,14 +353,19 @@ const listRecentPasses = async (req, res) => {
       LEFT JOIN providers p ON ap.provider_id = p.id
       LEFT JOIN users u_prov ON p.user_id = u_prov.id
       LEFT JOIN users u_owner ON ap.owner_id = u_owner.id
+      ${whereSql}
       ORDER BY ap.created_at DESC, ap.id DESC
-      LIMIT 30;
+      LIMIT $${limitParamIdx} OFFSET $${offsetParamIdx};
     `;
 
-    const result = await db.query(query);
+    const result = await db.query(dataQuery, dataParams);
 
     return res.status(200).json({
       count: result.rows.length,
+      total,
+      page: safePage,
+      limit,
+      totalPages,
       passes: result.rows
     });
   } catch (error) {
