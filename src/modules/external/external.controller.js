@@ -1,7 +1,7 @@
 /**
  * @file external.controller.js
  * @description Endpoint de integración para aplicaciones y sistemas de garita de barrios privados,
- * y diagnóstico técnico protegido para el rol superadmin.
+ * diagnóstico técnico y gestión operativa de pases QR para el rol superadmin.
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
 
@@ -63,6 +63,96 @@ const getExternalDiagnostics = async (req, res) => {
         api_key_configured: Boolean(process.env.EXTERNAL_GATE_API_KEY && String(process.env.EXTERNAL_GATE_API_KEY).trim())
       },
       error: 'Error al consultar la base de datos o el estado del servicio.'
+    });
+  }
+};
+
+/**
+ * Lista los pases QR recientes en la plataforma para auditoría y gestión del superadmin.
+ * Uso exclusivo: rol 'superadmin'.
+ */
+const listRecentPasses = async (req, res) => {
+  try {
+    const query = `
+      SELECT
+        ap.id,
+        ap.qr_token,
+        ap.status,
+        ap.fraction_number,
+        ap.lot_number,
+        ap.start_time,
+        ap.end_time,
+        ap.created_at,
+        c.name AS country_name,
+        u_prov.first_name AS provider_first_name,
+        u_prov.last_name AS provider_last_name,
+        p.specialty AS provider_specialty,
+        u_owner.first_name AS owner_first_name,
+        u_owner.last_name AS owner_last_name
+      FROM access_passes ap
+      LEFT JOIN countries c ON ap.country_id = c.id
+      LEFT JOIN providers p ON ap.provider_id = p.id
+      LEFT JOIN users u_prov ON p.user_id = u_prov.id
+      LEFT JOIN users u_owner ON ap.owner_id = u_owner.id
+      ORDER BY ap.created_at DESC, ap.id DESC
+      LIMIT 30;
+    `;
+
+    const result = await db.query(query);
+
+    return res.status(200).json({
+      count: result.rows.length,
+      passes: result.rows
+    });
+  } catch (error) {
+    console.error('Error al listar pases QR recientes:', error);
+    return res.status(500).json({
+      error: 'Error interno al consultar los pases QR recientes.'
+    });
+  }
+};
+
+/**
+ * Cancela un pase QR existente por ID.
+ * Uso exclusivo: rol 'superadmin'.
+ */
+const cancelPassById = async (req, res) => {
+  try {
+    const passId = Number(req.params.id);
+
+    if (!Number.isInteger(passId) || passId <= 0) {
+      return res.status(400).json({ error: 'ID de pase inválido.' });
+    }
+
+    const existing = await db.query(
+      'SELECT id, status FROM access_passes WHERE id = $1 LIMIT 1',
+      [passId]
+    );
+
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Pase QR no encontrado.' });
+    }
+
+    if (existing.rows[0].status === 'cancelled') {
+      return res.status(400).json({ error: 'El pase ya se encuentra cancelado.' });
+    }
+
+    const updated = await db.query(
+      `UPDATE access_passes
+       SET status = 'cancelled'
+       WHERE id = $1
+       RETURNING id, qr_token, status, start_time, end_time`,
+      [passId]
+    );
+
+    return res.status(200).json({
+      message: `Pase QR #${passId} cancelado con éxito.`,
+      pass: updated.rows[0]
+    });
+  } catch (error) {
+    console.error('Error al cancelar pase QR:', error);
+    return res.status(500).json({
+      error: 'Error interno al cancelar el pase QR.'
     });
   }
 };
@@ -235,5 +325,7 @@ const verifyExternalPassByQR = async (req, res) => {
 
 module.exports = {
   getExternalDiagnostics,
+  listRecentPasses,
+  cancelPassById,
   verifyExternalPassByQR
 };
