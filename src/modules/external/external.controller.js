@@ -1,7 +1,7 @@
 /**
  * @file external.controller.js
  * @description Controlador completo para integración externa de barrios privados (validación de QR),
- * diagnóstico técnico del sistema, gestión de pases QR con paginación y filtros,
+ * diagnóstico técnico del sistema, gestión de pases QR con paginación y filtros (incluyendo comunidad),
  * administración de comunidades y configuración de claves/integraciones por comunidad para superadmin.
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
@@ -267,8 +267,8 @@ const toggleCountryStatus = async (req, res) => {
 };
 
 /**
- * Punto 4: Lista todas las integraciones y claves API por comunidad.
- * Uso exclusivo: rol 'superadmin'.
+ * Lista todas las integraciones y claves API por comunidad para superadmin.
+ * Incluye api_key para permitir copiarla desde el panel y masked_key para visualización enmascarada.
  */
 const listCommunityIntegrations = async (req, res) => {
   try {
@@ -302,6 +302,7 @@ const listCommunityIntegrations = async (req, res) => {
       country_location: row.country_location,
       country_is_active: row.country_is_active,
       label: row.label,
+      api_key: row.api_key,
       masked_key: maskApiKey(row.api_key),
       is_active: row.is_active,
       last_used_at: row.last_used_at,
@@ -322,7 +323,7 @@ const listCommunityIntegrations = async (req, res) => {
 };
 
 /**
- * Punto 4: Crea una nueva API Key para una comunidad.
+ * Crea una nueva API Key para una comunidad.
  * Devuelve la clave en claro una única vez al crearse.
  */
 const createCommunityIntegration = async (req, res) => {
@@ -371,7 +372,7 @@ const createCommunityIntegration = async (req, res) => {
 };
 
 /**
- * Punto 4: Rota / regenera la clave de una integración existente.
+ * Rota / regenera la clave de una integración existente.
  */
 const rotateCommunityIntegrationKey = async (req, res) => {
   try {
@@ -419,7 +420,7 @@ const rotateCommunityIntegrationKey = async (req, res) => {
 };
 
 /**
- * Punto 4: Activa o desactiva una clave de integración por comunidad.
+ * Activa o desactiva una clave de integración por comunidad.
  */
 const toggleCommunityIntegrationStatus = async (req, res) => {
   try {
@@ -456,7 +457,7 @@ const toggleCommunityIntegrationStatus = async (req, res) => {
 
 /**
  * Lista los pases QR recientes en la plataforma con paginación, búsqueda y filtro de estado.
- * Usa las columnas reales de access_passes: start_time, end_time, created_at.
+ * Incluye comunidad (country_id y country_name), prestador, destino, vigencia y estado.
  * Uso exclusivo: rol 'superadmin'.
  */
 const listRecentPasses = async (req, res) => {
@@ -479,6 +480,7 @@ const listRecentPasses = async (req, res) => {
       const idx = params.length;
       conditions.push(`(
         CAST(ap.id AS TEXT) ILIKE $${idx}
+        OR CAST(ap.country_id AS TEXT) ILIKE $${idx}
         OR COALESCE(ap.fraction_number, '') ILIKE $${idx}
         OR COALESCE(ap.lot_number, '') ILIKE $${idx}
         OR COALESCE(c.name, '') ILIKE $${idx}
@@ -507,6 +509,7 @@ const listRecentPasses = async (req, res) => {
     const dataQuery = `
       SELECT
         ap.id,
+        ap.country_id,
         ap.qr_token,
         ap.status,
         ap.fraction_number,
@@ -582,7 +585,6 @@ const cancelPassById = async (req, res) => {
 
 /**
  * Validación externa de pase QR mediante API Key de comunidad, API Key global o JWT.
- * Usa start_time y end_time de la tabla access_passes.
  */
 const verifyExternalPassByQR = async (req, res) => {
   try {
