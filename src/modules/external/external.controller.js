@@ -1,7 +1,7 @@
 /**
  * @file external.controller.js
  * @description Endpoint de integración para aplicaciones y sistemas de garita de barrios privados,
- * diagnóstico técnico y gestión operativa de pases QR para el rol superadmin.
+ * diagnóstico técnico, gestión de pases QR y administración de comunidades para el rol superadmin.
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
 
@@ -19,6 +19,7 @@ const getExternalDiagnostics = async (req, res) => {
       SELECT
         (SELECT COUNT(*)::int FROM access_passes) AS total_passes,
         (SELECT COUNT(*)::int FROM providers WHERE status = 'approved') AS approved_providers,
+        (SELECT COUNT(*)::int FROM countries WHERE is_active = true) AS active_countries,
         (SELECT COUNT(*)::int FROM countries) AS total_countries
     `);
 
@@ -44,6 +45,7 @@ const getExternalDiagnostics = async (req, res) => {
       metrics: metricsCheck.rows[0] || {
         total_passes: 0,
         approved_providers: 0,
+        active_countries: 0,
         total_countries: 0
       }
     });
@@ -63,6 +65,109 @@ const getExternalDiagnostics = async (req, res) => {
         api_key_configured: Boolean(process.env.EXTERNAL_GATE_API_KEY && String(process.env.EXTERNAL_GATE_API_KEY).trim())
       },
       error: 'Error al consultar la base de datos o el estado del servicio.'
+    });
+  }
+};
+
+/**
+ * Lista todas las comunidades (countries) registradas en PostgreSQL.
+ * Uso exclusivo: rol 'superadmin'.
+ */
+const listCountries = async (req, res) => {
+  try {
+    const query = `
+      SELECT id, name, location, is_active, created_at
+      FROM countries
+      ORDER BY id ASC;
+    `;
+    const result = await db.query(query);
+    return res.status(200).json({
+      count: result.rows.length,
+      countries: result.rows
+    });
+  } catch (error) {
+    console.error('Error al listar comunidades:', error);
+    return res.status(500).json({
+      error: 'Error interno al consultar las comunidades.'
+    });
+  }
+};
+
+/**
+ * Crea una nueva comunidad (country) en PostgreSQL.
+ * Uso exclusivo: rol 'superadmin'.
+ */
+const createCountry = async (req, res) => {
+  try {
+    const { name, location, is_active } = req.body;
+    const cleanName = String(name || '').trim();
+    const cleanLocation = location ? String(location).trim() : null;
+    const activeStatus = typeof is_active === 'boolean' ? is_active : true;
+
+    if (!cleanName) {
+      return res.status(400).json({
+        error: 'El nombre de la comunidad es obligatorio.'
+      });
+    }
+
+    const query = `
+      INSERT INTO countries (name, location, is_active)
+      VALUES ($1, $2, $3)
+      RETURNING id, name, location, is_active, created_at;
+    `;
+    const result = await db.query(query, [cleanName, cleanLocation, activeStatus]);
+
+    return res.status(201).json({
+      message: 'Comunidad creada exitosamente.',
+      country: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Error al crear comunidad:', error);
+    return res.status(500).json({
+      error: 'Error interno al crear la comunidad.'
+    });
+  }
+};
+
+/**
+ * Alterna o actualiza el estado is_active de una comunidad por ID.
+ * Uso exclusivo: rol 'superadmin'.
+ */
+const toggleCountryStatus = async (req, res) => {
+  try {
+    const countryId = Number(req.params.id);
+
+    if (!Number.isInteger(countryId) || countryId <= 0) {
+      return res.status(400).json({ error: 'ID de comunidad inválido.' });
+    }
+
+    const existing = await db.query(
+      'SELECT id, name, is_active FROM countries WHERE id = $1 LIMIT 1',
+      [countryId]
+    );
+
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Comunidad no encontrada.' });
+    }
+
+    const nextActive = !existing.rows[0].is_active;
+
+    const updated = await db.query(
+      `UPDATE countries
+       SET is_active = $1
+       WHERE id = $2
+       RETURNING id, name, location, is_active, created_at`,
+      [nextActive, countryId]
+    );
+
+    return res.status(200).json({
+      message: `Comunidad "${updated.rows[0].name}" ${nextActive ? 'activada' : 'desactivada'} con éxito.`,
+      country: updated.rows[0]
+    });
+  } catch (error) {
+    console.error('Error al actualizar estado de comunidad:', error);
+    return res.status(500).json({
+      error: 'Error interno al actualizar la comunidad.'
     });
   }
 };
@@ -325,6 +430,9 @@ const verifyExternalPassByQR = async (req, res) => {
 
 module.exports = {
   getExternalDiagnostics,
+  listCountries,
+  createCountry,
+  toggleCountryStatus,
   listRecentPasses,
   cancelPassById,
   verifyExternalPassByQR

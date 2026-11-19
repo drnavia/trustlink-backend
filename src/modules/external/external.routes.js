@@ -1,6 +1,7 @@
 /**
  * @file external.routes.js
- * @description Enrutador para endpoints de consumo externo, diagnóstico técnico y gestión de pases QR.
+ * @description Enrutador para endpoints de consumo externo, diagnóstico técnico,
+ * gestión de pases QR y administración de comunidades para superadmin.
  * @location /trustlink-backend/src/modules/external/external.routes.js
  */
 
@@ -9,6 +10,9 @@ const jwt = require('jsonwebtoken');
 const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
 const {
   getExternalDiagnostics,
+  listCountries,
+  createCountry,
+  toggleCountryStatus,
   listRecentPasses,
   cancelPassById,
   verifyExternalPassByQR
@@ -39,6 +43,11 @@ const optionalJwtAuth = (req, res, next) => {
 
 // Endpoint de diagnóstico técnico (Exclusivo superadmin)
 router.get('/status', verifyToken, verifyRole(['superadmin']), getExternalDiagnostics);
+
+// Gestión de comunidades / countries (Exclusivo superadmin)
+router.get('/countries', verifyToken, verifyRole(['superadmin']), listCountries);
+router.post('/countries', verifyToken, verifyRole(['superadmin']), createCountry);
+router.patch('/countries/:id/toggle', verifyToken, verifyRole(['superadmin']), toggleCountryStatus);
 
 // Listado y cancelación de pases QR recientes (Exclusivo superadmin)
 router.get('/passes', verifyToken, verifyRole(['superadmin']), listRecentPasses);
