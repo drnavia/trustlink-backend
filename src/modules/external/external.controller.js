@@ -1,9 +1,8 @@
 /**
  * @file external.controller.js
  * @description Controlador completo para integración externa de barrios privados (validación de QR),
- * diagnóstico técnico del sistema, gestión de pases QR con paginación y filtros,
- * administración de comunidades (nombre, dirección, código postal, localidad, provincia y estado),
- * integraciones por comunidad y auditoría paginada de accesos y transacciones.
+ * diagnóstico técnico del sistema, gestión de pases QR con persistencia de estado 'expired',
+ * administración de comunidades, integraciones por comunidad y auditoría de accesos/transacciones.
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
 
@@ -28,20 +27,8 @@ const ensureIntegrationsTable = async () => {
 };
 
 /**
- * Asegura que la tabla countries tenga los campos de dirección, código postal, localidad y provincia.
- */
-const ensureCountriesAddressColumns = async () => {
-  await db.query(`
-    ALTER TABLE countries
-      ADD COLUMN IF NOT EXISTS address VARCHAR(255) NULL,
-      ADD COLUMN IF NOT EXISTS postal_code VARCHAR(30) NULL,
-      ADD COLUMN IF NOT EXISTS locality VARCHAR(120) NULL,
-      ADD COLUMN IF NOT EXISTS province VARCHAR(120) NULL;
-  `);
-};
-
-/**
- * Asegura la existencia de la tabla gate_access_logs de forma idempotente.
+ * Asegura la existencia de la tabla gate_access_logs de forma idempotente
+ * para auditar intentos autorizados y denegados de validación de pases QR.
  */
 const ensureAuditLogsTable = async () => {
   await db.query(`
@@ -61,18 +48,41 @@ const ensureAuditLogsTable = async () => {
   `);
 };
 
-const composeLocationSummary = ({ location, address, postalCode, locality, province }) => {
-  const parts = [address, locality, province].map((v) => String(v || '').trim()).filter(Boolean);
-  const cp = String(postalCode || '').trim();
-  if (parts.length > 0) {
-    return cp ? `${parts.join(' - ')} (CP ${cp})` : parts.join(' - ');
+/**
+ * Marca como 'expired' en PostgreSQL los pases en estado 'pending' cuya end_time
+ * (interpretada en UTC, consistente con el almacenamiento del módulo de pases) ya venció.
+ * Opcionalmente filtra por passId para actualizar un único pase de forma focalizada.
+ */
+const expireOverduePasses = async (passId = null) => {
+  try {
+    if (passId !== null && passId !== undefined) {
+      await db.query(
+        `UPDATE access_passes
+         SET status = 'expired'::pass_status
+         WHERE id = $1
+           AND status = 'pending'::pass_status
+           AND end_time IS NOT NULL
+           AND (EXTRACT(EPOCH FROM (end_time AT TIME ZONE 'UTC')) * 1000)::bigint < (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint`,
+        [passId]
+      );
+      return;
+    }
+
+    await db.query(
+      `UPDATE access_passes
+       SET status = 'expired'::pass_status
+       WHERE status = 'pending'::pass_status
+         AND end_time IS NOT NULL
+         AND (EXTRACT(EPOCH FROM (end_time AT TIME ZONE 'UTC')) * 1000)::bigint < (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint`
+    );
+  } catch (err) {
+    console.error('Error al persistir estado expired en access_passes:', err);
   }
-  if (cp) {
-    return location ? `${String(location).trim()} (CP ${cp})` : `CP ${cp}`;
-  }
-  return location ? String(location).trim() : null;
 };
 
+/**
+ * Registra un evento en gate_access_logs sin interrumpir la respuesta principal si falla el log.
+ */
 const recordGateAccessLog = async ({
   qrToken = null,
   passId = null,
@@ -120,17 +130,14 @@ const maskApiKey = (apiKey = '') => {
 const getExternalDiagnostics = async (req, res) => {
   const startedAt = Date.now();
   try {
-    await Promise.all([
-      ensureIntegrationsTable(),
-      ensureAuditLogsTable(),
-      ensureCountriesAddressColumns()
-    ]);
+    await Promise.all([ensureIntegrationsTable(), ensureAuditLogsTable(), expireOverduePasses()]);
     const dbCheck = await db.query('SELECT NOW() AS db_time');
     const dbLatencyMs = Date.now() - startedAt;
 
     const metricsCheck = await db.query(`
       SELECT
         (SELECT COUNT(*)::int FROM access_passes) AS total_passes,
+        (SELECT COUNT(*)::int FROM access_passes WHERE status = 'expired') AS expired_passes,
         (SELECT COUNT(*)::int FROM providers WHERE status = 'approved') AS approved_providers,
         (SELECT COUNT(*)::int FROM countries WHERE is_active = true) AS active_countries,
         (SELECT COUNT(*)::int FROM countries) AS total_countries,
@@ -162,6 +169,7 @@ const getExternalDiagnostics = async (req, res) => {
       },
       metrics: metricsCheck.rows[0] || {
         total_passes: 0,
+        expired_passes: 0,
         approved_providers: 0,
         active_countries: 0,
         total_countries: 0,
@@ -188,7 +196,6 @@ const getExternalDiagnostics = async (req, res) => {
  */
 const listCountries = async (req, res) => {
   try {
-    await ensureCountriesAddressColumns();
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 50);
     const status = String(req.query.status || 'all').toLowerCase();
@@ -207,15 +214,7 @@ const listCountries = async (req, res) => {
     if (search) {
       params.push(`%${search}%`);
       const idx = params.length;
-      conditions.push(`(
-        CAST(id AS TEXT) ILIKE $${idx}
-        OR name ILIKE $${idx}
-        OR COALESCE(location, '') ILIKE $${idx}
-        OR COALESCE(address, '') ILIKE $${idx}
-        OR COALESCE(postal_code, '') ILIKE $${idx}
-        OR COALESCE(locality, '') ILIKE $${idx}
-        OR COALESCE(province, '') ILIKE $${idx}
-      )`);
+      conditions.push(`(CAST(id AS TEXT) ILIKE $${idx} OR name ILIKE $${idx} OR COALESCE(location, '') ILIKE $${idx})`);
     }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -229,16 +228,7 @@ const listCountries = async (req, res) => {
 
     const dataParams = [...params, limit, offset];
     const result = await db.query(
-      `SELECT
-        id,
-        name,
-        location,
-        address,
-        postal_code,
-        locality,
-        province,
-        is_active,
-        created_at
+      `SELECT id, name, location, is_active, created_at
        FROM countries
        ${whereClause}
        ORDER BY id ASC
@@ -260,35 +250,25 @@ const listCountries = async (req, res) => {
 };
 
 /**
- * Crea una nueva comunidad en countries con nombre, dirección, código postal, localidad, provincia y estado.
+ * Crea una nueva comunidad en countries.
  */
 const createCountry = async (req, res) => {
   try {
-    await ensureCountriesAddressColumns();
     const name = String(req.body.name || '').trim();
-    const address = req.body.address !== undefined ? (String(req.body.address).trim() || null) : null;
-    const postalCode = req.body.postal_code !== undefined ? (String(req.body.postal_code).trim() || null) : null;
-    const locality = req.body.locality !== undefined ? (String(req.body.locality).trim() || null) : null;
-    const province = req.body.province !== undefined ? (String(req.body.province).trim() || null) : null;
+    const location = req.body.location !== undefined && req.body.location !== null
+      ? String(req.body.location).trim()
+      : null;
     const isActive = req.body.is_active !== undefined ? Boolean(req.body.is_active) : true;
 
-    const location = composeLocationSummary({
-      location: req.body.location,
-      address,
-      postalCode,
-      locality,
-      province
-    });
-
     if (!name) {
-      return res.status(400).json({ error: 'El nombre de la comunidad / barrio es obligatorio.' });
+      return res.status(400).json({ error: 'El nombre de la comunidad es obligatorio.' });
     }
 
     const insertResult = await db.query(
-      `INSERT INTO countries (name, location, address, postal_code, locality, province, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, name, location, address, postal_code, locality, province, is_active, created_at`,
-      [name, location, address, postalCode, locality, province, isActive]
+      `INSERT INTO countries (name, location, is_active)
+       VALUES ($1, $2, $3)
+       RETURNING id, name, location, is_active, created_at`,
+      [name, location || null, isActive]
     );
 
     return res.status(201).json({
@@ -302,19 +282,17 @@ const createCountry = async (req, res) => {
 };
 
 /**
- * Edita nombre, dirección, código postal, localidad, provincia o estado de una comunidad existente.
+ * Edita nombre, ubicación o estado de una comunidad existente.
  */
 const updateCountry = async (req, res) => {
   try {
-    await ensureCountriesAddressColumns();
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) {
       return res.status(400).json({ error: 'ID de comunidad inválido.' });
     }
 
     const existingResult = await db.query(
-      `SELECT id, name, location, address, postal_code, locality, province, is_active, created_at
-       FROM countries WHERE id = $1`,
+      'SELECT id, name, location, is_active, created_at FROM countries WHERE id = $1',
       [id]
     );
     if (existingResult.rows.length === 0) {
@@ -323,44 +301,21 @@ const updateCountry = async (req, res) => {
 
     const current = existingResult.rows[0];
     const nextName = req.body.name !== undefined ? String(req.body.name).trim() : current.name;
-    const nextAddress = req.body.address !== undefined
-      ? (String(req.body.address).trim() || null)
-      : current.address;
-    const nextPostalCode = req.body.postal_code !== undefined
-      ? (String(req.body.postal_code).trim() || null)
-      : current.postal_code;
-    const nextLocality = req.body.locality !== undefined
-      ? (String(req.body.locality).trim() || null)
-      : current.locality;
-    const nextProvince = req.body.province !== undefined
-      ? (String(req.body.province).trim() || null)
-      : current.province;
+    const nextLocation = req.body.location !== undefined
+      ? (String(req.body.location).trim() || null)
+      : current.location;
     const nextIsActive = req.body.is_active !== undefined ? Boolean(req.body.is_active) : current.is_active;
 
-    const nextLocation = composeLocationSummary({
-      location: req.body.location !== undefined ? req.body.location : current.location,
-      address: nextAddress,
-      postalCode: nextPostalCode,
-      locality: nextLocality,
-      province: nextProvince
-    });
-
     if (!nextName) {
-      return res.status(400).json({ error: 'El nombre de la comunidad / barrio no puede quedar vacío.' });
+      return res.status(400).json({ error: 'El nombre de la comunidad no puede quedar vacío.' });
     }
 
     const updatedResult = await db.query(
       `UPDATE countries
-       SET name = $1,
-           location = $2,
-           address = $3,
-           postal_code = $4,
-           locality = $5,
-           province = $6,
-           is_active = $7
-       WHERE id = $8
-       RETURNING id, name, location, address, postal_code, locality, province, is_active, created_at`,
-      [nextName, nextLocation, nextAddress, nextPostalCode, nextLocality, nextProvince, nextIsActive, id]
+       SET name = $1, location = $2, is_active = $3
+       WHERE id = $4
+       RETURNING id, name, location, is_active, created_at`,
+      [nextName, nextLocation, nextIsActive, id]
     );
 
     return res.status(200).json({
@@ -378,7 +333,6 @@ const updateCountry = async (req, res) => {
  */
 const toggleCountryStatus = async (req, res) => {
   try {
-    await ensureCountriesAddressColumns();
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) {
       return res.status(400).json({ error: 'ID de comunidad inválido.' });
@@ -388,7 +342,7 @@ const toggleCountryStatus = async (req, res) => {
       `UPDATE countries
        SET is_active = NOT is_active
        WHERE id = $1
-       RETURNING id, name, location, address, postal_code, locality, province, is_active, created_at`,
+       RETURNING id, name, location, is_active, created_at`,
       [id]
     );
 
@@ -595,9 +549,12 @@ const toggleCommunityIntegrationStatus = async (req, res) => {
 
 /**
  * Lista los pases QR recientes en la plataforma con paginación, búsqueda y filtro de estado.
+ * Persiste automáticamente el estado 'expired' en pases 'pending' vencidos antes de consultar.
  */
 const listRecentPasses = async (req, res) => {
   try {
+    await expireOverduePasses();
+
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 8, 1), 50);
     const status = String(req.query.status || 'all').trim().toLowerCase();
@@ -720,18 +677,16 @@ const cancelPassById = async (req, res) => {
 };
 
 /**
- * Devuelve la auditoría de intentos de validación de acceso (paginada y filtrable)
- * junto con el resumen y listado reciente de contratos y transacciones.
+ * Devuelve la auditoría de intentos de validación de acceso (autorizados vs. denegados
+ * y su motivo) junto con el resumen y listado reciente de contratos y transacciones.
  * Uso exclusivo: rol 'superadmin'.
  */
 const getAuditOverview = async (req, res) => {
   try {
-    await ensureAuditLogsTable();
+    await Promise.all([ensureAuditLogsTable(), expireOverduePasses()]);
 
     const outcome = String(req.query.outcome || 'all').trim().toLowerCase();
     const search = String(req.query.search || '').trim();
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 50);
 
     const logConditions = [];
     const logParams = [];
@@ -756,18 +711,6 @@ const getAuditOverview = async (req, res) => {
 
     const logWhere = logConditions.length > 0 ? `WHERE ${logConditions.join(' AND ')}` : '';
 
-    const countLogsRes = await db.query(
-      `SELECT COUNT(*)::int AS total
-       FROM gate_access_logs gal
-       LEFT JOIN countries c ON c.id = gal.country_id
-       ${logWhere}`,
-      logParams
-    );
-    const totalLogs = countLogsRes.rows[0]?.total || 0;
-    const totalLogPages = Math.max(Math.ceil(totalLogs / limit), 1);
-    const safeLogPage = Math.min(page, totalLogPages);
-    const logOffset = (safeLogPage - 1) * limit;
-
     const accessLogsRes = await db.query(
       `SELECT
         gal.id,
@@ -786,8 +729,8 @@ const getAuditOverview = async (req, res) => {
        LEFT JOIN countries c ON c.id = gal.country_id
        ${logWhere}
        ORDER BY gal.id DESC
-       LIMIT $${logParams.length + 1} OFFSET $${logParams.length + 2}`,
-      [...logParams, limit, logOffset]
+       LIMIT 20`,
+      logParams
     );
 
     const logSummaryRes = await db.query(`
@@ -830,7 +773,7 @@ const getAuditOverview = async (req, res) => {
       LEFT JOIN providers p ON p.id = sc.provider_id
       LEFT JOIN users u_prov ON u_prov.id = p.user_id
       ORDER BY t.id DESC
-      LIMIT 25
+      LIMIT 15
     `);
 
     return res.status(200).json({
@@ -840,12 +783,6 @@ const getAuditOverview = async (req, res) => {
         denied_count: 0
       },
       access_logs: accessLogsRes.rows,
-      access_pagination: {
-        total: totalLogs,
-        page: safeLogPage,
-        limit,
-        totalPages: totalLogPages
-      },
       financial_summary: txSummaryRes.rows[0] || {
         total_contracts: 0,
         pending_contracts: 0,
@@ -867,6 +804,7 @@ const getAuditOverview = async (req, res) => {
 
 /**
  * Validación externa de pase QR mediante API Key de comunidad, API Key global o JWT.
+ * Persiste 'expired' si el pase pendiente venció y registra cada intento en gate_access_logs.
  */
 const verifyExternalPassByQR = async (req, res) => {
   const providedKey = String(req.headers['x-api-key'] || '').trim();
@@ -984,6 +922,9 @@ const verifyExternalPassByQR = async (req, res) => {
     const passQuery = await db.query(
       `SELECT
         ap.*,
+        (EXTRACT(EPOCH FROM (ap.start_time AT TIME ZONE 'UTC')) * 1000)::bigint AS start_utc_ms,
+        (EXTRACT(EPOCH FROM (ap.end_time AT TIME ZONE 'UTC')) * 1000)::bigint AS end_utc_ms,
+        (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint AS now_utc_ms,
         c.name AS country_name,
         c.is_active AS country_active,
         u_owner.first_name AS owner_first_name,
@@ -1032,7 +973,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
-    const record = passQuery.rows[0];
+    let record = passQuery.rows[0];
 
     if (matchedIntegration && Number(record.country_id) !== Number(matchedIntegration.country_id)) {
       const msg = `Este pase pertenece a ${record.country_name || 'otra comunidad'}, no a ${matchedIntegration.country_name}.`;
@@ -1074,8 +1015,17 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
-    const now = new Date();
-    if (record.start_time && now < new Date(record.start_time)) {
+    const startMs = record.start_utc_ms !== null && record.start_utc_ms !== undefined
+      ? Number(record.start_utc_ms)
+      : null;
+    const endMs = record.end_utc_ms !== null && record.end_utc_ms !== undefined
+      ? Number(record.end_utc_ms)
+      : null;
+    const nowMs = record.now_utc_ms !== null && record.now_utc_ms !== undefined
+      ? Number(record.now_utc_ms)
+      : Date.now();
+
+    if (startMs !== null && !Number.isNaN(startMs) && nowMs < startMs) {
       const msg = 'El pase aún no está dentro de su franja horaria habilitada.';
       await recordGateAccessLog({
         qrToken,
@@ -1095,8 +1045,13 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
-    if (record.end_time && now > new Date(record.end_time)) {
-      const msg = 'El pase QR se encuentra fuera de vigencia horaria.';
+    if (endMs !== null && !Number.isNaN(endMs) && nowMs > endMs) {
+      if (record.status === 'pending') {
+        await expireOverduePasses(record.id);
+        record = { ...record, status: 'expired' };
+      }
+
+      const msg = 'El pase QR se encuentra vencido / fuera de vigencia horaria.';
       await recordGateAccessLog({
         qrToken,
         passId: record.id,
@@ -1111,6 +1066,28 @@ const verifyExternalPassByQR = async (req, res) => {
       return res.status(403).json({
         authorized: false,
         code: 'OUT_OF_TIME_WINDOW',
+        pass_status: record.status,
+        error: msg
+      });
+    }
+
+    if (record.status === 'expired') {
+      const msg = 'El pase QR se encuentra vencido.';
+      await recordGateAccessLog({
+        qrToken,
+        passId: record.id,
+        countryId: record.country_id,
+        integrationLabel: effectiveIntegrationLabel,
+        authMode: effectiveAuthMode,
+        authorized: false,
+        reasonCode: 'PASS_EXPIRED',
+        message: msg,
+        httpStatus: 403
+      });
+      return res.status(403).json({
+        authorized: false,
+        code: 'PASS_EXPIRED',
+        pass_status: record.status,
         error: msg
       });
     }
