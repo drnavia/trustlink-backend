@@ -1,8 +1,8 @@
 /**
  * @file external.controller.js
  * @description Controlador completo para integración externa de barrios privados (validación de QR),
- * diagnóstico técnico del sistema, gestión de pases QR con paginación y filtros (incluyendo comunidad),
- * administración de comunidades y configuración de claves/integraciones por comunidad para superadmin.
+ * diagnóstico técnico del sistema, gestión de pases QR con paginación y filtros,
+ * administración de comunidades, integraciones por comunidad y auditoría de accesos/transacciones (Punto 5).
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
 
@@ -26,6 +26,66 @@ const ensureIntegrationsTable = async () => {
   `);
 };
 
+/**
+ * Punto 5: Asegura la existencia de la tabla gate_access_logs de forma idempotente
+ * para auditar intentos autorizados y denegados de validación de pases QR.
+ */
+const ensureAuditLogsTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS gate_access_logs (
+      id SERIAL PRIMARY KEY,
+      qr_token VARCHAR(255) NULL,
+      pass_id INTEGER NULL,
+      country_id INTEGER NULL,
+      integration_label VARCHAR(120) NULL,
+      auth_mode VARCHAR(40) NOT NULL DEFAULT 'unknown',
+      authorized BOOLEAN NOT NULL DEFAULT FALSE,
+      reason_code VARCHAR(80) NOT NULL,
+      message TEXT NOT NULL,
+      http_status INTEGER NOT NULL DEFAULT 200,
+      created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+    );
+  `);
+};
+
+/**
+ * Registra un evento en gate_access_logs sin interrumpir la respuesta principal si falla el log.
+ */
+const recordGateAccessLog = async ({
+  qrToken = null,
+  passId = null,
+  countryId = null,
+  integrationLabel = null,
+  authMode = 'unknown',
+  authorized = false,
+  reasonCode = 'UNKNOWN',
+  message = '',
+  httpStatus = 200
+}) => {
+  try {
+    await ensureAuditLogsTable();
+    const safeToken = qrToken ? String(qrToken).slice(0, 120) : null;
+    await db.query(
+      `INSERT INTO gate_access_logs
+        (qr_token, pass_id, country_id, integration_label, auth_mode, authorized, reason_code, message, http_status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        safeToken,
+        passId || null,
+        countryId || null,
+        integrationLabel || null,
+        authMode,
+        Boolean(authorized),
+        reasonCode,
+        message,
+        httpStatus
+      ]
+    );
+  } catch (logErr) {
+    console.error('Error al registrar evento de auditoría en gate_access_logs:', logErr);
+  }
+};
+
 const maskApiKey = (apiKey = '') => {
   if (!apiKey || apiKey.length <= 10) return '••••••••••';
   return `${apiKey.slice(0, 10)}••••••••••••${apiKey.slice(-4)}`;
@@ -38,7 +98,7 @@ const maskApiKey = (apiKey = '') => {
 const getExternalDiagnostics = async (req, res) => {
   const startedAt = Date.now();
   try {
-    await ensureIntegrationsTable();
+    await Promise.all([ensureIntegrationsTable(), ensureAuditLogsTable()]);
     const dbCheck = await db.query('SELECT NOW() AS db_time');
     const dbLatencyMs = Date.now() - startedAt;
 
@@ -268,7 +328,6 @@ const toggleCountryStatus = async (req, res) => {
 
 /**
  * Lista todas las integraciones y claves API por comunidad para superadmin.
- * Incluye api_key para permitir copiarla desde el panel y masked_key para visualización enmascarada.
  */
 const listCommunityIntegrations = async (req, res) => {
   try {
@@ -324,7 +383,6 @@ const listCommunityIntegrations = async (req, res) => {
 
 /**
  * Crea una nueva API Key para una comunidad.
- * Devuelve la clave en claro una única vez al crearse.
  */
 const createCommunityIntegration = async (req, res) => {
   try {
@@ -457,8 +515,6 @@ const toggleCommunityIntegrationStatus = async (req, res) => {
 
 /**
  * Lista los pases QR recientes en la plataforma con paginación, búsqueda y filtro de estado.
- * Incluye comunidad (country_id y country_name), prestador, destino, vigencia y estado.
- * Uso exclusivo: rol 'superadmin'.
  */
 const listRecentPasses = async (req, res) => {
   try {
@@ -584,26 +640,164 @@ const cancelPassById = async (req, res) => {
 };
 
 /**
+ * Punto 5: Devuelve la auditoría de intentos de validación de acceso (autorizados vs. denegados
+ * y su motivo) junto con el resumen y listado reciente de contratos y transacciones.
+ * Uso exclusivo: rol 'superadmin'.
+ */
+const getAuditOverview = async (req, res) => {
+  try {
+    await ensureAuditLogsTable();
+
+    const outcome = String(req.query.outcome || 'all').trim().toLowerCase();
+    const search = String(req.query.search || '').trim();
+
+    const logConditions = [];
+    const logParams = [];
+
+    if (outcome === 'authorized') {
+      logConditions.push('gal.authorized = TRUE');
+    } else if (outcome === 'denied') {
+      logConditions.push('gal.authorized = FALSE');
+    }
+
+    if (search) {
+      logParams.push(`%${search}%`);
+      const idx = logParams.length;
+      logConditions.push(`(
+        COALESCE(gal.reason_code, '') ILIKE $${idx}
+        OR COALESCE(gal.qr_token, '') ILIKE $${idx}
+        OR COALESCE(gal.message, '') ILIKE $${idx}
+        OR COALESCE(c.name, '') ILIKE $${idx}
+        OR COALESCE(gal.integration_label, '') ILIKE $${idx}
+      )`);
+    }
+
+    const logWhere = logConditions.length > 0 ? `WHERE ${logConditions.join(' AND ')}` : '';
+
+    const accessLogsRes = await db.query(
+      `SELECT
+        gal.id,
+        gal.qr_token,
+        gal.pass_id,
+        gal.country_id,
+        c.name AS country_name,
+        gal.integration_label,
+        gal.auth_mode,
+        gal.authorized,
+        gal.reason_code,
+        gal.message,
+        gal.http_status,
+        gal.created_at
+       FROM gate_access_logs gal
+       LEFT JOIN countries c ON c.id = gal.country_id
+       ${logWhere}
+       ORDER BY gal.id DESC
+       LIMIT 20`,
+      logParams
+    );
+
+    const logSummaryRes = await db.query(`
+      SELECT
+        COUNT(*)::int AS total_attempts,
+        COUNT(*) FILTER (WHERE authorized = TRUE)::int AS authorized_count,
+        COUNT(*) FILTER (WHERE authorized = FALSE)::int AS denied_count
+      FROM gate_access_logs
+    `);
+
+    const txSummaryRes = await db.query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM service_contracts) AS total_contracts,
+        (SELECT COUNT(*)::int FROM service_contracts WHERE status = 'pending') AS pending_contracts,
+        (SELECT COUNT(*)::int FROM service_contracts WHERE status = 'completed') AS completed_contracts,
+        (SELECT COUNT(*)::int FROM transactions) AS total_transactions,
+        (SELECT COALESCE(SUM(total_amount), 0)::numeric(12,2) FROM transactions) AS gross_volume,
+        (SELECT COALESCE(SUM(platform_fee), 0)::numeric(12,2) FROM transactions) AS platform_fees,
+        (SELECT COALESCE(SUM(provider_payout), 0)::numeric(12,2) FROM transactions) AS provider_payouts
+    `);
+
+    const transactionsRes = await db.query(`
+      SELECT
+        t.id,
+        t.contract_id,
+        t.gateway_provider,
+        t.gateway_payment_id,
+        t.total_amount,
+        t.platform_fee,
+        t.provider_payout,
+        t.status,
+        t.created_at,
+        sc.description AS contract_description,
+        c.name AS country_name,
+        u_prov.first_name AS provider_first_name,
+        u_prov.last_name AS provider_last_name
+      FROM transactions t
+      LEFT JOIN service_contracts sc ON sc.id = t.contract_id
+      LEFT JOIN countries c ON c.id = sc.country_id
+      LEFT JOIN providers p ON p.id = sc.provider_id
+      LEFT JOIN users u_prov ON u_prov.id = p.user_id
+      ORDER BY t.id DESC
+      LIMIT 15
+    `);
+
+    return res.status(200).json({
+      access_summary: logSummaryRes.rows[0] || {
+        total_attempts: 0,
+        authorized_count: 0,
+        denied_count: 0
+      },
+      access_logs: accessLogsRes.rows,
+      financial_summary: txSummaryRes.rows[0] || {
+        total_contracts: 0,
+        pending_contracts: 0,
+        completed_contracts: 0,
+        total_transactions: 0,
+        gross_volume: '0.00',
+        platform_fees: '0.00',
+        provider_payouts: '0.00'
+      },
+      transactions: transactionsRes.rows
+    });
+  } catch (error) {
+    console.error('Error al consultar auditoría de accesos y transacciones:', error);
+    return res.status(500).json({
+      error: 'Error interno al consultar la auditoría de accesos y transacciones.'
+    });
+  }
+};
+
+/**
  * Validación externa de pase QR mediante API Key de comunidad, API Key global o JWT.
+ * Registra cada intento en gate_access_logs para auditoría del superadmin.
  */
 const verifyExternalPassByQR = async (req, res) => {
-  try {
-    await ensureIntegrationsTable();
+  const providedKey = String(req.headers['x-api-key'] || '').trim();
+  const envKey = String(process.env.EXTERNAL_GATE_API_KEY || '').trim();
+  const hasValidJwt = Boolean(
+    req.user && ['admin', 'superadmin', 'security'].includes(req.user.role)
+  );
+  const qrToken = String(req.body?.qr_token || '').trim();
+  const authMode = hasValidJwt ? 'jwt' : providedKey ? 'x-api-key' : 'none';
 
-    const providedKey = String(req.headers['x-api-key'] || '').trim();
-    const envKey = String(process.env.EXTERNAL_GATE_API_KEY || '').trim();
-    const hasValidJwt = Boolean(
-      req.user && ['admin', 'superadmin', 'security'].includes(req.user.role)
-    );
+  try {
+    await Promise.all([ensureIntegrationsTable(), ensureAuditLogsTable()]);
 
     let matchedIntegration = null;
 
     if (!hasValidJwt) {
       if (!providedKey) {
+        const msg = 'Debe enviar x-api-key o un token Bearer autorizado.';
+        await recordGateAccessLog({
+          qrToken,
+          authMode,
+          authorized: false,
+          reasonCode: 'MISSING_API_KEY',
+          message: msg,
+          httpStatus: 401
+        });
         return res.status(401).json({
           authorized: false,
           code: 'MISSING_API_KEY',
-          error: 'Debe enviar x-api-key o un token Bearer autorizado.'
+          error: msg
         });
       }
 
@@ -619,10 +813,21 @@ const verifyExternalPassByQR = async (req, res) => {
       if (keyLookup.rows.length > 0) {
         matchedIntegration = keyLookup.rows[0];
         if (!matchedIntegration.country_active) {
+          const msg = 'La comunidad asociada a esta clave de integración está inactiva.';
+          await recordGateAccessLog({
+            qrToken,
+            countryId: matchedIntegration.country_id,
+            integrationLabel: matchedIntegration.label,
+            authMode,
+            authorized: false,
+            reasonCode: 'COUNTRY_INACTIVE',
+            message: msg,
+            httpStatus: 403
+          });
           return res.status(403).json({
             authorized: false,
             code: 'COUNTRY_INACTIVE',
-            error: 'La comunidad asociada a esta clave de integración está inactiva.'
+            error: msg
           });
         }
         await db.query(
@@ -630,20 +835,50 @@ const verifyExternalPassByQR = async (req, res) => {
           [matchedIntegration.id]
         );
       } else if (!envKey || providedKey !== envKey) {
+        const msg = 'API Key externa inválida o inactiva.';
+        await recordGateAccessLog({
+          qrToken,
+          authMode,
+          authorized: false,
+          reasonCode: 'INVALID_API_KEY',
+          message: msg,
+          httpStatus: 401
+        });
         return res.status(401).json({
           authorized: false,
           code: 'INVALID_API_KEY',
-          error: 'API Key externa inválida o inactiva.'
+          error: msg
         });
       }
     }
 
-    const qrToken = String(req.body.qr_token || '').trim();
+    const effectiveAuthMode = matchedIntegration
+      ? 'community_api_key'
+      : hasValidJwt
+        ? 'jwt'
+        : 'global_env_key';
+    const effectiveIntegrationLabel = matchedIntegration
+      ? matchedIntegration.label
+      : hasValidJwt
+        ? `JWT (${req.user.role})`
+        : 'Global (.env)';
+
     if (!qrToken) {
+      const msg = 'El campo qr_token es obligatorio.';
+      await recordGateAccessLog({
+        qrToken: null,
+        countryId: matchedIntegration?.country_id || null,
+        integrationLabel: effectiveIntegrationLabel,
+        authMode: effectiveAuthMode,
+        authorized: false,
+        reasonCode: 'MISSING_QR_TOKEN',
+        message: msg,
+        httpStatus: 400
+      });
       return res.status(400).json({
         authorized: false,
         code: 'MISSING_QR_TOKEN',
-        error: 'El campo qr_token es obligatorio.'
+        error: msg
       });
     }
 
@@ -680,60 +915,144 @@ const verifyExternalPassByQR = async (req, res) => {
     );
 
     if (passQuery.rows.length === 0) {
+      const msg = 'Token QR inexistente.';
+      await recordGateAccessLog({
+        qrToken,
+        countryId: matchedIntegration?.country_id || null,
+        integrationLabel: effectiveIntegrationLabel,
+        authMode: effectiveAuthMode,
+        authorized: false,
+        reasonCode: 'PASS_NOT_FOUND',
+        message: msg,
+        httpStatus: 404
+      });
       return res.status(404).json({
         authorized: false,
         code: 'PASS_NOT_FOUND',
-        error: 'Token QR inexistente.'
+        error: msg
       });
     }
 
     const record = passQuery.rows[0];
 
     if (matchedIntegration && Number(record.country_id) !== Number(matchedIntegration.country_id)) {
+      const msg = `Este pase pertenece a ${record.country_name || 'otra comunidad'}, no a ${matchedIntegration.country_name}.`;
+      await recordGateAccessLog({
+        qrToken,
+        passId: record.id,
+        countryId: matchedIntegration.country_id,
+        integrationLabel: effectiveIntegrationLabel,
+        authMode: effectiveAuthMode,
+        authorized: false,
+        reasonCode: 'COUNTRY_MISMATCH',
+        message: msg,
+        httpStatus: 403
+      });
       return res.status(403).json({
         authorized: false,
         code: 'COUNTRY_MISMATCH',
-        error: `Este pase pertenece a ${record.country_name || 'otra comunidad'}, no a ${matchedIntegration.country_name}.`
+        error: msg
       });
     }
 
     if (record.status === 'cancelled') {
+      const msg = 'El pase QR fue cancelado.';
+      await recordGateAccessLog({
+        qrToken,
+        passId: record.id,
+        countryId: record.country_id,
+        integrationLabel: effectiveIntegrationLabel,
+        authMode: effectiveAuthMode,
+        authorized: false,
+        reasonCode: 'PASS_CANCELLED',
+        message: msg,
+        httpStatus: 403
+      });
       return res.status(403).json({
         authorized: false,
         code: 'PASS_CANCELLED',
-        error: 'El pase QR fue cancelado.'
+        error: msg
       });
     }
 
     const now = new Date();
     if (record.start_time && now < new Date(record.start_time)) {
+      const msg = 'El pase aún no está dentro de su franja horaria habilitada.';
+      await recordGateAccessLog({
+        qrToken,
+        passId: record.id,
+        countryId: record.country_id,
+        integrationLabel: effectiveIntegrationLabel,
+        authMode: effectiveAuthMode,
+        authorized: false,
+        reasonCode: 'BEFORE_TIME_WINDOW',
+        message: msg,
+        httpStatus: 403
+      });
       return res.status(403).json({
         authorized: false,
         code: 'BEFORE_TIME_WINDOW',
-        error: 'El pase aún no está dentro de su franja horaria habilitada.'
+        error: msg
       });
     }
 
     if (record.end_time && now > new Date(record.end_time)) {
+      const msg = 'El pase QR se encuentra fuera de vigencia horaria.';
+      await recordGateAccessLog({
+        qrToken,
+        passId: record.id,
+        countryId: record.country_id,
+        integrationLabel: effectiveIntegrationLabel,
+        authMode: effectiveAuthMode,
+        authorized: false,
+        reasonCode: 'OUT_OF_TIME_WINDOW',
+        message: msg,
+        httpStatus: 403
+      });
       return res.status(403).json({
         authorized: false,
         code: 'OUT_OF_TIME_WINDOW',
-        error: 'El pase QR se encuentra fuera de vigencia horaria.'
+        error: msg
       });
     }
 
     if (record.compliance_status && record.compliance_status !== 'approved') {
+      const msg = `El prestador no posee compliance aprobado (estado actual: ${record.compliance_status}).`;
+      await recordGateAccessLog({
+        qrToken,
+        passId: record.id,
+        countryId: record.country_id,
+        integrationLabel: effectiveIntegrationLabel,
+        authMode: effectiveAuthMode,
+        authorized: false,
+        reasonCode: 'COMPLIANCE_NOT_APPROVED',
+        message: msg,
+        httpStatus: 403
+      });
       return res.status(403).json({
         authorized: false,
         code: 'COMPLIANCE_NOT_APPROVED',
-        error: `El prestador no posee compliance aprobado (estado actual: ${record.compliance_status}).`
+        error: msg
       });
     }
+
+    const grantedMsg = 'Acceso autorizado para ingreso perimetral.';
+    await recordGateAccessLog({
+      qrToken,
+      passId: record.id,
+      countryId: record.country_id,
+      integrationLabel: effectiveIntegrationLabel,
+      authMode: effectiveAuthMode,
+      authorized: true,
+      reasonCode: 'ACCESS_GRANTED',
+      message: grantedMsg,
+      httpStatus: 200
+    });
 
     return res.status(200).json({
       authorized: true,
       code: 'ACCESS_GRANTED',
-      message: 'Acceso autorizado para ingreso perimetral.',
+      message: grantedMsg,
       integration: matchedIntegration
         ? { id: matchedIntegration.id, label: matchedIntegration.label }
         : { mode: hasValidJwt ? 'jwt' : 'global_env_key' },
@@ -772,10 +1091,20 @@ const verifyExternalPassByQR = async (req, res) => {
     });
   } catch (error) {
     console.error('Error en validación externa de pase QR:', error);
+    const errMsg = 'Error interno al validar el pase QR.';
+    await recordGateAccessLog({
+      qrToken,
+      integrationLabel: 'Sistema',
+      authMode,
+      authorized: false,
+      reasonCode: 'INTERNAL_SERVER_ERROR',
+      message: errMsg,
+      httpStatus: 500
+    });
     return res.status(500).json({
       authorized: false,
       code: 'INTERNAL_SERVER_ERROR',
-      error: 'Error interno al validar el pase QR.'
+      error: errMsg
     });
   }
 };
@@ -792,5 +1121,6 @@ module.exports = {
   toggleCommunityIntegrationStatus,
   listRecentPasses,
   cancelPassById,
+  getAuditOverview,
   verifyExternalPassByQR
 };

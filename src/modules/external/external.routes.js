@@ -1,7 +1,8 @@
 /**
  * @file external.routes.js
  * @description Enrutador para endpoints de consumo externo, diagnóstico técnico,
- * gestión de pases QR, administración de comunidades e integraciones por comunidad.
+ * gestión de pases QR, administración de comunidades, integraciones por comunidad
+ * y auditoría de accesos y transacciones (Punto 5).
  * @location /trustlink-backend/src/modules/external/external.routes.js
  */
 
@@ -20,6 +21,7 @@ const {
   toggleCommunityIntegrationStatus,
   listRecentPasses,
   cancelPassById,
+  getAuditOverview,
   verifyExternalPassByQR
 } = require('./external.controller');
 
@@ -60,6 +62,9 @@ router.patch('/integrations/:id/toggle', verifyToken, verifyRole(['superadmin'])
 // Gestión de pases QR recientes (Exclusivo superadmin)
 router.get('/passes', verifyToken, verifyRole(['superadmin']), listRecentPasses);
 router.patch('/passes/:id/cancel', verifyToken, verifyRole(['superadmin']), cancelPassById);
+
+// Punto 5: Trazabilidad de eventos y auditoría de accesos y transacciones (Exclusivo superadmin)
+router.get('/audit', verifyToken, verifyRole(['superadmin']), getAuditOverview);
 
 // Validación externa de pase QR
 router.post('/passes/verify', optionalJwtAuth, verifyExternalPassByQR);
