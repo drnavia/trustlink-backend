@@ -42,7 +42,7 @@ const createPass = async (req, res) => {
     // 1. Generar un token criptográfico único para el código QR
     const qr_token = crypto.randomBytes(32).toString('hex');
 
-    // 2. Insertar el pase en PostgreSQL usando timestamp ISO normalizado en UTC
+    // 2. Insertar el pase en PostgreSQL normalizando el instante recibido a UTC
     const query = `
       INSERT INTO access_passes (
         country_id,
@@ -55,7 +55,17 @@ const createPass = async (req, res) => {
         end_time,
         status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7::timestamp, $8::timestamp, 'pending')
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        ($7::timestamptz AT TIME ZONE 'UTC'),
+        ($8::timestamptz AT TIME ZONE 'UTC'),
+        'pending'
+      )
       RETURNING id, qr_token, start_time, end_time, status, created_at;
     `;
 
@@ -101,12 +111,16 @@ const verifyPassByQR = async (req, res) => {
     }
 
     // 1. Buscar el pase junto con los datos del prestador, vehículo y residente
+    // y calcular epoch ms en UTC directamente en PostgreSQL para evitar desfases de zona horaria
     const query = `
       SELECT
         ap.id AS pass_id,
         ap.status AS pass_status,
         ap.start_time,
         ap.end_time,
+        (EXTRACT(EPOCH FROM (ap.start_time AT TIME ZONE 'UTC')) * 1000)::bigint AS start_utc_ms,
+        (EXTRACT(EPOCH FROM (ap.end_time AT TIME ZONE 'UTC')) * 1000)::bigint AS end_utc_ms,
+        (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint AS now_utc_ms,
         ap.country_id,
         u_prov.first_name AS provider_first_name,
         u_prov.last_name AS provider_last_name,
@@ -164,21 +178,18 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
-    // 5. Validar franja horaria autorizada
-    // Nota: al haberse guardado en ISO UTC, interpretamos el timestamp devuelto por pg como UTC
-    const startMs = new Date(`${String(passInfo.start_time).replace(' ', 'T')}Z`).getTime();
-    const endMs = new Date(`${String(passInfo.end_time).replace(' ', 'T')}Z`).getTime();
-    const nowMs = Date.now();
+    // 5. Validar franja horaria autorizada en UTC
+    const startMs = Number(passInfo.start_utc_ms);
+    const endMs = Number(passInfo.end_utc_ms);
+    const nowMs = Number(passInfo.now_utc_ms);
 
-    const parsedStartMs = Number.isNaN(startMs) ? new Date(passInfo.start_time).getTime() : startMs;
-    const parsedEndMs = Number.isNaN(endMs) ? new Date(passInfo.end_time).getTime() : endMs;
-
-    if (nowMs < parsedStartMs || nowMs > parsedEndMs) {
+    if (nowMs < startMs || nowMs > endMs) {
       return res.status(400).json({
         authorized: false,
         error: 'El pase se encuentra fuera de la franja horaria autorizada.',
-        valid_from: new Date(parsedStartMs).toISOString(),
-        valid_to: new Date(parsedEndMs).toISOString()
+        valid_from: new Date(startMs).toISOString(),
+        valid_to: new Date(endMs).toISOString(),
+        evaluated_at: new Date(nowMs).toISOString()
       });
     }
 
