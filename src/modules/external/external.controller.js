@@ -49,9 +49,9 @@ const ensureAuditLogsTable = async () => {
 };
 
 /**
- * Marca como 'expired' en PostgreSQL los pases en estado 'pending' cuya end_time
- * (interpretada en UTC, consistente con el almacenamiento del módulo de pases) ya venció.
- * Opcionalmente filtra por passId para actualizar un único pase de forma focalizada.
+ * Persiste en PostgreSQL el estado 'expired'::pass_status para pases en estado 'pending'
+ * cuya end_time (almacenada en UTC sin zona horaria) ya superó el instante actual (NOW()).
+ * Respeta estados terminales como 'cancelled' y 'used'.
  */
 const expireOverduePasses = async (passId = null) => {
   try {
@@ -946,7 +946,7 @@ const verifyExternalPassByQR = async (req, res) => {
        LEFT JOIN countries c ON c.id = ap.country_id
        LEFT JOIN users u_owner ON u_owner.id = ap.owner_id
        LEFT JOIN providers p ON p.id = ap.provider_id
-       LEFT JOIN users u_prov ON u_prov.id = p.user_id
+       LEFT JOIN users u_prov ON p.user_id = u_prov.id
        LEFT JOIN provider_vehicles pv ON pv.provider_id = p.id
        WHERE ap.qr_token = $1
        ORDER BY pv.id DESC NULLS LAST
