@@ -1,7 +1,7 @@
 /**
  * @file external.routes.js
  * @description Enrutador para endpoints de consumo externo, diagnóstico técnico,
- * gestión de pases QR y administración de comunidades para superadmin.
+ * gestión de pases QR, administración de comunidades e integraciones por comunidad.
  * @location /trustlink-backend/src/modules/external/external.routes.js
  */
 
@@ -14,6 +14,10 @@ const {
   createCountry,
   updateCountry,
   toggleCountryStatus,
+  listCommunityIntegrations,
+  createCommunityIntegration,
+  rotateCommunityIntegrationKey,
+  toggleCommunityIntegrationStatus,
   listRecentPasses,
   cancelPassById,
   verifyExternalPassByQR
@@ -21,10 +25,6 @@ const {
 
 const router = Router();
 
-/**
- * Middleware opcional: si se envía Authorization Bearer JWT válido, adjunta req.user;
- * si no, deja pasar para validar x-api-key en el controlador.
- */
 const optionalJwtAuth = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -42,20 +42,26 @@ const optionalJwtAuth = (req, res, next) => {
   next();
 };
 
-// Endpoint de diagnóstico técnico (Exclusivo superadmin)
+// Diagnóstico técnico (Exclusivo superadmin)
 router.get('/status', verifyToken, verifyRole(['superadmin']), getExternalDiagnostics);
 
-// Gestión de comunidades / countries (Exclusivo superadmin)
+// Gestión de comunidades (Exclusivo superadmin)
 router.get('/countries', verifyToken, verifyRole(['superadmin']), listCountries);
 router.post('/countries', verifyToken, verifyRole(['superadmin']), createCountry);
 router.patch('/countries/:id', verifyToken, verifyRole(['superadmin']), updateCountry);
 router.patch('/countries/:id/toggle', verifyToken, verifyRole(['superadmin']), toggleCountryStatus);
 
-// Listado y cancelación de pases QR recientes (Exclusivo superadmin)
+// Punto 4: Integraciones y claves API por comunidad (Exclusivo superadmin)
+router.get('/integrations', verifyToken, verifyRole(['superadmin']), listCommunityIntegrations);
+router.post('/integrations', verifyToken, verifyRole(['superadmin']), createCommunityIntegration);
+router.patch('/integrations/:id/rotate', verifyToken, verifyRole(['superadmin']), rotateCommunityIntegrationKey);
+router.patch('/integrations/:id/toggle', verifyToken, verifyRole(['superadmin']), toggleCommunityIntegrationStatus);
+
+// Gestión de pases QR recientes (Exclusivo superadmin)
 router.get('/passes', verifyToken, verifyRole(['superadmin']), listRecentPasses);
 router.patch('/passes/:id/cancel', verifyToken, verifyRole(['superadmin']), cancelPassById);
 
-// Endpoint para validación de pase QR desde aplicaciones de barrios privados
+// Validación externa de pase QR
 router.post('/passes/verify', optionalJwtAuth, verifyExternalPassByQR);
 
 module.exports = router;
