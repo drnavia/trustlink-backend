@@ -1,8 +1,8 @@
 /**
  * @file external.controller.js
- * @description Controlador para integración externa de barrios privados (validación de QR),
- * diagnóstico técnico del sistema, gestión de pases QR, administración de comunidades
- * y configuración de claves/integraciones por comunidad para superadmin.
+ * @description Controlador completo para integración externa de barrios privados (validación de QR),
+ * diagnóstico técnico del sistema, gestión de pases QR con paginación y filtros,
+ * administración de comunidades y configuración de claves/integraciones por comunidad para superadmin.
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
 
@@ -77,6 +77,7 @@ const getExternalDiagnostics = async (req, res) => {
       metrics: metricsCheck.rows[0] || {
         total_passes: 0,
         approved_providers: 0,
+        active_countries: 0,
         total_countries: 0,
         active_integrations: 0
       }
@@ -454,39 +455,96 @@ const toggleCommunityIntegrationStatus = async (req, res) => {
 };
 
 /**
- * Lista pases QR recientes para auditoría del superadmin.
+ * Lista los pases QR recientes en la plataforma con paginación, búsqueda y filtro de estado.
+ * Usa las columnas reales de access_passes: start_time, end_time, created_at.
+ * Uso exclusivo: rol 'superadmin'.
  */
 const listRecentPasses = async (req, res) => {
   try {
-    const result = await db.query(`
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 8, 1), 50);
+    const status = String(req.query.status || 'all').trim().toLowerCase();
+    const search = String(req.query.search || '').trim();
+
+    const conditions = [];
+    const params = [];
+
+    if (['pending', 'used', 'expired', 'cancelled'].includes(status)) {
+      params.push(status);
+      conditions.push(`ap.status = $${params.length}::pass_status`);
+    }
+
+    if (search) {
+      params.push(`%${search}%`);
+      const idx = params.length;
+      conditions.push(`(
+        CAST(ap.id AS TEXT) ILIKE $${idx}
+        OR COALESCE(ap.fraction_number, '') ILIKE $${idx}
+        OR COALESCE(ap.lot_number, '') ILIKE $${idx}
+        OR COALESCE(c.name, '') ILIKE $${idx}
+        OR COALESCE(u_prov.first_name, '') ILIKE $${idx}
+        OR COALESCE(u_prov.last_name, '') ILIKE $${idx}
+        OR COALESCE(p.specialty, '') ILIKE $${idx}
+      )`);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM access_passes ap
+      LEFT JOIN countries c ON ap.country_id = c.id
+      LEFT JOIN providers p ON ap.provider_id = p.id
+      LEFT JOIN users u_prov ON p.user_id = u_prov.id
+      ${whereClause};
+    `;
+    const countRes = await db.query(countQuery, params);
+    const total = countRes.rows[0]?.total || 0;
+    const totalPages = Math.max(Math.ceil(total / limit), 1);
+    const safePage = Math.min(page, totalPages);
+    const safeOffset = (safePage - 1) * limit;
+
+    const dataQuery = `
       SELECT
         ap.id,
         ap.qr_token,
         ap.status,
         ap.fraction_number,
         ap.lot_number,
-        ap.valid_from,
-        ap.valid_to,
+        ap.start_time,
+        ap.end_time,
         ap.created_at,
         c.name AS country_name,
-        u_owner.first_name AS owner_first_name,
-        u_owner.last_name AS owner_last_name,
         u_prov.first_name AS provider_first_name,
         u_prov.last_name AS provider_last_name,
-        p.specialty AS provider_specialty
+        p.specialty AS provider_specialty,
+        u_owner.first_name AS owner_first_name,
+        u_owner.last_name AS owner_last_name
       FROM access_passes ap
-      LEFT JOIN countries c ON c.id = ap.country_id
-      LEFT JOIN users u_owner ON u_owner.id = ap.owner_id
-      LEFT JOIN providers p ON p.id = ap.provider_id
-      LEFT JOIN users u_prov ON u_prov.id = p.user_id
+      LEFT JOIN countries c ON ap.country_id = c.id
+      LEFT JOIN providers p ON ap.provider_id = p.id
+      LEFT JOIN users u_prov ON p.user_id = u_prov.id
+      LEFT JOIN users u_owner ON ap.owner_id = u_owner.id
+      ${whereClause}
       ORDER BY ap.id DESC
-      LIMIT 25
-    `);
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2};
+    `;
 
-    return res.status(200).json({ passes: result.rows });
+    const result = await db.query(dataQuery, [...params, limit, safeOffset]);
+
+    return res.status(200).json({
+      count: result.rows.length,
+      total,
+      page: safePage,
+      limit,
+      totalPages,
+      passes: result.rows
+    });
   } catch (error) {
-    console.error('Error al listar pases recientes:', error);
-    return res.status(500).json({ error: 'Error interno al consultar pases recientes.' });
+    console.error('Error al listar pases QR recientes:', error);
+    return res.status(500).json({
+      error: 'Error interno al consultar los pases QR recientes.'
+    });
   }
 };
 
@@ -502,7 +560,7 @@ const cancelPassById = async (req, res) => {
 
     const updated = await db.query(
       `UPDATE access_passes
-       SET status = 'cancelled'
+       SET status = 'cancelled'::pass_status
        WHERE id = $1
        RETURNING id, status`,
       [id]
@@ -524,6 +582,7 @@ const cancelPassById = async (req, res) => {
 
 /**
  * Validación externa de pase QR mediante API Key de comunidad, API Key global o JWT.
+ * Usa start_time y end_time de la tabla access_passes.
  */
 const verifyExternalPassByQR = async (req, res) => {
   try {
@@ -645,7 +704,7 @@ const verifyExternalPassByQR = async (req, res) => {
     }
 
     const now = new Date();
-    if (record.valid_from && now < new Date(record.valid_from)) {
+    if (record.start_time && now < new Date(record.start_time)) {
       return res.status(403).json({
         authorized: false,
         code: 'BEFORE_TIME_WINDOW',
@@ -653,7 +712,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
-    if (record.valid_to && now > new Date(record.valid_to)) {
+    if (record.end_time && now > new Date(record.end_time)) {
       return res.status(403).json({
         authorized: false,
         code: 'OUT_OF_TIME_WINDOW',
@@ -686,8 +745,8 @@ const verifyExternalPassByQR = async (req, res) => {
         fraction_number: record.fraction_number,
         lot_number: record.lot_number,
         authorized_by: `${record.owner_first_name || ''} ${record.owner_last_name || ''}`.trim() || 'Residente',
-        valid_from: record.valid_from,
-        valid_to: record.valid_to
+        start_time: record.start_time,
+        end_time: record.end_time
       },
       provider: {
         id: record.provider_profile_id,

@@ -51,7 +51,7 @@ router.post('/countries', verifyToken, verifyRole(['superadmin']), createCountry
 router.patch('/countries/:id', verifyToken, verifyRole(['superadmin']), updateCountry);
 router.patch('/countries/:id/toggle', verifyToken, verifyRole(['superadmin']), toggleCountryStatus);
 
-// Punto 4: Integraciones y claves API por comunidad (Exclusivo superadmin)
+// Integraciones y claves API por comunidad (Exclusivo superadmin)
 router.get('/integrations', verifyToken, verifyRole(['superadmin']), listCommunityIntegrations);
 router.post('/integrations', verifyToken, verifyRole(['superadmin']), createCommunityIntegration);
 router.patch('/integrations/:id/rotate', verifyToken, verifyRole(['superadmin']), rotateCommunityIntegrationKey);
