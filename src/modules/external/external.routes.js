@@ -1,12 +1,13 @@
 /**
  * @file external.routes.js
- * @description Enrutador para endpoints de consumo externo por aplicaciones de barrios privados.
+ * @description Enrutador para endpoints de consumo externo y diagnóstico técnico para superadmin.
  * @location /trustlink-backend/src/modules/external/external.routes.js
  */
 
 const { Router } = require('express');
 const jwt = require('jsonwebtoken');
-const { verifyExternalPassByQR } = require('./external.controller');
+const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
+const { getExternalDiagnostics, verifyExternalPassByQR } = require('./external.controller');
 
 const router = Router();
 
@@ -30,6 +31,9 @@ const optionalJwtAuth = (req, res, next) => {
   }
   next();
 };
+
+// Endpoint de diagnóstico técnico (Exclusivo superadmin)
+router.get('/status', verifyToken, verifyRole(['superadmin']), getExternalDiagnostics);
 
 // Endpoint para validación de pase QR desde aplicaciones de barrios privados
 router.post('/passes/verify', optionalJwtAuth, verifyExternalPassByQR);

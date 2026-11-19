@@ -1,12 +1,71 @@
 /**
  * @file external.controller.js
- * @description Endpoint de integración para aplicaciones y sistemas de garita de barrios privados.
- * Valida tokens QR emitidos por TrustLink y devuelve información estructurada del pase,
- * prestador, compliance y vehículo.
+ * @description Endpoint de integración para aplicaciones y sistemas de garita de barrios privados,
+ * y diagnóstico técnico protegido para el rol superadmin.
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
 
 const db = require('../../config/db');
+
+/**
+ * Diagnóstico del estado del backend, PostgreSQL y endpoint externo.
+ * Uso exclusivo: rol 'superadmin'.
+ */
+const getExternalDiagnostics = async (req, res) => {
+  const startedAt = Date.now();
+  try {
+    const dbCheck = await db.query('SELECT NOW() AS db_time');
+    const metricsCheck = await db.query(`
+      SELECT
+        (SELECT COUNT(*)::int FROM access_passes) AS total_passes,
+        (SELECT COUNT(*)::int FROM providers WHERE status = 'approved') AS approved_providers,
+        (SELECT COUNT(*)::int FROM countries) AS total_countries
+    `);
+
+    const dbLatencyMs = Date.now() - startedAt;
+    const apiKeyConfigured = Boolean(process.env.EXTERNAL_GATE_API_KEY && String(process.env.EXTERNAL_GATE_API_KEY).trim());
+
+    return res.status(200).json({
+      status: 'healthy',
+      service: 'trustlink-backend',
+      timestamp: new Date().toISOString(),
+      uptime_seconds: Math.floor(process.uptime()),
+      database: {
+        connected: true,
+        latency_ms: dbLatencyMs,
+        db_time: dbCheck.rows[0]?.db_time || null
+      },
+      external_endpoint: {
+        route: '/api/v1/external/passes/verify',
+        method: 'POST',
+        api_key_configured: apiKeyConfigured,
+        auth_modes: ['x-api-key', 'Bearer JWT (admin, superadmin, security)']
+      },
+      metrics: metricsCheck.rows[0] || {
+        total_passes: 0,
+        approved_providers: 0,
+        total_countries: 0
+      }
+    });
+  } catch (error) {
+    console.error('Error en diagnóstico técnico externo:', error);
+    return res.status(500).json({
+      status: 'degraded',
+      service: 'trustlink-backend',
+      timestamp: new Date().toISOString(),
+      database: {
+        connected: false,
+        latency_ms: Date.now() - startedAt
+      },
+      external_endpoint: {
+        route: '/api/v1/external/passes/verify',
+        method: 'POST',
+        api_key_configured: Boolean(process.env.EXTERNAL_GATE_API_KEY && String(process.env.EXTERNAL_GATE_API_KEY).trim())
+      },
+      error: 'Error al consultar la base de datos o el estado del servicio.'
+    });
+  }
+};
 
 /**
  * Valida un token QR para sistemas externos de barrios privados.
@@ -26,7 +85,6 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
-    // Validar autenticación externa por API Key si no viene un req.user autenticado por JWT
     const scopedCountryId = req.user?.countryId || bodyCountryId || null;
 
     if (!req.user) {
@@ -176,5 +234,6 @@ const verifyExternalPassByQR = async (req, res) => {
 };
 
 module.exports = {
+  getExternalDiagnostics,
   verifyExternalPassByQR
 };
