@@ -2,7 +2,8 @@
  * @file external.controller.js
  * @description Controlador completo para integración externa de barrios privados (validación de QR),
  * diagnóstico técnico del sistema, gestión de pases QR con paginación y filtros,
- * administración de comunidades, integraciones por comunidad y auditoría de accesos/transacciones (Punto 5).
+ * administración de comunidades (nombre, dirección, código postal, localidad, provincia y estado),
+ * integraciones por comunidad y auditoría paginada de accesos y transacciones.
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
 
@@ -27,8 +28,20 @@ const ensureIntegrationsTable = async () => {
 };
 
 /**
- * Punto 5: Asegura la existencia de la tabla gate_access_logs de forma idempotente
- * para auditar intentos autorizados y denegados de validación de pases QR.
+ * Asegura que la tabla countries tenga los campos de dirección, código postal, localidad y provincia.
+ */
+const ensureCountriesAddressColumns = async () => {
+  await db.query(`
+    ALTER TABLE countries
+      ADD COLUMN IF NOT EXISTS address VARCHAR(255) NULL,
+      ADD COLUMN IF NOT EXISTS postal_code VARCHAR(30) NULL,
+      ADD COLUMN IF NOT EXISTS locality VARCHAR(120) NULL,
+      ADD COLUMN IF NOT EXISTS province VARCHAR(120) NULL;
+  `);
+};
+
+/**
+ * Asegura la existencia de la tabla gate_access_logs de forma idempotente.
  */
 const ensureAuditLogsTable = async () => {
   await db.query(`
@@ -48,9 +61,18 @@ const ensureAuditLogsTable = async () => {
   `);
 };
 
-/**
- * Registra un evento en gate_access_logs sin interrumpir la respuesta principal si falla el log.
- */
+const composeLocationSummary = ({ location, address, postalCode, locality, province }) => {
+  const parts = [address, locality, province].map((v) => String(v || '').trim()).filter(Boolean);
+  const cp = String(postalCode || '').trim();
+  if (parts.length > 0) {
+    return cp ? `${parts.join(' - ')} (CP ${cp})` : parts.join(' - ');
+  }
+  if (cp) {
+    return location ? `${String(location).trim()} (CP ${cp})` : `CP ${cp}`;
+  }
+  return location ? String(location).trim() : null;
+};
+
 const recordGateAccessLog = async ({
   qrToken = null,
   passId = null,
@@ -98,7 +120,11 @@ const maskApiKey = (apiKey = '') => {
 const getExternalDiagnostics = async (req, res) => {
   const startedAt = Date.now();
   try {
-    await Promise.all([ensureIntegrationsTable(), ensureAuditLogsTable()]);
+    await Promise.all([
+      ensureIntegrationsTable(),
+      ensureAuditLogsTable(),
+      ensureCountriesAddressColumns()
+    ]);
     const dbCheck = await db.query('SELECT NOW() AS db_time');
     const dbLatencyMs = Date.now() - startedAt;
 
@@ -162,6 +188,7 @@ const getExternalDiagnostics = async (req, res) => {
  */
 const listCountries = async (req, res) => {
   try {
+    await ensureCountriesAddressColumns();
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 50);
     const status = String(req.query.status || 'all').toLowerCase();
@@ -180,7 +207,15 @@ const listCountries = async (req, res) => {
     if (search) {
       params.push(`%${search}%`);
       const idx = params.length;
-      conditions.push(`(CAST(id AS TEXT) ILIKE $${idx} OR name ILIKE $${idx} OR COALESCE(location, '') ILIKE $${idx})`);
+      conditions.push(`(
+        CAST(id AS TEXT) ILIKE $${idx}
+        OR name ILIKE $${idx}
+        OR COALESCE(location, '') ILIKE $${idx}
+        OR COALESCE(address, '') ILIKE $${idx}
+        OR COALESCE(postal_code, '') ILIKE $${idx}
+        OR COALESCE(locality, '') ILIKE $${idx}
+        OR COALESCE(province, '') ILIKE $${idx}
+      )`);
     }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -194,7 +229,16 @@ const listCountries = async (req, res) => {
 
     const dataParams = [...params, limit, offset];
     const result = await db.query(
-      `SELECT id, name, location, is_active, created_at
+      `SELECT
+        id,
+        name,
+        location,
+        address,
+        postal_code,
+        locality,
+        province,
+        is_active,
+        created_at
        FROM countries
        ${whereClause}
        ORDER BY id ASC
@@ -216,25 +260,35 @@ const listCountries = async (req, res) => {
 };
 
 /**
- * Crea una nueva comunidad en countries.
+ * Crea una nueva comunidad en countries con nombre, dirección, código postal, localidad, provincia y estado.
  */
 const createCountry = async (req, res) => {
   try {
+    await ensureCountriesAddressColumns();
     const name = String(req.body.name || '').trim();
-    const location = req.body.location !== undefined && req.body.location !== null
-      ? String(req.body.location).trim()
-      : null;
+    const address = req.body.address !== undefined ? (String(req.body.address).trim() || null) : null;
+    const postalCode = req.body.postal_code !== undefined ? (String(req.body.postal_code).trim() || null) : null;
+    const locality = req.body.locality !== undefined ? (String(req.body.locality).trim() || null) : null;
+    const province = req.body.province !== undefined ? (String(req.body.province).trim() || null) : null;
     const isActive = req.body.is_active !== undefined ? Boolean(req.body.is_active) : true;
 
+    const location = composeLocationSummary({
+      location: req.body.location,
+      address,
+      postalCode,
+      locality,
+      province
+    });
+
     if (!name) {
-      return res.status(400).json({ error: 'El nombre de la comunidad es obligatorio.' });
+      return res.status(400).json({ error: 'El nombre de la comunidad / barrio es obligatorio.' });
     }
 
     const insertResult = await db.query(
-      `INSERT INTO countries (name, location, is_active)
-       VALUES ($1, $2, $3)
-       RETURNING id, name, location, is_active, created_at`,
-      [name, location || null, isActive]
+      `INSERT INTO countries (name, location, address, postal_code, locality, province, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, name, location, address, postal_code, locality, province, is_active, created_at`,
+      [name, location, address, postalCode, locality, province, isActive]
     );
 
     return res.status(201).json({
@@ -248,17 +302,19 @@ const createCountry = async (req, res) => {
 };
 
 /**
- * Edita nombre, ubicación o estado de una comunidad existente.
+ * Edita nombre, dirección, código postal, localidad, provincia o estado de una comunidad existente.
  */
 const updateCountry = async (req, res) => {
   try {
+    await ensureCountriesAddressColumns();
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) {
       return res.status(400).json({ error: 'ID de comunidad inválido.' });
     }
 
     const existingResult = await db.query(
-      'SELECT id, name, location, is_active, created_at FROM countries WHERE id = $1',
+      `SELECT id, name, location, address, postal_code, locality, province, is_active, created_at
+       FROM countries WHERE id = $1`,
       [id]
     );
     if (existingResult.rows.length === 0) {
@@ -267,21 +323,44 @@ const updateCountry = async (req, res) => {
 
     const current = existingResult.rows[0];
     const nextName = req.body.name !== undefined ? String(req.body.name).trim() : current.name;
-    const nextLocation = req.body.location !== undefined
-      ? (String(req.body.location).trim() || null)
-      : current.location;
+    const nextAddress = req.body.address !== undefined
+      ? (String(req.body.address).trim() || null)
+      : current.address;
+    const nextPostalCode = req.body.postal_code !== undefined
+      ? (String(req.body.postal_code).trim() || null)
+      : current.postal_code;
+    const nextLocality = req.body.locality !== undefined
+      ? (String(req.body.locality).trim() || null)
+      : current.locality;
+    const nextProvince = req.body.province !== undefined
+      ? (String(req.body.province).trim() || null)
+      : current.province;
     const nextIsActive = req.body.is_active !== undefined ? Boolean(req.body.is_active) : current.is_active;
 
+    const nextLocation = composeLocationSummary({
+      location: req.body.location !== undefined ? req.body.location : current.location,
+      address: nextAddress,
+      postalCode: nextPostalCode,
+      locality: nextLocality,
+      province: nextProvince
+    });
+
     if (!nextName) {
-      return res.status(400).json({ error: 'El nombre de la comunidad no puede quedar vacío.' });
+      return res.status(400).json({ error: 'El nombre de la comunidad / barrio no puede quedar vacío.' });
     }
 
     const updatedResult = await db.query(
       `UPDATE countries
-       SET name = $1, location = $2, is_active = $3
-       WHERE id = $4
-       RETURNING id, name, location, is_active, created_at`,
-      [nextName, nextLocation, nextIsActive, id]
+       SET name = $1,
+           location = $2,
+           address = $3,
+           postal_code = $4,
+           locality = $5,
+           province = $6,
+           is_active = $7
+       WHERE id = $8
+       RETURNING id, name, location, address, postal_code, locality, province, is_active, created_at`,
+      [nextName, nextLocation, nextAddress, nextPostalCode, nextLocality, nextProvince, nextIsActive, id]
     );
 
     return res.status(200).json({
@@ -299,6 +378,7 @@ const updateCountry = async (req, res) => {
  */
 const toggleCountryStatus = async (req, res) => {
   try {
+    await ensureCountriesAddressColumns();
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) {
       return res.status(400).json({ error: 'ID de comunidad inválido.' });
@@ -308,7 +388,7 @@ const toggleCountryStatus = async (req, res) => {
       `UPDATE countries
        SET is_active = NOT is_active
        WHERE id = $1
-       RETURNING id, name, location, is_active, created_at`,
+       RETURNING id, name, location, address, postal_code, locality, province, is_active, created_at`,
       [id]
     );
 
@@ -640,8 +720,8 @@ const cancelPassById = async (req, res) => {
 };
 
 /**
- * Punto 5: Devuelve la auditoría de intentos de validación de acceso (autorizados vs. denegados
- * y su motivo) junto con el resumen y listado reciente de contratos y transacciones.
+ * Devuelve la auditoría de intentos de validación de acceso (paginada y filtrable)
+ * junto con el resumen y listado reciente de contratos y transacciones.
  * Uso exclusivo: rol 'superadmin'.
  */
 const getAuditOverview = async (req, res) => {
@@ -650,6 +730,8 @@ const getAuditOverview = async (req, res) => {
 
     const outcome = String(req.query.outcome || 'all').trim().toLowerCase();
     const search = String(req.query.search || '').trim();
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 50);
 
     const logConditions = [];
     const logParams = [];
@@ -674,6 +756,18 @@ const getAuditOverview = async (req, res) => {
 
     const logWhere = logConditions.length > 0 ? `WHERE ${logConditions.join(' AND ')}` : '';
 
+    const countLogsRes = await db.query(
+      `SELECT COUNT(*)::int AS total
+       FROM gate_access_logs gal
+       LEFT JOIN countries c ON c.id = gal.country_id
+       ${logWhere}`,
+      logParams
+    );
+    const totalLogs = countLogsRes.rows[0]?.total || 0;
+    const totalLogPages = Math.max(Math.ceil(totalLogs / limit), 1);
+    const safeLogPage = Math.min(page, totalLogPages);
+    const logOffset = (safeLogPage - 1) * limit;
+
     const accessLogsRes = await db.query(
       `SELECT
         gal.id,
@@ -692,8 +786,8 @@ const getAuditOverview = async (req, res) => {
        LEFT JOIN countries c ON c.id = gal.country_id
        ${logWhere}
        ORDER BY gal.id DESC
-       LIMIT 20`,
-      logParams
+       LIMIT $${logParams.length + 1} OFFSET $${logParams.length + 2}`,
+      [...logParams, limit, logOffset]
     );
 
     const logSummaryRes = await db.query(`
@@ -736,7 +830,7 @@ const getAuditOverview = async (req, res) => {
       LEFT JOIN providers p ON p.id = sc.provider_id
       LEFT JOIN users u_prov ON u_prov.id = p.user_id
       ORDER BY t.id DESC
-      LIMIT 15
+      LIMIT 25
     `);
 
     return res.status(200).json({
@@ -746,6 +840,12 @@ const getAuditOverview = async (req, res) => {
         denied_count: 0
       },
       access_logs: accessLogsRes.rows,
+      access_pagination: {
+        total: totalLogs,
+        page: safeLogPage,
+        limit,
+        totalPages: totalLogPages
+      },
       financial_summary: txSummaryRes.rows[0] || {
         total_contracts: 0,
         pending_contracts: 0,
@@ -767,7 +867,6 @@ const getAuditOverview = async (req, res) => {
 
 /**
  * Validación externa de pase QR mediante API Key de comunidad, API Key global o JWT.
- * Registra cada intento en gate_access_logs para auditoría del superadmin.
  */
 const verifyExternalPassByQR = async (req, res) => {
   const providedKey = String(req.headers['x-api-key'] || '').trim();
