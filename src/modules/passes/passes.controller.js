@@ -110,8 +110,7 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
-    // 1. Buscar el pase junto con los datos del prestador, vehículo y residente
-    // y calcular epoch ms en UTC directamente en PostgreSQL para evitar desfases de zona horaria
+    // 1. Buscar el pase junto con los datos completos del prestador, vehículo y residente
     const query = `
       SELECT
         ap.id AS pass_id,
@@ -125,7 +124,9 @@ const verifyPassByQR = async (req, res) => {
         u_prov.first_name AS provider_first_name,
         u_prov.last_name AS provider_last_name,
         u_prov.dni AS provider_dni,
+        p.specialty AS provider_specialty,
         p.status AS provider_compliance_status,
+        pv.vehicle_type,
         pv.brand,
         pv.model,
         pv.color,
@@ -193,21 +194,28 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
-    // 6. Acceso autorizado
+    // 6. Acceso autorizado con detalle operativo completo para garita
     return res.status(200).json({
       authorized: true,
       message: 'Acceso autorizado con éxito.',
       details: {
+        pass_id: passInfo.pass_id,
+        pass_status: passInfo.pass_status,
         provider_first_name: passInfo.provider_first_name,
         provider_last_name: passInfo.provider_last_name,
         provider_dni: passInfo.provider_dni,
+        provider_specialty: passInfo.provider_specialty,
+        provider_compliance_status: passInfo.provider_compliance_status,
+        vehicle_type: passInfo.vehicle_type,
         brand: passInfo.brand,
         model: passInfo.model,
         color: passInfo.color,
         plate: passInfo.plate,
         fraction_number: passInfo.fraction_number,
         lot_number: passInfo.lot_number,
-        authorized_by: `${passInfo.owner_first_name} ${passInfo.owner_last_name}`
+        authorized_by: `${passInfo.owner_first_name} ${passInfo.owner_last_name}`,
+        valid_from: new Date(startMs).toISOString(),
+        valid_to: new Date(endMs).toISOString()
       }
     });
   } catch (error) {
