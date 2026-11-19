@@ -130,6 +130,59 @@ const createCountry = async (req, res) => {
 };
 
 /**
+ * Edita nombre y ubicación (y opcionalmente is_active) de una comunidad existente.
+ * Uso exclusivo: rol 'superadmin'.
+ */
+const updateCountry = async (req, res) => {
+  try {
+    const countryId = Number(req.params.id);
+    const { name, location, is_active } = req.body;
+
+    if (!Number.isInteger(countryId) || countryId <= 0) {
+      return res.status(400).json({ error: 'ID de comunidad inválido.' });
+    }
+
+    const cleanName = String(name || '').trim();
+    if (!cleanName) {
+      return res.status(400).json({ error: 'El nombre de la comunidad es obligatorio.' });
+    }
+
+    const existing = await db.query(
+      'SELECT id, name, location, is_active FROM countries WHERE id = $1 LIMIT 1',
+      [countryId]
+    );
+
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Comunidad no encontrada.' });
+    }
+
+    const current = existing.rows[0];
+    const nextLocation = location !== undefined
+      ? (String(location || '').trim() || null)
+      : current.location;
+    const nextActive = typeof is_active === 'boolean' ? is_active : current.is_active;
+
+    const updated = await db.query(
+      `UPDATE countries
+       SET name = $1, location = $2, is_active = $3
+       WHERE id = $4
+       RETURNING id, name, location, is_active, created_at`,
+      [cleanName, nextLocation, nextActive, countryId]
+    );
+
+    return res.status(200).json({
+      message: `Comunidad #${countryId} actualizada con éxito.`,
+      country: updated.rows[0]
+    });
+  } catch (error) {
+    console.error('Error al editar comunidad:', error);
+    return res.status(500).json({
+      error: 'Error interno al actualizar la comunidad.'
+    });
+  }
+};
+
+/**
  * Alterna o actualiza el estado is_active de una comunidad por ID.
  * Uso exclusivo: rol 'superadmin'.
  */
@@ -432,6 +485,7 @@ module.exports = {
   getExternalDiagnostics,
   listCountries,
   createCountry,
+  updateCountry,
   toggleCountryStatus,
   listRecentPasses,
   cancelPassById,

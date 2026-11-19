@@ -12,6 +12,7 @@ const {
   getExternalDiagnostics,
   listCountries,
   createCountry,
+  updateCountry,
   toggleCountryStatus,
   listRecentPasses,
   cancelPassById,
@@ -47,6 +48,7 @@ router.get('/status', verifyToken, verifyRole(['superadmin']), getExternalDiagno
 // Gestión de comunidades / countries (Exclusivo superadmin)
 router.get('/countries', verifyToken, verifyRole(['superadmin']), listCountries);
 router.post('/countries', verifyToken, verifyRole(['superadmin']), createCountry);
+router.patch('/countries/:id', verifyToken, verifyRole(['superadmin']), updateCountry);
 router.patch('/countries/:id/toggle', verifyToken, verifyRole(['superadmin']), toggleCountryStatus);
 
 // Listado y cancelación de pases QR recientes (Exclusivo superadmin)
