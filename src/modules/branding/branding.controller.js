@@ -1,9 +1,8 @@
 /**
  * @file branding.controller.js
- * @description Controlador modular para gestionar la apariencia global de TrustLink:
- * fondos (plataforma, menú, sub-menú, tarjetas Zona 4 y cajas internas Zona 5),
- * tipografías (plataforma, menú, sub-menú), logo opcional (SVG, PNG, JPG) y modo oscuro/claro,
- * con persistencia en PostgreSQL.
+ * @description Controlador modular para gestionar fondos y tipografías de las Zonas 1 a 6
+ * (Menú, Sub-menú, Plataforma general, Tarjetas principales, Cajas internas y Footer),
+ * logo opcional (SVG, PNG, JPG) y modo oscuro/claro, con persistencia en PostgreSQL.
  * @location /trustlink-backend/src/modules/branding/branding.controller.js
  */
 
@@ -11,14 +10,18 @@ const db = require('../../config/db');
 
 // Configuración inicial por defecto de TrustLink (estética oscura y sobria)
 const DEFAULT_BRANDING = {
-  platform_bg_color: '#0F172A',
   menu_bg_color: '#020617',
-  submenu_bg_color: '#090D16',
-  card_bg_color: '#020617',
-  inner_bg_color: '#0F172A',
-  platform_text_color: '#F1F5F9',
   menu_text_color: '#E2E8F0',
+  submenu_bg_color: '#090D16',
   submenu_text_color: '#CBD5E1',
+  platform_bg_color: '#0F172A',
+  platform_text_color: '#F1F5F9',
+  card_bg_color: '#020617',
+  card_text_color: '#F1F5F9',
+  inner_bg_color: '#0F172A',
+  inner_text_color: '#E2E8F0',
+  footer_bg_color: '#020617',
+  footer_text_color: '#94A3B8',
   logo_url: null,
   dark_mode: true,
 };
@@ -105,20 +108,24 @@ const normalizeLogoUrl = (value) => {
 };
 
 /**
- * Asegura la existencia de la tabla platform_branding y sus columnas de forma idempotente.
+ * Crea o actualiza de forma idempotente la tabla platform_branding con todas las zonas 1 a 6.
  */
 const ensureBrandingSchema = async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS platform_branding (
       id SERIAL PRIMARY KEY,
-      platform_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
       menu_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
-      submenu_bg_color VARCHAR(7) NOT NULL DEFAULT '#090D16',
-      card_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
-      inner_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
-      platform_text_color VARCHAR(7) NOT NULL DEFAULT '#F1F5F9',
       menu_text_color VARCHAR(7) NOT NULL DEFAULT '#E2E8F0',
+      submenu_bg_color VARCHAR(7) NOT NULL DEFAULT '#090D16',
       submenu_text_color VARCHAR(7) NOT NULL DEFAULT '#CBD5E1',
+      platform_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
+      platform_text_color VARCHAR(7) NOT NULL DEFAULT '#F1F5F9',
+      card_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
+      card_text_color VARCHAR(7) NOT NULL DEFAULT '#F1F5F9',
+      inner_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
+      inner_text_color VARCHAR(7) NOT NULL DEFAULT '#E2E8F0',
+      footer_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
+      footer_text_color VARCHAR(7) NOT NULL DEFAULT '#94A3B8',
       logo_url TEXT DEFAULT NULL,
       dark_mode BOOLEAN NOT NULL DEFAULT TRUE,
       updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
@@ -127,14 +134,18 @@ const ensureBrandingSchema = async () => {
 
   await db.query(`
     ALTER TABLE platform_branding
-      ADD COLUMN IF NOT EXISTS platform_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
       ADD COLUMN IF NOT EXISTS menu_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
-      ADD COLUMN IF NOT EXISTS submenu_bg_color VARCHAR(7) NOT NULL DEFAULT '#090D16',
-      ADD COLUMN IF NOT EXISTS card_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
-      ADD COLUMN IF NOT EXISTS inner_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
-      ADD COLUMN IF NOT EXISTS platform_text_color VARCHAR(7) NOT NULL DEFAULT '#F1F5F9',
       ADD COLUMN IF NOT EXISTS menu_text_color VARCHAR(7) NOT NULL DEFAULT '#E2E8F0',
+      ADD COLUMN IF NOT EXISTS submenu_bg_color VARCHAR(7) NOT NULL DEFAULT '#090D16',
       ADD COLUMN IF NOT EXISTS submenu_text_color VARCHAR(7) NOT NULL DEFAULT '#CBD5E1',
+      ADD COLUMN IF NOT EXISTS platform_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
+      ADD COLUMN IF NOT EXISTS platform_text_color VARCHAR(7) NOT NULL DEFAULT '#F1F5F9',
+      ADD COLUMN IF NOT EXISTS card_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
+      ADD COLUMN IF NOT EXISTS card_text_color VARCHAR(7) NOT NULL DEFAULT '#F1F5F9',
+      ADD COLUMN IF NOT EXISTS inner_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
+      ADD COLUMN IF NOT EXISTS inner_text_color VARCHAR(7) NOT NULL DEFAULT '#E2E8F0',
+      ADD COLUMN IF NOT EXISTS footer_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
+      ADD COLUMN IF NOT EXISTS footer_text_color VARCHAR(7) NOT NULL DEFAULT '#94A3B8',
       ADD COLUMN IF NOT EXISTS logo_url TEXT DEFAULT NULL,
       ADD COLUMN IF NOT EXISTS dark_mode BOOLEAN NOT NULL DEFAULT TRUE,
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW();
@@ -147,26 +158,34 @@ const ensureBrandingSchema = async () => {
   if (existing.rows.length === 0) {
     await db.query(
       `INSERT INTO platform_branding (
-        platform_bg_color,
         menu_bg_color,
-        submenu_bg_color,
-        card_bg_color,
-        inner_bg_color,
-        platform_text_color,
         menu_text_color,
+        submenu_bg_color,
         submenu_text_color,
+        platform_bg_color,
+        platform_text_color,
+        card_bg_color,
+        card_text_color,
+        inner_bg_color,
+        inner_text_color,
+        footer_bg_color,
+        footer_text_color,
         logo_url,
         dark_mode
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
       [
-        DEFAULT_BRANDING.platform_bg_color,
         DEFAULT_BRANDING.menu_bg_color,
-        DEFAULT_BRANDING.submenu_bg_color,
-        DEFAULT_BRANDING.card_bg_color,
-        DEFAULT_BRANDING.inner_bg_color,
-        DEFAULT_BRANDING.platform_text_color,
         DEFAULT_BRANDING.menu_text_color,
+        DEFAULT_BRANDING.submenu_bg_color,
         DEFAULT_BRANDING.submenu_text_color,
+        DEFAULT_BRANDING.platform_bg_color,
+        DEFAULT_BRANDING.platform_text_color,
+        DEFAULT_BRANDING.card_bg_color,
+        DEFAULT_BRANDING.card_text_color,
+        DEFAULT_BRANDING.inner_bg_color,
+        DEFAULT_BRANDING.inner_text_color,
+        DEFAULT_BRANDING.footer_bg_color,
+        DEFAULT_BRANDING.footer_text_color,
         DEFAULT_BRANDING.logo_url,
         DEFAULT_BRANDING.dark_mode,
       ]
@@ -179,14 +198,18 @@ const ensureBrandingSchema = async () => {
  * @param {Record<string, any>} row
  */
 const formatBrandingRow = (row) => ({
-  platform_bg_color: row.platform_bg_color || DEFAULT_BRANDING.platform_bg_color,
   menu_bg_color: row.menu_bg_color || DEFAULT_BRANDING.menu_bg_color,
-  submenu_bg_color: row.submenu_bg_color || DEFAULT_BRANDING.submenu_bg_color,
-  card_bg_color: row.card_bg_color || DEFAULT_BRANDING.card_bg_color,
-  inner_bg_color: row.inner_bg_color || DEFAULT_BRANDING.inner_bg_color,
-  platform_text_color: row.platform_text_color || DEFAULT_BRANDING.platform_text_color,
   menu_text_color: row.menu_text_color || DEFAULT_BRANDING.menu_text_color,
+  submenu_bg_color: row.submenu_bg_color || DEFAULT_BRANDING.submenu_bg_color,
   submenu_text_color: row.submenu_text_color || DEFAULT_BRANDING.submenu_text_color,
+  platform_bg_color: row.platform_bg_color || DEFAULT_BRANDING.platform_bg_color,
+  platform_text_color: row.platform_text_color || DEFAULT_BRANDING.platform_text_color,
+  card_bg_color: row.card_bg_color || DEFAULT_BRANDING.card_bg_color,
+  card_text_color: row.card_text_color || DEFAULT_BRANDING.card_text_color,
+  inner_bg_color: row.inner_bg_color || DEFAULT_BRANDING.inner_bg_color,
+  inner_text_color: row.inner_text_color || DEFAULT_BRANDING.inner_text_color,
+  footer_bg_color: row.footer_bg_color || row.menu_bg_color || DEFAULT_BRANDING.footer_bg_color,
+  footer_text_color: row.footer_text_color || DEFAULT_BRANDING.footer_text_color,
   logo_url: row.logo_url || null,
   dark_mode: typeof row.dark_mode === 'boolean' ? row.dark_mode : DEFAULT_BRANDING.dark_mode,
   updated_at: row.updated_at || null,
@@ -202,14 +225,18 @@ const getBranding = async (req, res) => {
     const result = await db.query(
       `SELECT
          id,
-         platform_bg_color,
          menu_bg_color,
-         submenu_bg_color,
-         card_bg_color,
-         inner_bg_color,
-         platform_text_color,
          menu_text_color,
+         submenu_bg_color,
          submenu_text_color,
+         platform_bg_color,
+         platform_text_color,
+         card_bg_color,
+         card_text_color,
+         inner_bg_color,
+         inner_text_color,
+         footer_bg_color,
+         footer_text_color,
          logo_url,
          dark_mode,
          updated_at
@@ -242,14 +269,18 @@ const updateBranding = async (req, res) => {
     const currentResult = await db.query(
       `SELECT
          id,
-         platform_bg_color,
          menu_bg_color,
-         submenu_bg_color,
-         card_bg_color,
-         inner_bg_color,
-         platform_text_color,
          menu_text_color,
+         submenu_bg_color,
          submenu_text_color,
+         platform_bg_color,
+         platform_text_color,
+         card_bg_color,
+         card_text_color,
+         inner_bg_color,
+         inner_text_color,
+         footer_bg_color,
+         footer_text_color,
          logo_url,
          dark_mode
        FROM platform_branding
@@ -266,44 +297,60 @@ const updateBranding = async (req, res) => {
       return fallbackValue;
     };
 
-    const platformBgColor = normalizeHexColor(
-      pick('platform_bg_color', 'platformBgColor', current.platform_bg_color)
-    );
     const menuBgColor = normalizeHexColor(
       pick('menu_bg_color', 'menuBgColor', current.menu_bg_color)
-    );
-    const submenuBgColor = normalizeHexColor(
-      pick('submenu_bg_color', 'submenuBgColor', current.submenu_bg_color)
-    );
-    const cardBgColor = normalizeHexColor(
-      pick('card_bg_color', 'cardBgColor', current.card_bg_color)
-    );
-    const innerBgColor = normalizeHexColor(
-      pick('inner_bg_color', 'innerBgColor', current.inner_bg_color)
-    );
-    const platformTextColor = normalizeHexColor(
-      pick('platform_text_color', 'platformTextColor', current.platform_text_color)
     );
     const menuTextColor = normalizeHexColor(
       pick('menu_text_color', 'menuTextColor', current.menu_text_color)
     );
+    const submenuBgColor = normalizeHexColor(
+      pick('submenu_bg_color', 'submenuBgColor', current.submenu_bg_color)
+    );
     const submenuTextColor = normalizeHexColor(
       pick('submenu_text_color', 'submenuTextColor', current.submenu_text_color)
     );
+    const platformBgColor = normalizeHexColor(
+      pick('platform_bg_color', 'platformBgColor', current.platform_bg_color)
+    );
+    const platformTextColor = normalizeHexColor(
+      pick('platform_text_color', 'platformTextColor', current.platform_text_color)
+    );
+    const cardBgColor = normalizeHexColor(
+      pick('card_bg_color', 'cardBgColor', current.card_bg_color)
+    );
+    const cardTextColor = normalizeHexColor(
+      pick('card_text_color', 'cardTextColor', current.card_text_color)
+    );
+    const innerBgColor = normalizeHexColor(
+      pick('inner_bg_color', 'innerBgColor', current.inner_bg_color)
+    );
+    const innerTextColor = normalizeHexColor(
+      pick('inner_text_color', 'innerTextColor', current.inner_text_color)
+    );
+    const footerBgColor = normalizeHexColor(
+      pick('footer_bg_color', 'footerBgColor', current.footer_bg_color)
+    );
+    const footerTextColor = normalizeHexColor(
+      pick('footer_text_color', 'footerTextColor', current.footer_text_color)
+    );
 
     if (
-      !platformBgColor ||
       !menuBgColor ||
-      !submenuBgColor ||
-      !cardBgColor ||
-      !innerBgColor ||
-      !platformTextColor ||
       !menuTextColor ||
-      !submenuTextColor
+      !submenuBgColor ||
+      !submenuTextColor ||
+      !platformBgColor ||
+      !platformTextColor ||
+      !cardBgColor ||
+      !cardTextColor ||
+      !innerBgColor ||
+      !innerTextColor ||
+      !footerBgColor ||
+      !footerTextColor
     ) {
       return res.status(400).json({
         error:
-          'Todos los colores de fondo y tipografía deben tener formato hexadecimal válido de 6 dígitos (#RRGGBB).',
+          'Todos los colores de fondo y tipografía de las zonas deben tener formato hexadecimal válido de 6 dígitos (#RRGGBB).',
       });
     }
 
@@ -320,40 +367,52 @@ const updateBranding = async (req, res) => {
 
     const updatedResult = await db.query(
       `UPDATE platform_branding
-       SET platform_bg_color = $1,
-           menu_bg_color = $2,
+       SET menu_bg_color = $1,
+           menu_text_color = $2,
            submenu_bg_color = $3,
-           card_bg_color = $4,
-           inner_bg_color = $5,
+           submenu_text_color = $4,
+           platform_bg_color = $5,
            platform_text_color = $6,
-           menu_text_color = $7,
-           submenu_text_color = $8,
-           logo_url = $9,
-           dark_mode = $10,
+           card_bg_color = $7,
+           card_text_color = $8,
+           inner_bg_color = $9,
+           inner_text_color = $10,
+           footer_bg_color = $11,
+           footer_text_color = $12,
+           logo_url = $13,
+           dark_mode = $14,
            updated_at = NOW()
-       WHERE id = $11
+       WHERE id = $15
        RETURNING
          id,
-         platform_bg_color,
          menu_bg_color,
-         submenu_bg_color,
-         card_bg_color,
-         inner_bg_color,
-         platform_text_color,
          menu_text_color,
+         submenu_bg_color,
          submenu_text_color,
+         platform_bg_color,
+         platform_text_color,
+         card_bg_color,
+         card_text_color,
+         inner_bg_color,
+         inner_text_color,
+         footer_bg_color,
+         footer_text_color,
          logo_url,
          dark_mode,
          updated_at`,
       [
-        platformBgColor,
         menuBgColor,
-        submenuBgColor,
-        cardBgColor,
-        innerBgColor,
-        platformTextColor,
         menuTextColor,
+        submenuBgColor,
         submenuTextColor,
+        platformBgColor,
+        platformTextColor,
+        cardBgColor,
+        cardTextColor,
+        innerBgColor,
+        innerTextColor,
+        footerBgColor,
+        footerTextColor,
         logoCheck.value,
         darkMode,
         currentId,
