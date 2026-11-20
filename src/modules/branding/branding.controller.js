@@ -2,7 +2,8 @@
  * @file branding.controller.js
  * @description Controlador modular para gestionar fondos y tipografías de las Zonas 1 a 6
  * (Menú, Sub-menú, Plataforma general, Tarjetas principales, Cajas internas y Footer),
- * logo opcional (SVG, PNG, JPG) y modo oscuro/claro, con persistencia en PostgreSQL.
+ * identidad opcional del menú (brand_name, brand_badge, brand_subtitle), logo opcional
+ * (SVG, PNG, JPG) y modo oscuro/claro, con persistencia en PostgreSQL.
  * @location /trustlink-backend/src/modules/branding/branding.controller.js
  */
 
@@ -10,6 +11,9 @@ const db = require('../../config/db');
 
 // Configuración inicial por defecto de TrustLink (estética oscura y sobria)
 const DEFAULT_BRANDING = {
+  brand_name: 'TrustLink',
+  brand_badge: 'Community',
+  brand_subtitle: 'Red de Confianza Residencial',
   menu_bg_color: '#020617',
   menu_text_color: '#E2E8F0',
   submenu_bg_color: '#090D16',
@@ -42,6 +46,21 @@ const normalizeHexColor = (value) => {
   const trimmed = value.trim();
   if (!HEX_COLOR_REGEX.test(trimmed)) return null;
   return trimmed.toUpperCase();
+};
+
+/**
+ * Normaliza textos opcionales de identidad del menú con longitud máxima y fallback seguro.
+ * @param {unknown} value
+ * @param {string} fallback
+ * @param {number} maxLength
+ * @returns {string}
+ */
+const normalizeIdentityText = (value, fallback, maxLength) => {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  if (!trimmed) return fallback;
+  return trimmed.slice(0, maxLength);
 };
 
 /**
@@ -108,12 +127,16 @@ const normalizeLogoUrl = (value) => {
 };
 
 /**
- * Crea o actualiza de forma idempotente la tabla platform_branding con todas las zonas 1 a 6.
+ * Crea o actualiza de forma idempotente la tabla platform_branding con zonas 1 a 6
+ * y campos opcionales de identidad del menú.
  */
 const ensureBrandingSchema = async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS platform_branding (
       id SERIAL PRIMARY KEY,
+      brand_name VARCHAR(60) NOT NULL DEFAULT 'TrustLink',
+      brand_badge VARCHAR(40) NOT NULL DEFAULT 'Community',
+      brand_subtitle VARCHAR(100) NOT NULL DEFAULT 'Red de Confianza Residencial',
       menu_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
       menu_text_color VARCHAR(7) NOT NULL DEFAULT '#E2E8F0',
       submenu_bg_color VARCHAR(7) NOT NULL DEFAULT '#090D16',
@@ -134,6 +157,9 @@ const ensureBrandingSchema = async () => {
 
   await db.query(`
     ALTER TABLE platform_branding
+      ADD COLUMN IF NOT EXISTS brand_name VARCHAR(60) NOT NULL DEFAULT 'TrustLink',
+      ADD COLUMN IF NOT EXISTS brand_badge VARCHAR(40) NOT NULL DEFAULT 'Community',
+      ADD COLUMN IF NOT EXISTS brand_subtitle VARCHAR(100) NOT NULL DEFAULT 'Red de Confianza Residencial',
       ADD COLUMN IF NOT EXISTS menu_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
       ADD COLUMN IF NOT EXISTS menu_text_color VARCHAR(7) NOT NULL DEFAULT '#E2E8F0',
       ADD COLUMN IF NOT EXISTS submenu_bg_color VARCHAR(7) NOT NULL DEFAULT '#090D16',
@@ -158,6 +184,9 @@ const ensureBrandingSchema = async () => {
   if (existing.rows.length === 0) {
     await db.query(
       `INSERT INTO platform_branding (
+        brand_name,
+        brand_badge,
+        brand_subtitle,
         menu_bg_color,
         menu_text_color,
         submenu_bg_color,
@@ -172,8 +201,11 @@ const ensureBrandingSchema = async () => {
         footer_text_color,
         logo_url,
         dark_mode
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
       [
+        DEFAULT_BRANDING.brand_name,
+        DEFAULT_BRANDING.brand_badge,
+        DEFAULT_BRANDING.brand_subtitle,
         DEFAULT_BRANDING.menu_bg_color,
         DEFAULT_BRANDING.menu_text_color,
         DEFAULT_BRANDING.submenu_bg_color,
@@ -198,6 +230,9 @@ const ensureBrandingSchema = async () => {
  * @param {Record<string, any>} row
  */
 const formatBrandingRow = (row) => ({
+  brand_name: row.brand_name || DEFAULT_BRANDING.brand_name,
+  brand_badge: row.brand_badge || DEFAULT_BRANDING.brand_badge,
+  brand_subtitle: row.brand_subtitle || DEFAULT_BRANDING.brand_subtitle,
   menu_bg_color: row.menu_bg_color || DEFAULT_BRANDING.menu_bg_color,
   menu_text_color: row.menu_text_color || DEFAULT_BRANDING.menu_text_color,
   submenu_bg_color: row.submenu_bg_color || DEFAULT_BRANDING.submenu_bg_color,
@@ -225,6 +260,9 @@ const getBranding = async (req, res) => {
     const result = await db.query(
       `SELECT
          id,
+         brand_name,
+         brand_badge,
+         brand_subtitle,
          menu_bg_color,
          menu_text_color,
          submenu_bg_color,
@@ -269,6 +307,9 @@ const updateBranding = async (req, res) => {
     const currentResult = await db.query(
       `SELECT
          id,
+         brand_name,
+         brand_badge,
+         brand_subtitle,
          menu_bg_color,
          menu_text_color,
          submenu_bg_color,
@@ -296,6 +337,22 @@ const updateBranding = async (req, res) => {
       if (req.body[camelKey] !== undefined) return req.body[camelKey];
       return fallbackValue;
     };
+
+    const brandName = normalizeIdentityText(
+      pick('brand_name', 'brandName', current.brand_name),
+      DEFAULT_BRANDING.brand_name,
+      60
+    );
+    const brandBadge = normalizeIdentityText(
+      pick('brand_badge', 'brandBadge', current.brand_badge),
+      DEFAULT_BRANDING.brand_badge,
+      40
+    );
+    const brandSubtitle = normalizeIdentityText(
+      pick('brand_subtitle', 'brandSubtitle', current.brand_subtitle),
+      DEFAULT_BRANDING.brand_subtitle,
+      100
+    );
 
     const menuBgColor = normalizeHexColor(
       pick('menu_bg_color', 'menuBgColor', current.menu_bg_color)
@@ -367,24 +424,30 @@ const updateBranding = async (req, res) => {
 
     const updatedResult = await db.query(
       `UPDATE platform_branding
-       SET menu_bg_color = $1,
-           menu_text_color = $2,
-           submenu_bg_color = $3,
-           submenu_text_color = $4,
-           platform_bg_color = $5,
-           platform_text_color = $6,
-           card_bg_color = $7,
-           card_text_color = $8,
-           inner_bg_color = $9,
-           inner_text_color = $10,
-           footer_bg_color = $11,
-           footer_text_color = $12,
-           logo_url = $13,
-           dark_mode = $14,
+       SET brand_name = $1,
+           brand_badge = $2,
+           brand_subtitle = $3,
+           menu_bg_color = $4,
+           menu_text_color = $5,
+           submenu_bg_color = $6,
+           submenu_text_color = $7,
+           platform_bg_color = $8,
+           platform_text_color = $9,
+           card_bg_color = $10,
+           card_text_color = $11,
+           inner_bg_color = $12,
+           inner_text_color = $13,
+           footer_bg_color = $14,
+           footer_text_color = $15,
+           logo_url = $16,
+           dark_mode = $17,
            updated_at = NOW()
-       WHERE id = $15
+       WHERE id = $18
        RETURNING
          id,
+         brand_name,
+         brand_badge,
+         brand_subtitle,
          menu_bg_color,
          menu_text_color,
          submenu_bg_color,
@@ -401,6 +464,9 @@ const updateBranding = async (req, res) => {
          dark_mode,
          updated_at`,
       [
+        brandName,
+        brandBadge,
+        brandSubtitle,
         menuBgColor,
         menuTextColor,
         submenuBgColor,
