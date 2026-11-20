@@ -1,8 +1,9 @@
 /**
  * @file branding.controller.js
  * @description Controlador modular para gestionar la apariencia global de TrustLink:
- * fondos (plataforma, menú, sub-menú), tipografías (plataforma, menú, sub-menú),
- * logo institucional opcional (SVG, PNG, JPG) y modo oscuro/claro, con persistencia en PostgreSQL.
+ * fondos (plataforma, menú, sub-menú, tarjetas Zona 4 y cajas internas Zona 5),
+ * tipografías (plataforma, menú, sub-menú), logo opcional (SVG, PNG, JPG) y modo oscuro/claro,
+ * con persistencia en PostgreSQL.
  * @location /trustlink-backend/src/modules/branding/branding.controller.js
  */
 
@@ -13,6 +14,8 @@ const DEFAULT_BRANDING = {
   platform_bg_color: '#0F172A',
   menu_bg_color: '#020617',
   submenu_bg_color: '#090D16',
+  card_bg_color: '#020617',
+  inner_bg_color: '#0F172A',
   platform_text_color: '#F1F5F9',
   menu_text_color: '#E2E8F0',
   submenu_text_color: '#CBD5E1',
@@ -23,7 +26,7 @@ const DEFAULT_BRANDING = {
 // Validador estricto para colores hexadecimales #RRGGBB
 const HEX_COLOR_REGEX = /^#[0-9A-Fa-f]{6}$/;
 
-// Tamaño máximo aproximado para logo embebido (data:image/...;base64,...) ~ 1.5 MB de texto
+// Tamaño máximo aproximado para logo embebido en base64
 const MAX_LOGO_DATA_URL_LENGTH = 1500000;
 
 /**
@@ -52,10 +55,7 @@ const normalizeBoolean = (value, fallback) => {
 };
 
 /**
- * Valida y normaliza logo_url:
- * - null o '' -> sin logo personalizado (usa emblema por defecto de TrustLink)
- * - data:image/png;base64,... | data:image/jpeg;base64,... | data:image/jpg;base64,... | data:image/svg+xml;base64,...
- * - ruta relativa segura (/...) o URL http(s)://... terminada en svg/png/jpg/jpeg/webp
+ * Valida y normaliza logo_url (SVG, PNG, JPG o URL/ruta segura, o null para usar emblema por defecto).
  * @param {unknown} value
  * @returns {{ valid: boolean, value: string|null, error?: string }}
  */
@@ -105,8 +105,7 @@ const normalizeLogoUrl = (value) => {
 };
 
 /**
- * Crea la tabla platform_branding si no existe, agrega columnas faltantes de forma
- * idempotente y garantiza el registro inicial por defecto.
+ * Asegura la existencia de la tabla platform_branding y sus columnas de forma idempotente.
  */
 const ensureBrandingSchema = async () => {
   await db.query(`
@@ -115,6 +114,8 @@ const ensureBrandingSchema = async () => {
       platform_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
       menu_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
       submenu_bg_color VARCHAR(7) NOT NULL DEFAULT '#090D16',
+      card_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
+      inner_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
       platform_text_color VARCHAR(7) NOT NULL DEFAULT '#F1F5F9',
       menu_text_color VARCHAR(7) NOT NULL DEFAULT '#E2E8F0',
       submenu_text_color VARCHAR(7) NOT NULL DEFAULT '#CBD5E1',
@@ -124,12 +125,13 @@ const ensureBrandingSchema = async () => {
     );
   `);
 
-  // Migración idempotente por si la tabla ya existía con columnas previas
   await db.query(`
     ALTER TABLE platform_branding
       ADD COLUMN IF NOT EXISTS platform_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
       ADD COLUMN IF NOT EXISTS menu_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
       ADD COLUMN IF NOT EXISTS submenu_bg_color VARCHAR(7) NOT NULL DEFAULT '#090D16',
+      ADD COLUMN IF NOT EXISTS card_bg_color VARCHAR(7) NOT NULL DEFAULT '#020617',
+      ADD COLUMN IF NOT EXISTS inner_bg_color VARCHAR(7) NOT NULL DEFAULT '#0F172A',
       ADD COLUMN IF NOT EXISTS platform_text_color VARCHAR(7) NOT NULL DEFAULT '#F1F5F9',
       ADD COLUMN IF NOT EXISTS menu_text_color VARCHAR(7) NOT NULL DEFAULT '#E2E8F0',
       ADD COLUMN IF NOT EXISTS submenu_text_color VARCHAR(7) NOT NULL DEFAULT '#CBD5E1',
@@ -148,16 +150,20 @@ const ensureBrandingSchema = async () => {
         platform_bg_color,
         menu_bg_color,
         submenu_bg_color,
+        card_bg_color,
+        inner_bg_color,
         platform_text_color,
         menu_text_color,
         submenu_text_color,
         logo_url,
         dark_mode
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         DEFAULT_BRANDING.platform_bg_color,
         DEFAULT_BRANDING.menu_bg_color,
         DEFAULT_BRANDING.submenu_bg_color,
+        DEFAULT_BRANDING.card_bg_color,
+        DEFAULT_BRANDING.inner_bg_color,
         DEFAULT_BRANDING.platform_text_color,
         DEFAULT_BRANDING.menu_text_color,
         DEFAULT_BRANDING.submenu_text_color,
@@ -176,6 +182,8 @@ const formatBrandingRow = (row) => ({
   platform_bg_color: row.platform_bg_color || DEFAULT_BRANDING.platform_bg_color,
   menu_bg_color: row.menu_bg_color || DEFAULT_BRANDING.menu_bg_color,
   submenu_bg_color: row.submenu_bg_color || DEFAULT_BRANDING.submenu_bg_color,
+  card_bg_color: row.card_bg_color || DEFAULT_BRANDING.card_bg_color,
+  inner_bg_color: row.inner_bg_color || DEFAULT_BRANDING.inner_bg_color,
   platform_text_color: row.platform_text_color || DEFAULT_BRANDING.platform_text_color,
   menu_text_color: row.menu_text_color || DEFAULT_BRANDING.menu_text_color,
   submenu_text_color: row.submenu_text_color || DEFAULT_BRANDING.submenu_text_color,
@@ -186,7 +194,6 @@ const formatBrandingRow = (row) => ({
 
 /**
  * GET /api/v1/branding
- * Devuelve la configuración activa de apariencia y los valores por defecto.
  */
 const getBranding = async (req, res) => {
   try {
@@ -198,6 +205,8 @@ const getBranding = async (req, res) => {
          platform_bg_color,
          menu_bg_color,
          submenu_bg_color,
+         card_bg_color,
+         inner_bg_color,
          platform_text_color,
          menu_text_color,
          submenu_text_color,
@@ -224,9 +233,7 @@ const getBranding = async (req, res) => {
 };
 
 /**
- * PUT /api/v1/branding
- * Actualiza fondos, tipografías, logo opcional y modo oscuro en PostgreSQL.
- * Uso exclusivo para el rol 'superadmin'.
+ * PUT /api/v1/branding (exclusivo superadmin)
  */
 const updateBranding = async (req, res) => {
   try {
@@ -238,6 +245,8 @@ const updateBranding = async (req, res) => {
          platform_bg_color,
          menu_bg_color,
          submenu_bg_color,
+         card_bg_color,
+         inner_bg_color,
          platform_text_color,
          menu_text_color,
          submenu_text_color,
@@ -266,6 +275,12 @@ const updateBranding = async (req, res) => {
     const submenuBgColor = normalizeHexColor(
       pick('submenu_bg_color', 'submenuBgColor', current.submenu_bg_color)
     );
+    const cardBgColor = normalizeHexColor(
+      pick('card_bg_color', 'cardBgColor', current.card_bg_color)
+    );
+    const innerBgColor = normalizeHexColor(
+      pick('inner_bg_color', 'innerBgColor', current.inner_bg_color)
+    );
     const platformTextColor = normalizeHexColor(
       pick('platform_text_color', 'platformTextColor', current.platform_text_color)
     );
@@ -280,6 +295,8 @@ const updateBranding = async (req, res) => {
       !platformBgColor ||
       !menuBgColor ||
       !submenuBgColor ||
+      !cardBgColor ||
+      !innerBgColor ||
       !platformTextColor ||
       !menuTextColor ||
       !submenuTextColor
@@ -306,18 +323,22 @@ const updateBranding = async (req, res) => {
        SET platform_bg_color = $1,
            menu_bg_color = $2,
            submenu_bg_color = $3,
-           platform_text_color = $4,
-           menu_text_color = $5,
-           submenu_text_color = $6,
-           logo_url = $7,
-           dark_mode = $8,
+           card_bg_color = $4,
+           inner_bg_color = $5,
+           platform_text_color = $6,
+           menu_text_color = $7,
+           submenu_text_color = $8,
+           logo_url = $9,
+           dark_mode = $10,
            updated_at = NOW()
-       WHERE id = $9
+       WHERE id = $11
        RETURNING
          id,
          platform_bg_color,
          menu_bg_color,
          submenu_bg_color,
+         card_bg_color,
+         inner_bg_color,
          platform_text_color,
          menu_text_color,
          submenu_text_color,
@@ -328,6 +349,8 @@ const updateBranding = async (req, res) => {
         platformBgColor,
         menuBgColor,
         submenuBgColor,
+        cardBgColor,
+        innerBgColor,
         platformTextColor,
         menuTextColor,
         submenuTextColor,
