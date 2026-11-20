@@ -1,22 +1,30 @@
 /**
  * @file reviews.routes.js
- * @description Enrutador completo para la gestión de contratos y calificaciones cruzadas.
+ * @description Enrutador para consulta de contratos y emisión de reseñas cruzadas (Residente <-> Prestador).
  * @location /trustlink-backend/src/modules/reviews/reviews.routes.js
  */
 
 const { Router } = require('express');
-const { createContract, completeContract, createReview } = require('./reviews.controller');
+const {
+  getContractsForReviews,
+  createProviderReview,
+  createOwnerReview,
+  getProviderReviewsById
+} = require('./reviews.controller');
 const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
 
 const router = Router();
 
-// Endpoint para registrar un contrato de servicio (Rol: owner, family)
-router.post('/contract', verifyToken, verifyRole(['owner', 'family']), createContract);
+// Listar contratos del residente o prestador con estado de reseñas cruzadas
+router.get('/contracts', verifyToken, verifyRole(['owner', 'family', 'provider', 'superadmin']), getContractsForReviews);
 
-// Endpoint para marcar un contrato como completado (Rol: owner, family, admin)
-router.patch('/contract/complete', verifyToken, verifyRole(['owner', 'family', 'admin']), completeContract);
+// Residente califica al prestador (y recalcula rating_avg en providers)
+router.post('/provider', verifyToken, verifyRole(['owner', 'family']), createProviderReview);
 
-// Endpoint para emitir reseña y calificación (Rol: owner, family)
-router.post('/review', verifyToken, verifyRole(['owner', 'family']), createReview);
+// Prestador califica al residente/propietario
+router.post('/owner', verifyToken, verifyRole(['provider']), createOwnerReview);
+
+// Consultar reseñas públicas/verificadas de un prestador
+router.get('/provider/:providerId', verifyToken, getProviderReviewsById);
 
 module.exports = router;
