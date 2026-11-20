@@ -549,7 +549,8 @@ const toggleCommunityIntegrationStatus = async (req, res) => {
 
 /**
  * Lista los pases QR recientes en la plataforma con paginación, búsqueda y filtro de estado.
- * Persiste automáticamente el estado 'expired' en pases 'pending' vencidos antes de consultar.
+ * Devuelve start_utc_ms y end_utc_ms calculados directamente en PostgreSQL para evitar
+ * desplazamientos del driver pg sobre columnas timestamp without time zone.
  */
 const listRecentPasses = async (req, res) => {
   try {
@@ -609,6 +610,8 @@ const listRecentPasses = async (req, res) => {
         ap.lot_number,
         ap.start_time,
         ap.end_time,
+        (EXTRACT(EPOCH FROM (ap.start_time AT TIME ZONE 'UTC')) * 1000)::bigint AS start_utc_ms,
+        (EXTRACT(EPOCH FROM (ap.end_time AT TIME ZONE 'UTC')) * 1000)::bigint AS end_utc_ms,
         ap.created_at,
         c.name AS country_name,
         u_prov.first_name AS provider_first_name,
