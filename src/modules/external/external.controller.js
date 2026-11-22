@@ -2,7 +2,7 @@
  * @file external.controller.js
  * @description Controlador para integración externa de barrios privados (validación de QR),
  * diagnóstico técnico del sistema, gestión de pases QR con persistencia de estado 'expired',
- * administración de comunidades, integraciones por comunidad y auditoría de accesos/transacciones.
+ * administración de comunidades, integraciones por comunidad y auditoría tolerante de accesos y transacciones.
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
 
@@ -870,6 +870,109 @@ const cancelPassById = async (req, res) => {
 };
 
 /**
+ * Consulta de forma segura el resumen y listado reciente de transacciones
+ * adaptándose dinámicamente a las columnas reales de la tabla `transactions`.
+ */
+const fetchTransactionsAuditSafe = async () => {
+  const defaultSummary = {
+    total_transactions: 0,
+    gross_volume: 0,
+    platform_fee_total: 0,
+    provider_payout_total: 0
+  };
+
+  try {
+    const colsRes = await db.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'transactions'
+    `);
+    const cols = new Set(colsRes.rows.map((r) => r.column_name));
+    if (cols.size === 0) {
+      return { summary: defaultSummary, recent: [] };
+    }
+
+    const grossCol = cols.has('gross_amount')
+      ? 't.gross_amount'
+      : cols.has('amount')
+      ? 't.amount'
+      : cols.has('total_amount')
+      ? 't.total_amount'
+      : '0';
+
+    const feeCol = cols.has('platform_fee')
+      ? 't.platform_fee'
+      : cols.has('commission_fee')
+      ? 't.commission_fee'
+      : cols.has('fee_amount')
+      ? 't.fee_amount'
+      : `ROUND((${grossCol} * 0.07)::numeric, 2)`;
+
+    const payoutCol = cols.has('provider_payout')
+      ? 't.provider_payout'
+      : cols.has('net_amount')
+      ? 't.net_amount'
+      : cols.has('provider_amount')
+      ? 't.provider_amount'
+      : `ROUND((${grossCol} - (${feeCol}))::numeric, 2)`;
+
+    const statusCol = cols.has('status')
+      ? 't.status::text'
+      : cols.has('payment_status')
+      ? 't.payment_status::text'
+      : `'completed'`;
+
+    const contractCol = cols.has('contract_id') ? 't.contract_id' : 'NULL';
+    const orderCol = cols.has('id') ? 't.id DESC' : '1';
+
+    const summaryRes = await db.query(`
+      SELECT
+        COUNT(*)::int AS total_transactions,
+        COALESCE(SUM(${grossCol}), 0)::numeric(12,2) AS gross_volume,
+        COALESCE(SUM(${feeCol}), 0)::numeric(12,2) AS platform_fee_total,
+        COALESCE(SUM(${payoutCol}), 0)::numeric(12,2) AS provider_payout_total
+      FROM transactions t
+    `);
+
+    const joinContracts = cols.has('contract_id')
+      ? `
+        LEFT JOIN service_contracts sc ON t.contract_id = sc.id
+        LEFT JOIN providers p ON sc.provider_id = p.id
+        LEFT JOIN users u_prov ON p.user_id = u_prov.id
+        LEFT JOIN countries c ON sc.country_id = c.id
+      `
+      : '';
+
+    const providerSelect = cols.has('contract_id')
+      ? `TRIM(CONCAT(COALESCE(u_prov.first_name, ''), ' ', COALESCE(u_prov.last_name, ''))) AS provider_name, c.name AS country_name`
+      : `NULL AS provider_name, NULL AS country_name`;
+
+    const recentRes = await db.query(`
+      SELECT
+        ${cols.has('id') ? 't.id' : 'ROW_NUMBER() OVER () AS id'},
+        ${contractCol} AS contract_id,
+        COALESCE(${grossCol}, 0)::numeric(12,2) AS gross_amount,
+        COALESCE(${feeCol}, 0)::numeric(12,2) AS platform_fee,
+        COALESCE(${payoutCol}, 0)::numeric(12,2) AS provider_payout,
+        ${statusCol} AS status,
+        ${providerSelect}
+      FROM transactions t
+      ${joinContracts}
+      ORDER BY ${orderCol}
+      LIMIT 6
+    `);
+
+    return {
+      summary: summaryRes.rows[0] || defaultSummary,
+      recent: recentRes.rows
+    };
+  } catch (txErr) {
+    console.error('Aviso al consultar resumen de transacciones en auditoría:', txErr);
+    return { summary: defaultSummary, recent: [] };
+  }
+};
+
+/**
  * Obtiene bitácora paginada de intentos de validación de acceso en garita/API externa
  * y resumen de transacciones / comisiones (Take Rate) en PostgreSQL.
  */
@@ -953,34 +1056,7 @@ const getAuditOverview = async (req, res) => {
       logsParams
     );
 
-    const txSummaryRes = await db.query(`
-      SELECT
-        COUNT(*)::int AS total_transactions,
-        COALESCE(SUM(gross_amount), 0)::numeric(12,2) AS gross_volume,
-        COALESCE(SUM(platform_fee), 0)::numeric(12,2) AS platform_fee_total,
-        COALESCE(SUM(provider_payout), 0)::numeric(12,2) AS provider_payout_total
-      FROM transactions
-    `);
-
-    const recentTxRes = await db.query(`
-      SELECT
-        t.id,
-        t.contract_id,
-        t.gross_amount,
-        t.platform_fee,
-        t.provider_payout,
-        t.status,
-        t.created_at,
-        TRIM(CONCAT(COALESCE(u_prov.first_name, ''), ' ', COALESCE(u_prov.last_name, ''))) AS provider_name,
-        c.name AS country_name
-      FROM transactions t
-      LEFT JOIN service_contracts sc ON t.contract_id = sc.id
-      LEFT JOIN providers p ON sc.provider_id = p.id
-      LEFT JOIN users u_prov ON p.user_id = u_prov.id
-      LEFT JOIN countries c ON sc.country_id = c.id
-      ORDER BY t.id DESC
-      LIMIT 6
-    `);
+    const txAudit = await fetchTransactionsAuditSafe();
 
     return res.status(200).json({
       access_summary: summaryRes.rows[0] || {
@@ -995,17 +1071,14 @@ const getAuditOverview = async (req, res) => {
         total,
         totalPages
       },
-      transactions_summary: txSummaryRes.rows[0] || {
-        total_transactions: 0,
-        gross_volume: 0,
-        platform_fee_total: 0,
-        provider_payout_total: 0
-      },
-      recent_transactions: recentTxRes.rows
+      transactions_summary: txAudit.summary,
+      recent_transactions: txAudit.recent
     });
   } catch (error) {
     console.error('Error al obtener auditoría de accesos y transacciones:', error);
-    return res.status(500).json({ error: 'Error al cargar la auditoría del sistema.' });
+    return res.status(500).json({
+      error: `Error al cargar la auditoría del sistema: ${error.message}`
+    });
   }
 };
 
