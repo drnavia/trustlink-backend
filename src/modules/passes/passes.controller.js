@@ -1,61 +1,50 @@
 /**
  * @file passes.controller.js
- * @description Lógica de negocio para emisión de pases QR por residentes, consulta del historial
- * propio del residente, cancelación segura de pases y validación perimetral en garita.
+ * @description Lógica de negocio completa para la emisión, consulta, edición de pases QR
+ * vigentes por residentes y validación perimetral en tiempo real en la garita.
  * @location /trustlink-backend/src/modules/passes/passes.controller.js
  */
 
 const db = require('../../config/db');
 const crypto = require('crypto');
 
+let hasVehiclePlateColumnCache = null;
+
 /**
- * Persiste en PostgreSQL el estado 'expired'::pass_status para pases en estado 'pending'
- * cuya end_time (almacenada en UTC sin zona horaria) ya superó el instante actual (NOW()).
- * @param {number|null} passId
- * @param {number|null} ownerId
+ * Detecta de forma segura si la tabla access_passes dispone de la columna vehicle_plate.
  */
-const expireOverduePasses = async (passId = null, ownerId = null) => {
+const checkHasVehiclePlateColumn = async () => {
+  if (hasVehiclePlateColumnCache !== null) return hasVehiclePlateColumnCache;
   try {
-    if (passId !== null && passId !== undefined) {
-      await db.query(
-        `
-          UPDATE access_passes
-          SET status = 'expired'::pass_status
-          WHERE id = $1
-            AND status = 'pending'::pass_status
-            AND end_time IS NOT NULL
-            AND (EXTRACT(EPOCH FROM (end_time AT TIME ZONE 'UTC')) * 1000)::bigint < (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
-        `,
-        [passId]
-      );
-      return;
-    }
-
-    if (ownerId !== null && ownerId !== undefined) {
-      await db.query(
-        `
-          UPDATE access_passes
-          SET status = 'expired'::pass_status
-          WHERE owner_id = $1
-            AND status = 'pending'::pass_status
-            AND end_time IS NOT NULL
-            AND (EXTRACT(EPOCH FROM (end_time AT TIME ZONE 'UTC')) * 1000)::bigint < (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
-        `,
-        [ownerId]
-      );
-      return;
-    }
-
-    await db.query(`
-      UPDATE access_passes
-      SET status = 'expired'::pass_status
-      WHERE status = 'pending'::pass_status
-        AND end_time IS NOT NULL
-        AND (EXTRACT(EPOCH FROM (end_time AT TIME ZONE 'UTC')) * 1000)::bigint < (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint
-    `);
-  } catch (err) {
-    console.error('Error al persistir pases vencidos (expired):', err);
+    const res = await db.query(
+      `
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'access_passes'
+          AND column_name = 'vehicle_plate'
+        LIMIT 1;
+      `
+    );
+    hasVehiclePlateColumnCache = res.rows.length > 0;
+  } catch {
+    hasVehiclePlateColumnCache = false;
   }
+  return hasVehiclePlateColumnCache;
+};
+
+/**
+ * Marca como 'expired' en PostgreSQL los pases 'pending' cuya franja end_time ya venció.
+ */
+const expireOverduePasses = async () => {
+  await db.query(
+    `
+      UPDATE public.access_passes
+      SET status = 'expired'::public.pass_status
+      WHERE status = 'pending'::public.pass_status
+        AND (end_time AT TIME ZONE 'UTC') < NOW();
+    `
+  );
 };
 
 /**
@@ -66,18 +55,14 @@ const createPass = async (req, res) => {
   try {
     const {
       provider_id,
-      country_id: bodyCountryId,
-      fraction,
-      lot_number,
       fraction_number,
+      lot_number,
+      vehicle_plate,
       start_time,
       end_time
     } = req.body;
-
     const owner_id = req.user.userId;
-    const country_id = bodyCountryId || req.user.countryId || 1;
-    const finalFraction = (fraction_number || fraction || '').trim() || null;
-    const finalLot = String(lot_number || '').trim() || null;
+    const country_id = req.user.countryId;
 
     if (!provider_id || !start_time || !end_time) {
       return res.status(400).json({
@@ -101,52 +86,73 @@ const createPass = async (req, res) => {
     }
 
     const qr_token = crypto.randomBytes(32).toString('hex');
+    const cleanPlate = vehicle_plate ? String(vehicle_plate).trim().toUpperCase() : null;
+    const hasPlateCol = await checkHasVehiclePlateColumn();
 
-    const query = `
-      INSERT INTO access_passes (
-        country_id,
-        owner_id,
-        provider_id,
-        fraction_number,
-        lot_number,
-        qr_token,
-        start_time,
-        end_time,
-        status
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7::timestamp, $8::timestamp, 'pending'::pass_status)
-      RETURNING
-        id,
-        country_id,
-        owner_id,
-        provider_id,
-        fraction_number,
-        lot_number,
-        qr_token,
-        start_time,
-        end_time,
-        (EXTRACT(EPOCH FROM (start_time AT TIME ZONE 'UTC')) * 1000)::bigint AS start_utc_ms,
-        (EXTRACT(EPOCH FROM (end_time AT TIME ZONE 'UTC')) * 1000)::bigint AS end_utc_ms,
-        status,
-        created_at;
-    `;
+    const query = hasPlateCol
+      ? `
+          INSERT INTO access_passes (
+            country_id,
+            owner_id,
+            provider_id,
+            fraction_number,
+            lot_number,
+            vehicle_plate,
+            qr_token,
+            start_time,
+            end_time,
+            status
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamp, $9::timestamp, 'pending')
+          RETURNING id, qr_token, fraction_number, lot_number, vehicle_plate, start_time, end_time, status, created_at;
+        `
+      : `
+          INSERT INTO access_passes (
+            country_id,
+            owner_id,
+            provider_id,
+            fraction_number,
+            lot_number,
+            qr_token,
+            start_time,
+            end_time,
+            status
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7::timestamp, $8::timestamp, 'pending')
+          RETURNING id, qr_token, fraction_number, lot_number, start_time, end_time, status, created_at;
+        `;
 
-    const values = [
-      country_id,
-      owner_id,
-      provider_id,
-      finalFraction,
-      finalLot,
-      qr_token,
-      startDate.toISOString(),
-      endDate.toISOString()
-    ];
+    const values = hasPlateCol
+      ? [
+          country_id,
+          owner_id,
+          provider_id,
+          fraction_number || null,
+          lot_number || null,
+          cleanPlate,
+          qr_token,
+          startDate.toISOString(),
+          endDate.toISOString()
+        ]
+      : [
+          country_id,
+          owner_id,
+          provider_id,
+          fraction_number || null,
+          lot_number || null,
+          qr_token,
+          startDate.toISOString(),
+          endDate.toISOString()
+        ];
 
     const newPass = await db.query(query, values);
 
     return res.status(201).json({
       message: 'Pase de acceso generado exitosamente.',
-      pass: newPass.rows[0]
+      pass: {
+        ...newPass.rows[0],
+        vehicle_plate: newPass.rows[0]?.vehicle_plate || cleanPlate
+      }
     });
   } catch (error) {
     console.error('Error al generar el pase de acceso:', error);
@@ -157,125 +163,178 @@ const createPass = async (req, res) => {
 };
 
 /**
- * Lista los pases QR emitidos por el residente/propietario autenticado.
- * Roles permitidos: 'owner', 'family'
+ * Lista los pases QR emitidos por el residente/familia logueado.
+ * Sincroniza previamente los pases vencidos a estado 'expired'.
  */
-const listMyPasses = async (req, res) => {
+const getMyPasses = async (req, res) => {
   try {
+    await expireOverduePasses();
+
     const ownerId = req.user.userId;
-    await expireOverduePasses(null, ownerId);
-
-    const statusFilter = String(req.query.status || 'all').trim().toLowerCase();
-    const searchFilter = String(req.query.search || '').trim();
-
-    const conditions = ['ap.owner_id = $1'];
-    const params = [ownerId];
-
-    if (['pending', 'used', 'expired', 'cancelled'].includes(statusFilter)) {
-      params.push(statusFilter);
-      conditions.push(`ap.status = $${params.length}::pass_status`);
-    }
-
-    if (searchFilter) {
-      params.push(`%${searchFilter}%`);
-      const idx = params.length;
-      conditions.push(
-        `(ap.qr_token ILIKE $${idx} OR COALESCE(u_prov.first_name, '') ILIKE $${idx} OR COALESCE(u_prov.last_name, '') ILIKE $${idx} OR COALESCE(p.specialty, '') ILIKE $${idx} OR COALESCE(ap.fraction_number, '') ILIKE $${idx} OR COALESCE(ap.lot_number, '') ILIKE $${idx})`
-      );
-    }
+    const hasPlateCol = await checkHasVehiclePlateColumn();
+    const plateSelect = hasPlateCol ? 'ap.vehicle_plate' : 'NULL::varchar AS vehicle_plate';
 
     const query = `
       SELECT
         ap.id,
         ap.country_id,
-        c.name AS country_name,
         ap.owner_id,
         ap.provider_id,
-        TRIM(CONCAT(COALESCE(u_prov.first_name, ''), ' ', COALESCE(u_prov.last_name, ''))) AS provider_name,
-        p.specialty,
-        p.status AS compliance_status,
         ap.fraction_number,
         ap.lot_number,
+        ${plateSelect},
         ap.qr_token,
         ap.start_time,
         ap.end_time,
-        (EXTRACT(EPOCH FROM (ap.start_time AT TIME ZONE 'UTC')) * 1000)::bigint AS start_utc_ms,
-        (EXTRACT(EPOCH FROM (ap.end_time AT TIME ZONE 'UTC')) * 1000)::bigint AS end_utc_ms,
-        ap.status,
-        ap.created_at
-      FROM access_passes ap
-      LEFT JOIN countries c ON ap.country_id = c.id
-      LEFT JOIN providers p ON ap.provider_id = p.id
-      LEFT JOIN users u_prov ON p.user_id = u_prov.id
-      WHERE ${conditions.join(' AND ')}
-      ORDER BY ap.id DESC
-      LIMIT 50;
+        ap.status::text AS status,
+        ap.created_at,
+        TRIM(CONCAT(COALESCE(u_prov.first_name, ''), ' ', COALESCE(u_prov.last_name, ''))) AS provider_name,
+        p.specialty AS provider_specialty
+      FROM public.access_passes ap
+      LEFT JOIN public.providers p ON p.id = ap.provider_id
+      LEFT JOIN public.users u_prov ON u_prov.id = p.user_id
+      WHERE ap.owner_id = $1
+      ORDER BY ap.id DESC;
     `;
 
-    const result = await db.query(query, params);
-
+    const result = await db.query(query, [ownerId]);
     return res.status(200).json({
       count: result.rows.length,
       passes: result.rows
     });
   } catch (error) {
-    console.error('Error al listar pases del residente:', error);
+    console.error('Error al consultar pases del residente:', error);
     return res.status(500).json({
-      error: 'Error interno del servidor al consultar tus pases QR.'
+      error: 'Error interno del servidor al consultar los pases QR.'
     });
   }
 };
 
 /**
- * Cancela un pase QR pendiente emitido por el residente autenticado (o admin/superadmin).
+ * Permite al residente/familia editar un pase QR que esté realmente VIGENTE
+ * (estado 'pending' y end_time en el futuro). Bloquea pases 'expired', 'cancelled' o 'used'.
  */
-const cancelPass = async (req, res) => {
+const updatePass = async (req, res) => {
   try {
+    await expireOverduePasses();
+
     const passId = parseInt(req.params.id, 10);
+    const ownerId = req.user.userId;
+    const { fraction_number, lot_number, vehicle_plate, start_time, end_time } = req.body;
+
     if (!Number.isInteger(passId) || passId <= 0) {
       return res.status(400).json({ error: 'ID de pase inválido.' });
     }
 
-    await expireOverduePasses(passId, null);
-
-    const passRes = await db.query(
-      'SELECT id, owner_id, status, qr_token FROM access_passes WHERE id = $1',
-      [passId]
-    );
-    if (passRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Pase QR no encontrado.' });
-    }
-
-    const passRow = passRes.rows[0];
-    const isPrivileged = ['admin', 'superadmin'].includes(req.user?.role);
-    if (!isPrivileged && Number(passRow.owner_id) !== Number(req.user?.userId)) {
-      return res.status(403).json({ error: 'No tenés permiso para cancelar este pase QR.' });
-    }
-
-    if (passRow.status !== 'pending') {
-      return res.status(400).json({
-        error: `No se puede cancelar un pase en estado '${passRow.status}'.`
-      });
-    }
-
-    const updated = await db.query(
+    const existingRes = await db.query(
       `
-        UPDATE access_passes
-        SET status = 'cancelled'::pass_status
+        SELECT
+          id,
+          owner_id,
+          status::text AS status,
+          start_time,
+          end_time,
+          (EXTRACT(EPOCH FROM (end_time AT TIME ZONE 'UTC')) * 1000)::bigint AS end_utc_ms,
+          (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint AS now_utc_ms
+        FROM public.access_passes
         WHERE id = $1
-        RETURNING id, qr_token, status, start_time, end_time
+        LIMIT 1;
       `,
       [passId]
     );
 
+    if (existingRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Pase QR no encontrado.' });
+    }
+
+    const currentPass = existingRes.rows[0];
+    if (Number(currentPass.owner_id) !== Number(ownerId) && req.user.role !== 'superadmin') {
+      return res.status(403).json({ error: 'No autorizado para editar este pase QR.' });
+    }
+
+    const currentStatus = String(currentPass.status || '').toLowerCase();
+    const isExpiredByTime =
+      currentPass.end_utc_ms !== null &&
+      currentPass.now_utc_ms !== null &&
+      Number(currentPass.end_utc_ms) < Number(currentPass.now_utc_ms);
+
+    if (currentStatus !== 'pending' || isExpiredByTime) {
+      return res.status(400).json({
+        error:
+          'Solo se pueden editar pases QR vigentes (no cancelados, vencidos ni utilizados).'
+      });
+    }
+
+    const nextStartDate = start_time ? new Date(start_time) : new Date(currentPass.start_time);
+    const nextEndDate = end_time ? new Date(end_time) : new Date(currentPass.end_time);
+
+    if (Number.isNaN(nextStartDate.getTime()) || Number.isNaN(nextEndDate.getTime())) {
+      return res.status(400).json({ error: 'Formato de fecha/hora inválido.' });
+    }
+
+    if (nextEndDate <= nextStartDate) {
+      return res.status(400).json({
+        error: 'La fecha/hora de fin debe ser posterior a la de inicio.'
+      });
+    }
+
+    const cleanPlate =
+      vehicle_plate !== undefined
+        ? String(vehicle_plate).trim().toUpperCase() || null
+        : null;
+    const hasPlateCol = await checkHasVehiclePlateColumn();
+
+    const updateQuery = hasPlateCol
+      ? `
+          UPDATE public.access_passes
+          SET fraction_number = COALESCE($1, fraction_number),
+              lot_number = COALESCE($2, lot_number),
+              vehicle_plate = $3,
+              start_time = $4::timestamp,
+              end_time = $5::timestamp
+          WHERE id = $6
+          RETURNING id, qr_token, fraction_number, lot_number, vehicle_plate, start_time, end_time, status::text AS status;
+        `
+      : `
+          UPDATE public.access_passes
+          SET fraction_number = COALESCE($1, fraction_number),
+              lot_number = COALESCE($2, lot_number),
+              start_time = $3::timestamp,
+              end_time = $4::timestamp
+          WHERE id = $5
+          RETURNING id, qr_token, fraction_number, lot_number, start_time, end_time, status::text AS status;
+        `;
+
+    const values = hasPlateCol
+      ? [
+          fraction_number !== undefined ? String(fraction_number).trim() || null : null,
+          lot_number !== undefined ? String(lot_number).trim() || null : null,
+          cleanPlate,
+          nextStartDate.toISOString(),
+          nextEndDate.toISOString(),
+          passId
+        ]
+      : [
+          fraction_number !== undefined ? String(fraction_number).trim() || null : null,
+          lot_number !== undefined ? String(lot_number).trim() || null : null,
+          nextStartDate.toISOString(),
+          nextEndDate.toISOString(),
+          passId
+        ];
+
+    const updated = await db.query(updateQuery, values);
+
     return res.status(200).json({
-      message: `Pase QR #${passId} cancelado correctamente.`,
-      pass: updated.rows[0]
+      message: `Pase #${passId} actualizado correctamente.`,
+      pass: {
+        ...updated.rows[0],
+        vehicle_plate: updated.rows[0]?.vehicle_plate ?? cleanPlate
+      }
     });
   } catch (error) {
-    console.error('Error al cancelar pase QR:', error);
+    console.error('Error al actualizar pase QR vigente:', error);
     return res.status(500).json({
-      error: 'Error interno del servidor al cancelar el pase QR.'
+      error: 'Error interno del servidor al actualizar el pase QR.'
     });
   }
 };
@@ -286,6 +345,8 @@ const cancelPass = async (req, res) => {
  */
 const verifyPassByQR = async (req, res) => {
   try {
+    await expireOverduePasses();
+
     const { qr_token } = req.body;
     const securityCountryId = req.user.countryId;
 
@@ -299,17 +360,14 @@ const verifyPassByQR = async (req, res) => {
     const query = `
       SELECT
         ap.id AS pass_id,
-        ap.status AS pass_status,
+        ap.status::text AS pass_status,
         ap.start_time,
         ap.end_time,
-        (EXTRACT(EPOCH FROM (ap.start_time AT TIME ZONE 'UTC')) * 1000)::bigint AS start_utc_ms,
-        (EXTRACT(EPOCH FROM (ap.end_time AT TIME ZONE 'UTC')) * 1000)::bigint AS end_utc_ms,
-        (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint AS now_utc_ms,
         ap.country_id,
         u_prov.first_name AS provider_first_name,
         u_prov.last_name AS provider_last_name,
         u_prov.dni AS provider_dni,
-        p.status AS provider_compliance_status,
+        p.status::text AS provider_compliance_status,
         pv.brand,
         pv.model,
         pv.color,
@@ -336,29 +394,7 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
-    let passInfo = result.rows[0];
-
-    const parsedStartMs =
-      passInfo.start_utc_ms !== null && passInfo.start_utc_ms !== undefined
-        ? Number(passInfo.start_utc_ms)
-        : new Date(passInfo.start_time).getTime();
-    const parsedEndMs =
-      passInfo.end_utc_ms !== null && passInfo.end_utc_ms !== undefined
-        ? Number(passInfo.end_utc_ms)
-        : new Date(passInfo.end_time).getTime();
-    const nowMs =
-      passInfo.now_utc_ms !== null && passInfo.now_utc_ms !== undefined
-        ? Number(passInfo.now_utc_ms)
-        : Date.now();
-
-    if (
-      passInfo.pass_status === 'pending' &&
-      !Number.isNaN(parsedEndMs) &&
-      nowMs > parsedEndMs
-    ) {
-      await expireOverduePasses(passInfo.pass_id, null);
-      passInfo = { ...passInfo, pass_status: 'expired' };
-    }
+    const passInfo = result.rows[0];
 
     if (
       securityCountryId &&
@@ -378,17 +414,27 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
-    if (passInfo.pass_status === 'cancelled' || passInfo.pass_status === 'expired') {
+    if (
+      passInfo.pass_status === 'cancelled' ||
+      passInfo.pass_status === 'expired' ||
+      passInfo.pass_status === 'used'
+    ) {
       return res.status(400).json({
         authorized: false,
         error: `El pase se encuentra ${passInfo.pass_status}.`
       });
     }
 
-    if (
-      (!Number.isNaN(parsedStartMs) && nowMs < parsedStartMs) ||
-      (!Number.isNaN(parsedEndMs) && nowMs > parsedEndMs)
-    ) {
+    const startMs = new Date(`${String(passInfo.start_time).replace(' ', 'T')}Z`).getTime();
+    const endMs = new Date(`${String(passInfo.end_time).replace(' ', 'T')}Z`).getTime();
+    const nowMs = Date.now();
+
+    const parsedStartMs = Number.isNaN(startMs)
+      ? new Date(passInfo.start_time).getTime()
+      : startMs;
+    const parsedEndMs = Number.isNaN(endMs) ? new Date(passInfo.end_time).getTime() : endMs;
+
+    if (nowMs < parsedStartMs || nowMs > parsedEndMs) {
       return res.status(400).json({
         authorized: false,
         error: 'El pase se encuentra fuera de la franja horaria autorizada.',
@@ -424,7 +470,7 @@ const verifyPassByQR = async (req, res) => {
 
 module.exports = {
   createPass,
-  listMyPasses,
-  cancelPass,
+  getMyPasses,
+  updatePass,
   verifyPassByQR
 };
