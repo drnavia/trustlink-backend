@@ -2,8 +2,8 @@
  * @file providers.controller.js
  * @description Controlador completo del módulo de prestadores en TrustLink.
  * Gestiona credenciales/especialidades, historial de versiones documentales sin sobrescribir
- * registros anteriores (vigentes, por vencer o vencidos), flota vehicular, auditoría central,
- * directorio unificado para residentes y suspensiones operativas locales.
+ * registros anteriores (vigentes, por vencer o vencidos), flota vehicular con póliza y vigencia
+ * de seguro automotor, auditoría central, directorio unificado y suspensiones locales.
  * @location /trustlink-backend/src/modules/providers/providers.controller.js
  */
 
@@ -26,6 +26,18 @@ const ensureDocumentVersionsTable = async () => {
       status VARCHAR(20) NOT NULL DEFAULT 'pending',
       created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
     );
+  `);
+};
+
+/**
+ * Asegura que provider_vehicles cuente con los campos de seguro vehicular y vigencia.
+ */
+const ensureVehicleInsuranceColumns = async () => {
+  await db.query(`
+    ALTER TABLE public.provider_vehicles
+    ADD COLUMN IF NOT EXISTS vehicle_insurance_url TEXT NULL,
+    ADD COLUMN IF NOT EXISTS vehicle_insurance_from DATE NULL,
+    ADD COLUMN IF NOT EXISTS vehicle_insurance_expiry DATE NULL;
   `);
 };
 
@@ -165,7 +177,7 @@ const updateProviderProfile = async (req, res) => {
 };
 
 /**
- * Permite editar un registro específico de compliance por su ID de provider
+ * Edita un registro específico de compliance por su ID de provider
  * y registra la nueva versión documental en el historial sin borrar las anteriores.
  */
 const editProviderProfile = async (req, res) => {
@@ -255,12 +267,23 @@ const editProviderProfile = async (req, res) => {
 };
 
 /**
- * Agrega un vehículo asociado al prestador logueado.
+ * Agrega un vehículo asociado al prestador logueado, incluyendo su seguro automotor y fechas de vigencia.
  */
 const addVehicle = async (req, res) => {
   try {
+    await ensureVehicleInsuranceColumns();
+
     const userId = req.user.userId;
-    const { vehicle_type, brand, model, color, plate, vehicle_insurance_url } = req.body;
+    const {
+      vehicle_type,
+      brand,
+      model,
+      color,
+      plate,
+      vehicle_insurance_url,
+      vehicle_insurance_from,
+      vehicle_insurance_expiry
+    } = req.body;
 
     if (!plate || !String(plate).trim()) {
       return res.status(400).json({ error: 'La patente del vehículo es obligatoria.' });
@@ -294,10 +317,23 @@ const addVehicle = async (req, res) => {
         model,
         color,
         plate,
-        vehicle_insurance_url
+        vehicle_insurance_url,
+        vehicle_insurance_from,
+        vehicle_insurance_expiry
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      RETURNING id, provider_id, vehicle_type, brand, model, color, plate, vehicle_insurance_url, created_at;
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::date, $9::date)
+      RETURNING
+        id,
+        provider_id,
+        vehicle_type,
+        brand,
+        model,
+        color,
+        plate,
+        vehicle_insurance_url,
+        vehicle_insurance_from,
+        vehicle_insurance_expiry,
+        created_at;
     `;
 
     const result = await db.query(vehicleQuery, [
@@ -307,11 +343,13 @@ const addVehicle = async (req, res) => {
       model ? String(model).trim() : '',
       color ? String(color).trim() : 'No especificado',
       String(plate).trim().toUpperCase(),
-      vehicle_insurance_url || null
+      vehicle_insurance_url ? String(vehicle_insurance_url).trim() : null,
+      vehicle_insurance_from || null,
+      vehicle_insurance_expiry || null
     ]);
 
     return res.status(201).json({
-      message: 'Vehículo registrado con éxito.',
+      message: 'Vehículo y seguro automotor registrados con éxito.',
       vehicle: result.rows[0]
     });
   } catch (error) {
@@ -321,13 +359,24 @@ const addVehicle = async (req, res) => {
 };
 
 /**
- * Edita un vehículo existente del prestador.
+ * Edita un vehículo existente del prestador, incluyendo seguro automotor y fechas de vigencia.
  */
 const editVehicle = async (req, res) => {
   try {
+    await ensureVehicleInsuranceColumns();
+
     const userId = req.user.userId;
     const { id } = req.params;
-    const { vehicle_type, brand, model, color, plate, vehicle_insurance_url } = req.body;
+    const {
+      vehicle_type,
+      brand,
+      model,
+      color,
+      plate,
+      vehicle_insurance_url,
+      vehicle_insurance_from,
+      vehicle_insurance_expiry
+    } = req.body;
 
     if (plate !== undefined && !String(plate).trim()) {
       return res.status(400).json({ error: 'La patente del vehículo no puede quedar vacía.' });
@@ -346,9 +395,22 @@ const editVehicle = async (req, res) => {
           model = COALESCE($3, model),
           color = COALESCE($4, color),
           plate = COALESCE($5, plate),
-          vehicle_insurance_url = COALESCE($6, vehicle_insurance_url)
-      WHERE id = $7 AND provider_id = ANY($8::int[])
-      RETURNING id, provider_id, vehicle_type, brand, model, color, plate, vehicle_insurance_url, created_at;
+          vehicle_insurance_url = $6,
+          vehicle_insurance_from = $7::date,
+          vehicle_insurance_expiry = $8::date
+      WHERE id = $9 AND provider_id = ANY($10::int[])
+      RETURNING
+        id,
+        provider_id,
+        vehicle_type,
+        brand,
+        model,
+        color,
+        plate,
+        vehicle_insurance_url,
+        vehicle_insurance_from,
+        vehicle_insurance_expiry,
+        created_at;
     `;
 
     const result = await db.query(updateQuery, [
@@ -357,7 +419,9 @@ const editVehicle = async (req, res) => {
       model !== undefined ? String(model).trim() : null,
       color !== undefined ? String(color).trim() : null,
       plate !== undefined ? String(plate).trim().toUpperCase() : null,
-      vehicle_insurance_url || null,
+      vehicle_insurance_url !== undefined ? String(vehicle_insurance_url).trim() || null : null,
+      vehicle_insurance_from || null,
+      vehicle_insurance_expiry || null,
       id,
       providerIds
     ]);
@@ -367,7 +431,7 @@ const editVehicle = async (req, res) => {
     }
 
     return res.status(200).json({
-      message: 'Vehículo actualizado con éxito.',
+      message: 'Vehículo y seguro automotor actualizados con éxito.',
       vehicle: result.rows[0]
     });
   } catch (error) {
@@ -377,12 +441,13 @@ const editVehicle = async (req, res) => {
 };
 
 /**
- * Obtiene especialidades, historial completo de versiones documentales (incluyendo vencidas)
- * y flota vehicular del prestador logueado.
+ * Obtiene especialidades, historial completo de versiones documentales
+ * y flota vehicular (con datos de seguro) del prestador logueado.
  */
 const getMyProviderProfile = async (req, res) => {
   try {
     await ensureDocumentVersionsTable();
+    await ensureVehicleInsuranceColumns();
 
     const userId = req.user.userId;
     const providersRes = await db.query(
@@ -427,10 +492,21 @@ const getMyProviderProfile = async (req, res) => {
       const providerIds = providersRes.rows.map((p) => p.id);
       const vehiclesRes = await db.query(
         `
-          SELECT id, provider_id, vehicle_type, brand, model, color, plate, vehicle_insurance_url, created_at
+          SELECT
+            id,
+            provider_id,
+            vehicle_type,
+            brand,
+            model,
+            color,
+            plate,
+            vehicle_insurance_url,
+            vehicle_insurance_from,
+            vehicle_insurance_expiry,
+            created_at
           FROM provider_vehicles
           WHERE provider_id = ANY($1::int[])
-          ORDER BY id ASC
+          ORDER BY id DESC
         `,
         [providerIds]
       );
