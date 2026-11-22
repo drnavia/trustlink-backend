@@ -2,8 +2,9 @@
  * @file providers.controller.js
  * @description Controlador completo del módulo de prestadores en TrustLink.
  * Gestiona credenciales/especialidades, historial de versiones documentales sin sobrescribir
- * registros anteriores (vigentes, por vencer o vencidos), flota vehicular con póliza y vigencia
- * de seguro automotor, auditoría central, directorio unificado y suspensiones locales.
+ * registros anteriores, flota vehicular con seguro automotor, auditoría central,
+ * directorio unificado para residentes (incluyendo la flota vehicular de cada prestador)
+ * y suspensiones operativas locales.
  * @location /trustlink-backend/src/modules/providers/providers.controller.js
  */
 
@@ -442,7 +443,7 @@ const editVehicle = async (req, res) => {
 
 /**
  * Obtiene especialidades, historial completo de versiones documentales
- * y flota vehicular (con datos de seguro) del prestador logueado.
+ * y flota vehicular del prestador logueado.
  */
 const getMyProviderProfile = async (req, res) => {
   try {
@@ -624,10 +625,13 @@ const updateComplianceStatus = async (req, res) => {
 };
 
 /**
- * Lista los prestadores verificados unificados por usuario (u.id) para el Portal Residente.
+ * Lista los prestadores verificados unificados por usuario (u.id) para el Portal Residente,
+ * incluyendo la flota vehicular registrada (`vehicles`) de cada prestador para seleccionarla al emitir QR.
  */
 const listVerifiedProviders = async (req, res) => {
   try {
+    await ensureVehicleInsuranceColumns();
+
     const query = `
       WITH approved_profiles AS (
         SELECT
@@ -661,7 +665,26 @@ const listVerifiedProviders = async (req, res) => {
         ARRAY_AGG(DISTINCT ap.specialty ORDER BY ap.specialty) AS specialties,
         (ARRAY_AGG(ap.specialty ORDER BY ap.ordered_id ASC))[1] AS specialty,
         ROUND(AVG(ap.rating_avg)::numeric, 2) AS rating_avg,
-        COALESCE(SUM(ap.profile_jobs), 0)::int AS total_jobs
+        COALESCE(SUM(ap.profile_jobs), 0)::int AS total_jobs,
+        COALESCE(
+          (
+            SELECT JSON_AGG(
+              JSON_BUILD_OBJECT(
+                'id', pv.id,
+                'vehicle_type', pv.vehicle_type,
+                'brand', pv.brand,
+                'model', pv.model,
+                'color', pv.color,
+                'plate', pv.plate
+              )
+              ORDER BY pv.id DESC
+            )
+            FROM provider_vehicles pv
+            JOIN providers p2 ON p2.id = pv.provider_id
+            WHERE p2.user_id = ap.user_id
+          ),
+          '[]'::json
+        ) AS vehicles
       FROM approved_profiles ap
       GROUP BY ap.user_id, ap.first_name, ap.last_name, ap.phone, ap.email
       ORDER BY AVG(ap.rating_avg) DESC, ap.user_id ASC;
