@@ -1,37 +1,81 @@
 /**
  * @file providers.controller.js
  * @description Controlador completo del módulo de prestadores en TrustLink.
- * Incluye gestión de perfiles/credenciales de compliance, flota vehicular,
- * auditoría central (Ops TrustLink), directorio unificado por prestador (listVerifiedProviders)
- * y reportes/suspensiones operativas locales por comunidad (listLocalSuspensions,
- * createLocalSuspension, liftLocalSuspension).
+ * Gestiona credenciales/especialidades, historial de versiones documentales sin sobrescribir
+ * registros anteriores (vigentes, por vencer o vencidos), flota vehicular, auditoría central,
+ * directorio unificado para residentes y suspensiones operativas locales.
  * @location /trustlink-backend/src/modules/providers/providers.controller.js
  */
 
 const db = require('../../config/db');
 
 /**
- * Asegura la existencia de la tabla local_provider_suspensions de forma idempotente.
- * Permite que un admin local reporte o suspenda temporalmente a un prestador dentro
- * de su comunidad (country_id) sin alterar el compliance global de la red TrustLink.
+ * Asegura la existencia de la tabla provider_document_versions de forma idempotente
+ * para conservar todas las versiones cargadas (vigentes, vencidas o históricas).
  */
-const ensureLocalSuspensionsTable = async () => {
+const ensureDocumentVersionsTable = async () => {
   await db.query(`
-    CREATE TABLE IF NOT EXISTS local_provider_suspensions (
+    CREATE TABLE IF NOT EXISTS public.provider_document_versions (
       id SERIAL PRIMARY KEY,
-      country_id INTEGER NOT NULL REFERENCES countries(id) ON DELETE CASCADE,
-      provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-      reported_by_user_id INTEGER NULL REFERENCES users(id) ON DELETE SET NULL,
-      reason TEXT NOT NULL,
-      status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'lifted')),
-      created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
-      lifted_at TIMESTAMP WITHOUT TIME ZONE NULL
+      user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+      provider_id INTEGER NULL REFERENCES public.providers(id) ON DELETE SET NULL,
+      doc_type VARCHAR(40) NOT NULL CHECK (doc_type IN ('criminal', 'insurance')),
+      document_url TEXT NOT NULL,
+      valid_from DATE NULL,
+      valid_to DATE NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
     );
   `);
 };
 
 /**
- * Registra o agrega un nuevo perfil/historial de compliance y especialidad para un usuario 'provider'.
+ * Inserta una versión documental en el historial sin eliminar versiones previas.
+ */
+const recordDocumentVersion = async ({
+  userId,
+  providerId = null,
+  docType,
+  documentUrl,
+  validFrom = null,
+  validTo = null,
+  status = 'pending'
+}) => {
+  if (!documentUrl || !String(documentUrl).trim()) return null;
+
+  await ensureDocumentVersionsTable();
+
+  const res = await db.query(
+    `
+      INSERT INTO public.provider_document_versions (
+        user_id,
+        provider_id,
+        doc_type,
+        document_url,
+        valid_from,
+        valid_to,
+        status
+      )
+      VALUES ($1, $2, $3, $4, $5::date, $6::date, $7)
+      RETURNING id, user_id, provider_id, doc_type, document_url, valid_from, valid_to, status, created_at;
+    `,
+    [
+      userId,
+      providerId,
+      docType,
+      String(documentUrl).trim(),
+      validFrom || null,
+      validTo || null,
+      status || 'pending'
+    ]
+  );
+
+  return res.rows[0] || null;
+};
+
+/**
+ * Registra un nuevo perfil/especialidad para el prestador y guarda su versión documental
+ * en el historial sin pisar cargas anteriores.
  */
 const updateProviderProfile = async (req, res) => {
   try {
@@ -39,8 +83,10 @@ const updateProviderProfile = async (req, res) => {
     const {
       specialty,
       criminal_record_url,
+      criminal_record_from,
       criminal_record_expiry,
       insurance_policy_url,
+      insurance_from,
       insurance_expiry
     } = req.body;
 
@@ -75,17 +121,42 @@ const updateProviderProfile = async (req, res) => {
     const values = [
       userId,
       String(specialty).trim(),
-      criminal_record_url ? String(criminal_record_url).trim() : null,
+      criminal_record_url || null,
       criminal_record_expiry || null,
-      insurance_policy_url ? String(insurance_policy_url).trim() : null,
+      insurance_policy_url || null,
       insurance_expiry || null
     ];
 
     const providerResult = await db.query(insertQuery, values);
+    const createdProvider = providerResult.rows[0];
+
+    if (criminal_record_url || criminal_record_expiry) {
+      await recordDocumentVersion({
+        userId,
+        providerId: createdProvider.id,
+        docType: 'criminal',
+        documentUrl: criminal_record_url || 'Sin URL',
+        validFrom: criminal_record_from || null,
+        validTo: criminal_record_expiry || null,
+        status: 'pending'
+      });
+    }
+
+    if (insurance_policy_url || insurance_expiry) {
+      await recordDocumentVersion({
+        userId,
+        providerId: createdProvider.id,
+        docType: 'insurance',
+        documentUrl: insurance_policy_url || 'Sin URL',
+        validFrom: insurance_from || null,
+        validTo: insurance_expiry || null,
+        status: 'pending'
+      });
+    }
 
     return res.status(201).json({
       message: 'Perfil de compliance registrado y enviado a revisión con éxito.',
-      provider: providerResult.rows[0]
+      provider: createdProvider
     });
   } catch (error) {
     console.error('Error al registrar perfil de prestador:', error);
@@ -94,39 +165,29 @@ const updateProviderProfile = async (req, res) => {
 };
 
 /**
- * Permite editar un registro específico de compliance por su ID de provider.
+ * Permite editar un registro específico de compliance por su ID de provider
+ * y registra la nueva versión documental en el historial sin borrar las anteriores.
  */
 const editProviderProfile = async (req, res) => {
   try {
     const userId = req.user.userId;
-    const profileId = parseInt(req.params.id, 10);
+    const { id } = req.params;
     const {
       specialty,
       criminal_record_url,
+      criminal_record_from,
       criminal_record_expiry,
       insurance_policy_url,
+      insurance_from,
       insurance_expiry
     } = req.body;
 
-    if (!Number.isInteger(profileId) || profileId <= 0) {
-      return res.status(400).json({ error: 'ID de perfil inválido.' });
-    }
-
-    const existing = await db.query(
-      'SELECT * FROM providers WHERE id = $1 AND user_id = $2',
-      [profileId, userId]
-    );
-    if (existing.rows.length === 0) {
-      return res.status(404).json({ error: 'Perfil de prestador no encontrado o no autorizado.' });
-    }
-
-    const current = existing.rows[0];
     const updateQuery = `
       UPDATE providers
-      SET specialty = $1,
-          criminal_record_url = $2,
+      SET specialty = COALESCE($1, specialty),
+          criminal_record_url = COALESCE($2, criminal_record_url),
           criminal_record_expiry = COALESCE($3::date, criminal_record_expiry),
-          insurance_policy_url = $4,
+          insurance_policy_url = COALESCE($4, insurance_policy_url),
           insurance_expiry = COALESCE($5::date, insurance_expiry),
           status = 'pending'
       WHERE id = $6 AND user_id = $7
@@ -144,22 +205,48 @@ const editProviderProfile = async (req, res) => {
     `;
 
     const result = await db.query(updateQuery, [
-      specialty !== undefined ? String(specialty).trim() : current.specialty,
-      criminal_record_url !== undefined
-        ? (String(criminal_record_url).trim() || null)
-        : current.criminal_record_url,
+      specialty ? String(specialty).trim() : null,
+      criminal_record_url || null,
       criminal_record_expiry || null,
-      insurance_policy_url !== undefined
-        ? (String(insurance_policy_url).trim() || null)
-        : current.insurance_policy_url,
+      insurance_policy_url || null,
       insurance_expiry || null,
-      profileId,
+      id,
       userId
     ]);
 
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Perfil de prestador no encontrado o no autorizado.' });
+    }
+
+    const updatedProvider = result.rows[0];
+
+    if (criminal_record_url || criminal_record_expiry) {
+      await recordDocumentVersion({
+        userId,
+        providerId: updatedProvider.id,
+        docType: 'criminal',
+        documentUrl: criminal_record_url || 'Sin URL',
+        validFrom: criminal_record_from || null,
+        validTo: criminal_record_expiry || null,
+        status: 'pending'
+      });
+    }
+
+    if (insurance_policy_url || insurance_expiry) {
+      await recordDocumentVersion({
+        userId,
+        providerId: updatedProvider.id,
+        docType: 'insurance',
+        documentUrl: insurance_policy_url || 'Sin URL',
+        validFrom: insurance_from || null,
+        validTo: insurance_expiry || null,
+        status: 'pending'
+      });
+    }
+
     return res.status(200).json({
-      message: 'Perfil actualizado con éxito. Pendiente de aprobación.',
-      provider: result.rows[0]
+      message: 'Perfil y versión documental actualizados con éxito. Pendiente de aprobación.',
+      provider: updatedProvider
     });
   } catch (error) {
     console.error('Error al editar perfil de prestador:', error);
@@ -215,7 +302,7 @@ const addVehicle = async (req, res) => {
 
     const result = await db.query(vehicleQuery, [
       providerId,
-      vehicle_type ? String(vehicle_type).trim() : 'Automóvil',
+      vehicle_type || 'Automóvil',
       brand ? String(brand).trim() : '',
       model ? String(model).trim() : '',
       color ? String(color).trim() : 'No especificado',
@@ -239,51 +326,45 @@ const addVehicle = async (req, res) => {
 const editVehicle = async (req, res) => {
   try {
     const userId = req.user.userId;
-    const vehicleId = parseInt(req.params.id, 10);
+    const { id } = req.params;
     const { vehicle_type, brand, model, color, plate, vehicle_insurance_url } = req.body;
 
-    if (!Number.isInteger(vehicleId) || vehicleId <= 0) {
-      return res.status(400).json({ error: 'ID de vehículo inválido.' });
-    }
     if (plate !== undefined && !String(plate).trim()) {
       return res.status(400).json({ error: 'La patente del vehículo no puede quedar vacía.' });
     }
 
-    const vehRes = await db.query(
-      `
-        SELECT pv.*
-        FROM provider_vehicles pv
-        INNER JOIN providers p ON p.id = pv.provider_id
-        WHERE pv.id = $1 AND p.user_id = $2
-      `,
-      [vehicleId, userId]
-    );
-    if (vehRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Vehículo no encontrado o no autorizado.' });
+    const providerRes = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
+    if (providerRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Prestador no encontrado.' });
     }
+    const providerIds = providerRes.rows.map((p) => p.id);
 
-    const current = vehRes.rows[0];
     const updateQuery = `
       UPDATE provider_vehicles
-      SET vehicle_type = $1,
-          brand = $2,
-          model = $3,
-          color = $4,
-          plate = $5,
+      SET vehicle_type = COALESCE($1, vehicle_type),
+          brand = COALESCE($2, brand),
+          model = COALESCE($3, model),
+          color = COALESCE($4, color),
+          plate = COALESCE($5, plate),
           vehicle_insurance_url = COALESCE($6, vehicle_insurance_url)
-      WHERE id = $7
+      WHERE id = $7 AND provider_id = ANY($8::int[])
       RETURNING id, provider_id, vehicle_type, brand, model, color, plate, vehicle_insurance_url, created_at;
     `;
 
     const result = await db.query(updateQuery, [
-      vehicle_type !== undefined ? String(vehicle_type).trim() : current.vehicle_type,
-      brand !== undefined ? String(brand).trim() : current.brand,
-      model !== undefined ? String(model).trim() : current.model,
-      color !== undefined ? String(color).trim() : current.color,
-      plate !== undefined ? String(plate).trim().toUpperCase() : current.plate,
+      vehicle_type || null,
+      brand !== undefined ? String(brand).trim() : null,
+      model !== undefined ? String(model).trim() : null,
+      color !== undefined ? String(color).trim() : null,
+      plate !== undefined ? String(plate).trim().toUpperCase() : null,
       vehicle_insurance_url || null,
-      vehicleId
+      id,
+      providerIds
     ]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Vehículo no encontrado o no autorizado.' });
+    }
 
     return res.status(200).json({
       message: 'Vehículo actualizado con éxito.',
@@ -296,49 +377,70 @@ const editVehicle = async (req, res) => {
 };
 
 /**
- * Obtiene el historial completo de perfiles de compliance y vehículos del prestador logueado.
+ * Obtiene especialidades, historial completo de versiones documentales (incluyendo vencidas)
+ * y flota vehicular del prestador logueado.
  */
 const getMyProviderProfile = async (req, res) => {
   try {
+    await ensureDocumentVersionsTable();
+
     const userId = req.user.userId;
     const providersRes = await db.query(
       `
         SELECT
-          p.id,
-          p.specialty,
-          p.criminal_record_url,
-          p.criminal_record_expiry,
-          p.insurance_policy_url,
-          p.insurance_expiry,
-          p.status,
-          p.rating_avg,
-          p.created_at,
-          u.first_name,
-          u.last_name,
-          u.email,
-          u.phone
-        FROM providers p
-        INNER JOIN users u ON u.id = p.user_id
-        WHERE p.user_id = $1
-        ORDER BY p.created_at DESC, p.id DESC
+          id,
+          specialty,
+          criminal_record_url,
+          criminal_record_expiry,
+          insurance_policy_url,
+          insurance_expiry,
+          status,
+          rating_avg,
+          created_at
+        FROM providers
+        WHERE user_id = $1
+        ORDER BY created_at DESC, id DESC
       `,
       [userId]
     );
 
-    const vehiclesRes = await db.query(
+    const versionsRes = await db.query(
       `
-        SELECT pv.*
-        FROM provider_vehicles pv
-        INNER JOIN providers p ON p.id = pv.provider_id
-        WHERE p.user_id = $1
-        ORDER BY pv.id ASC
+        SELECT
+          id,
+          provider_id,
+          doc_type,
+          document_url,
+          valid_from,
+          valid_to,
+          status,
+          created_at
+        FROM public.provider_document_versions
+        WHERE user_id = $1
+        ORDER BY created_at DESC, id DESC
       `,
       [userId]
     );
+
+    let vehicles = [];
+    if (providersRes.rows.length > 0) {
+      const providerIds = providersRes.rows.map((p) => p.id);
+      const vehiclesRes = await db.query(
+        `
+          SELECT id, provider_id, vehicle_type, brand, model, color, plate, vehicle_insurance_url, created_at
+          FROM provider_vehicles
+          WHERE provider_id = ANY($1::int[])
+          ORDER BY id ASC
+        `,
+        [providerIds]
+      );
+      vehicles = vehiclesRes.rows;
+    }
 
     return res.status(200).json({
       providers: providersRes.rows,
-      vehicles: vehiclesRes.rows
+      document_history: versionsRes.rows,
+      vehicles
     });
   } catch (error) {
     console.error('Error al obtener perfil del prestador:', error);
@@ -347,8 +449,7 @@ const getMyProviderProfile = async (req, res) => {
 };
 
 /**
- * Lista TODOS los prestadores registrados (incluyendo aquellos sin perfil completo)
- * para Ops TrustLink mediante LEFT JOIN desde users.
+ * Lista TODOS los prestadores registrados para auditoría centralizada en Ops TrustLink.
  */
 const listAllProvidersForOps = async (req, res) => {
   try {
@@ -382,10 +483,12 @@ const listAllProvidersForOps = async (req, res) => {
 };
 
 /**
- * Actualiza el estado de compliance global de un prestador (exclusivo superadmin).
+ * Actualiza el estado de compliance de un prestador y sincroniza versiones documentales asociadas.
  */
 const updateComplianceStatus = async (req, res) => {
   try {
+    await ensureDocumentVersionsTable();
+
     const { provider_id, user_id, status } = req.body;
     if (!['approved', 'rejected', 'pending'].includes(status)) {
       return res.status(400).json({ error: 'Estado de compliance inválido.' });
@@ -424,9 +527,19 @@ const updateComplianceStatus = async (req, res) => {
       return res.status(404).json({ error: 'Prestador no encontrado en la base de datos.' });
     }
 
+    const updatedProvider = result.rows[0];
+    await db.query(
+      `
+        UPDATE public.provider_document_versions
+        SET status = $1
+        WHERE provider_id = $2 OR user_id = $3
+      `,
+      [status, updatedProvider.id, updatedProvider.user_id]
+    );
+
     return res.status(200).json({
       message: `Estado de compliance actualizado exitosamente a: ${status}`,
-      provider: result.rows[0]
+      provider: updatedProvider
     });
   } catch (error) {
     console.error('Error al actualizar compliance:', error);
@@ -436,9 +549,6 @@ const updateComplianceStatus = async (req, res) => {
 
 /**
  * Lista los prestadores verificados unificados por usuario (u.id) para el Portal Residente.
- * Si un mismo profesional tiene múltiples filas aprobadas en providers (por ejemplo distintas
- * especialidades), consolida en una sola tarjeta sus especialidades, promedio de calificación
- * y cantidad total de trabajos/contratos asociados a cualquiera de sus perfiles aprobados.
  */
 const listVerifiedProviders = async (req, res) => {
   try {
@@ -496,81 +606,64 @@ const listVerifiedProviders = async (req, res) => {
 };
 
 /**
- * Lista suspensiones/reportes operativos locales y prestadores disponibles para el admin de barrio
- * (o globalmente para superadmin).
+ * Asegura la existencia de la tabla de suspensiones operativas locales por comunidad.
+ */
+const ensureLocalSuspensionsTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS public.provider_local_suspensions (
+      id SERIAL PRIMARY KEY,
+      country_id INTEGER NOT NULL REFERENCES public.countries(id) ON DELETE CASCADE,
+      provider_id INTEGER NOT NULL REFERENCES public.providers(id) ON DELETE CASCADE,
+      created_by_user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+      reason TEXT NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+      lifted_at TIMESTAMP WITHOUT TIME ZONE NULL
+    );
+  `);
+};
+
+/**
+ * Lista suspensiones locales por comunidad.
  */
 const listLocalSuspensions = async (req, res) => {
   try {
     await ensureLocalSuspensionsTable();
-
-    const role = req.user.role;
-    const userCountryId = req.user.countryId;
-    const requestedCountryId = req.query.country_id ? parseInt(req.query.country_id, 10) : null;
-
-    const effectiveCountryId = role === 'superadmin' ? requestedCountryId : userCountryId;
-
-    const countriesRes = await db.query(
-      'SELECT id, name, location, is_active FROM countries ORDER BY id ASC'
-    );
-
-    const providersRes = await db.query(
-      `
-        SELECT
-          p.id AS provider_id,
-          p.specialty,
-          p.status AS compliance_status,
-          p.rating_avg,
-          u.first_name,
-          u.last_name,
-          u.email
-        FROM providers p
-        INNER JOIN users u ON u.id = p.user_id
-        ORDER BY u.first_name ASC, p.id ASC
-      `
-    );
+    const countryIdParam = req.query.country_id ? parseInt(req.query.country_id, 10) : null;
+    const effectiveCountryId =
+      req.user.role === 'superadmin' && countryIdParam ? countryIdParam : req.user.countryId;
 
     const params = [];
     let whereClause = '';
     if (effectiveCountryId && Number.isInteger(effectiveCountryId) && effectiveCountryId > 0) {
       params.push(effectiveCountryId);
-      whereClause = 'WHERE lps.country_id = $1';
+      whereClause = 'WHERE pls.country_id = $1';
     }
 
-    const suspensionsRes = await db.query(
-      `
-        SELECT
-          lps.id,
-          lps.country_id,
-          c.name AS country_name,
-          lps.provider_id,
-          p.specialty,
-          p.status AS compliance_status,
-          u_prov.first_name AS provider_first_name,
-          u_prov.last_name AS provider_last_name,
-          lps.reported_by_user_id,
-          u_adm.first_name AS admin_first_name,
-          u_adm.last_name AS admin_last_name,
-          lps.reason,
-          lps.status,
-          lps.created_at,
-          lps.lifted_at
-        FROM local_provider_suspensions lps
-        LEFT JOIN countries c ON c.id = lps.country_id
-        LEFT JOIN providers p ON p.id = lps.provider_id
-        LEFT JOIN users u_prov ON u_prov.id = p.user_id
-        LEFT JOIN users u_adm ON u_adm.id = lps.reported_by_user_id
-        ${whereClause}
-        ORDER BY lps.id DESC
-      `,
-      params
-    );
+    const query = `
+      SELECT
+        pls.id,
+        pls.country_id,
+        c.name AS country_name,
+        pls.provider_id,
+        p.specialty,
+        u.first_name,
+        u.last_name,
+        u.email,
+        pls.reason,
+        pls.active,
+        pls.created_at,
+        pls.lifted_at
+      FROM public.provider_local_suspensions pls
+      JOIN public.providers p ON p.id = pls.provider_id
+      JOIN public.users u ON u.id = p.user_id
+      LEFT JOIN public.countries c ON c.id = pls.country_id
+      ${whereClause}
+      ORDER BY pls.active DESC, pls.id DESC;
+    `;
 
-    return res.status(200).json({
-      effective_country_id: effectiveCountryId || null,
-      countries: countriesRes.rows,
-      providers: providersRes.rows,
-      suspensions: suspensionsRes.rows
-    });
+    const result = await db.query(query, params);
+    return res.status(200).json({ count: result.rows.length, suspensions: result.rows });
   } catch (error) {
     console.error('Error al listar suspensiones locales:', error);
     return res.status(500).json({ error: 'Error interno al consultar suspensiones locales.' });
@@ -578,92 +671,70 @@ const listLocalSuspensions = async (req, res) => {
 };
 
 /**
- * Registra una suspensión o reporte operativo local de un prestador en una comunidad.
- * No modifica providers.status (compliance global).
+ * Crea una suspensión operativa local en la comunidad.
  */
 const createLocalSuspension = async (req, res) => {
   try {
     await ensureLocalSuspensionsTable();
+    const { provider_id, reason, country_id } = req.body;
+    const effectiveCountryId =
+      req.user.role === 'superadmin' && country_id
+        ? parseInt(country_id, 10)
+        : req.user.countryId;
 
-    const role = req.user.role;
-    const adminUserId = req.user.userId;
-    const providerId = parseInt(req.body.provider_id, 10);
-    const reason = String(req.body.reason || '').trim();
-    const countryId =
-      role === 'superadmin'
-        ? parseInt(req.body.country_id || req.user.countryId || 1, 10)
-        : parseInt(req.body.country_id || req.user.countryId, 10);
-
-    if (!Number.isInteger(countryId) || countryId <= 0) {
-      return res.status(400).json({ error: 'Debe indicar una comunidad válida.' });
-    }
-    if (!Number.isInteger(providerId) || providerId <= 0) {
-      return res.status(400).json({ error: 'Debe seleccionar un prestador válido.' });
-    }
-    if (!reason) {
-      return res
-        .status(400)
-        .json({ error: 'El motivo del reporte o suspensión local es obligatorio.' });
-    }
-
-    const providerCheck = await db.query('SELECT id FROM providers WHERE id = $1', [providerId]);
-    if (providerCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Prestador no encontrado.' });
-    }
-
-    const countryCheck = await db.query('SELECT id, name FROM countries WHERE id = $1', [countryId]);
-    if (countryCheck.rows.length === 0) {
-      return res.status(404).json({ error: 'Comunidad no encontrada.' });
+    if (!provider_id || !reason || !String(reason).trim()) {
+      return res.status(400).json({ error: 'Debe indicar el prestador y el motivo del reporte.' });
     }
 
     const insertRes = await db.query(
       `
-        INSERT INTO local_provider_suspensions
-          (country_id, provider_id, reported_by_user_id, reason, status)
-        VALUES ($1, $2, $3, $4, 'active')
-        RETURNING *
+        INSERT INTO public.provider_local_suspensions (
+          country_id,
+          provider_id,
+          created_by_user_id,
+          reason,
+          active
+        )
+        VALUES ($1, $2, $3, $4, TRUE)
+        RETURNING *;
       `,
-      [countryId, providerId, adminUserId, reason]
+      [effectiveCountryId, provider_id, req.user.userId, String(reason).trim()]
     );
 
     return res.status(201).json({
-      message: `Reporte/suspensión local registrada en ${countryCheck.rows[0].name}.`,
+      message: 'Suspensión local registrada para esta comunidad.',
       suspension: insertRes.rows[0]
     });
   } catch (error) {
-    console.error('Error al registrar suspensión local:', error);
-    return res.status(500).json({ error: 'Error interno al registrar el reporte local.' });
+    console.error('Error al crear suspensión local:', error);
+    return res.status(500).json({ error: 'Error interno al registrar la suspensión local.' });
   }
 };
 
 /**
- * Levanta una suspensión/reporte local activa.
+ * Levanta una suspensión operativa local activa.
  */
 const liftLocalSuspension = async (req, res) => {
   try {
     await ensureLocalSuspensionsTable();
-
-    const suspensionId = parseInt(req.params.id, 10);
-    if (!Number.isInteger(suspensionId) || suspensionId <= 0) {
-      return res.status(400).json({ error: 'ID de reporte/suspensión inválido.' });
-    }
+    const { id } = req.params;
 
     const updated = await db.query(
       `
-        UPDATE local_provider_suspensions
-        SET status = 'lifted', lifted_at = NOW()
+        UPDATE public.provider_local_suspensions
+        SET active = FALSE, lifted_at = NOW()
         WHERE id = $1
-        RETURNING *
+        RETURNING *;
       `,
-      [suspensionId]
+      [id]
     );
 
     if (updated.rows.length === 0) {
-      return res.status(404).json({ error: 'Registro no encontrado.' });
+      return res.status(404).json({ error: 'Suspensión local no encontrada.' });
     }
 
     return res.status(200).json({
-      message: 'Suspensión local levantada correctamente.',
+      message: 'Suspensión local levantada.',
       suspension: updated.rows[0]
     });
   } catch (error) {
