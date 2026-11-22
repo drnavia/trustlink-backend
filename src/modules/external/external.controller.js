@@ -52,7 +52,6 @@ const ensureAuditLogsTable = async () => {
 /**
  * Persiste en PostgreSQL el estado 'expired'::pass_status para pases en estado 'pending'
  * cuya end_time (almacenada en UTC sin zona horaria) ya superó el instante actual (NOW()).
- * Opcionalmente filtra por passId para actualizar un único pase de forma focalizada.
  * @param {number|null} passId
  */
 const expireOverduePasses = async (passId = null) => {
@@ -284,6 +283,7 @@ const getExternalDiagnostics = async (req, res) => {
     const envKey = String(process.env.EXTERNAL_GATE_API_KEY || '').trim();
 
     return res.status(200).json({
+      status: 'healthy',
       service: 'trustlink-backend',
       environment: process.env.NODE_ENV || 'development',
       timestamp: new Date().toISOString(),
@@ -305,6 +305,7 @@ const getExternalDiagnostics = async (req, res) => {
   } catch (error) {
     console.error('Error en diagnóstico externo:', error);
     return res.status(500).json({
+      status: 'degraded',
       service: 'trustlink-backend',
       timestamp: new Date().toISOString(),
       database: {
@@ -333,7 +334,6 @@ const listCountries = async (req, res) => {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 4, 1), 50);
     const search = String(req.query.search || '').trim();
-    const offset = (page - 1) * limit;
 
     const conditions = [];
     const params = [];
@@ -1011,7 +1011,6 @@ const getAuditOverview = async (req, res) => {
 
 /**
  * Valida un pase QR en tiempo real para garitas o sistemas externos de barrios privados.
- * Persiste 'expired' en access_passes si el pase pendiente venció en UTC y registra en gate_access_logs.
  */
 const verifyExternalPassByQR = async (req, res) => {
   await Promise.all([ensureIntegrationsTable(), ensureAuditLogsTable()]);
