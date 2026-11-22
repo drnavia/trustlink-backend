@@ -2,12 +2,50 @@
  * @file external.controller.js
  * @description Controlador para integración externa de barrios privados (validación de QR),
  * diagnóstico técnico del sistema, gestión de pases QR con persistencia de estado 'expired',
- * administración de comunidades, integraciones por comunidad y auditoría tolerante de accesos y transacciones.
+ * administración de comunidades (con migración idempotente de columnas), integraciones por comunidad
+ * y auditoría tolerante de accesos y transacciones.
  * @location /trustlink-backend/src/modules/external/external.controller.js
  */
 
 const crypto = require('crypto');
 const db = require('../../config/db');
+
+/**
+ * Asegura de forma idempotente que la tabla `countries` cuente con las columnas
+ * address, postal_code, city y province (migrando datos desde locality/location si existen).
+ */
+const ensureCountriesColumns = async () => {
+  await db.query(`
+    ALTER TABLE countries
+      ADD COLUMN IF NOT EXISTS address VARCHAR(255) NULL,
+      ADD COLUMN IF NOT EXISTS postal_code VARCHAR(30) NULL,
+      ADD COLUMN IF NOT EXISTS city VARCHAR(120) NULL,
+      ADD COLUMN IF NOT EXISTS province VARCHAR(120) NULL;
+  `);
+
+  const colsRes = await db.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'countries'
+  `);
+  const cols = new Set(colsRes.rows.map((r) => r.column_name));
+
+  if (cols.has('locality')) {
+    await db.query(`
+      UPDATE countries
+      SET city = COALESCE(city, locality)
+      WHERE city IS NULL AND locality IS NOT NULL;
+    `);
+  }
+
+  if (cols.has('location')) {
+    await db.query(`
+      UPDATE countries
+      SET city = COALESCE(city, location)
+      WHERE city IS NULL AND location IS NOT NULL;
+    `);
+  }
+};
 
 /**
  * Asegura la existencia de la tabla country_integrations de forma idempotente.
@@ -258,6 +296,7 @@ const getExternalDiagnostics = async (req, res) => {
   const startedAt = Date.now();
   try {
     await Promise.all([
+      ensureCountriesColumns(),
       ensureIntegrationsTable(),
       ensureAuditLogsTable(),
       expireOverduePasses()
@@ -326,23 +365,31 @@ const getExternalDiagnostics = async (req, res) => {
 };
 
 /**
- * Lista comunidades (countries) con paginación y búsqueda.
+ * Lista comunidades (countries) con paginación, filtro de estado y búsqueda.
  */
 const listCountries = async (req, res) => {
   try {
-    await ensureIntegrationsTable();
+    await Promise.all([ensureCountriesColumns(), ensureIntegrationsTable()]);
+
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 4, 1), 50);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 4, 1), 100);
     const search = String(req.query.search || '').trim();
+    const status = String(req.query.status || 'all').trim().toLowerCase();
 
     const conditions = [];
     const params = [];
+
+    if (status === 'active') {
+      conditions.push('c.is_active = TRUE');
+    } else if (status === 'inactive') {
+      conditions.push('c.is_active = FALSE');
+    }
 
     if (search) {
       params.push(`%${search}%`);
       const idx = params.length;
       conditions.push(
-        `(c.name ILIKE $${idx} OR COALESCE(c.city, '') ILIKE $${idx} OR COALESCE(c.province, '') ILIKE $${idx} OR COALESCE(c.address, '') ILIKE $${idx})`
+        `(c.name ILIKE $${idx} OR COALESCE(c.city, '') ILIKE $${idx} OR COALESCE(c.province, '') ILIKE $${idx} OR COALESCE(c.address, '') ILIKE $${idx} OR COALESCE(c.postal_code, '') ILIKE $${idx})`
       );
     }
 
@@ -389,7 +436,9 @@ const listCountries = async (req, res) => {
     });
   } catch (error) {
     console.error('Error al listar comunidades:', error);
-    return res.status(500).json({ error: 'Error al obtener las comunidades.' });
+    return res.status(500).json({
+      error: `Error al obtener las comunidades: ${error.message}`
+    });
   }
 };
 
@@ -398,6 +447,8 @@ const listCountries = async (req, res) => {
  */
 const createCountry = async (req, res) => {
   try {
+    await ensureCountriesColumns();
+
     const name = String(req.body?.name || '').trim();
     const address = String(req.body?.address || '').trim();
     const postalCode = String(req.body?.postal_code || '').trim();
@@ -407,6 +458,30 @@ const createCountry = async (req, res) => {
 
     if (!name) {
       return res.status(400).json({ error: 'El nombre de la comunidad es obligatorio.' });
+    }
+
+    const colsRes = await db.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'countries'
+    `);
+    const cols = new Set(colsRes.rows.map((r) => r.column_name));
+
+    const locationText = [address, city, province, postalCode].filter(Boolean).join(', ') || null;
+
+    if (cols.has('location')) {
+      const result = await db.query(
+        `
+          INSERT INTO countries (name, location, address, postal_code, city, province, is_active)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          RETURNING id, name, address, postal_code, city, province, is_active, created_at
+        `,
+        [name, locationText, address || null, postalCode || null, city || null, province || null, isActive]
+      );
+      return res.status(201).json({
+        message: 'Comunidad creada correctamente.',
+        country: result.rows[0]
+      });
     }
 
     const result = await db.query(
@@ -433,6 +508,8 @@ const createCountry = async (req, res) => {
  */
 const updateCountry = async (req, res) => {
   try {
+    await ensureCountriesColumns();
+
     const countryId = parseInt(req.params.id, 10);
     if (Number.isNaN(countryId)) {
       return res.status(400).json({ error: 'ID de comunidad inválido.' });
