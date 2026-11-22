@@ -1,58 +1,45 @@
 /**
  * @file passes.controller.js
  * @description Lógica de negocio completa para la emisión, consulta, edición de pases QR
- * vigentes por residentes y validación perimetral en tiempo real en la garita.
+ * vigentes por residentes (incluyendo patente del vehículo en `access_passes`)
+ * y validación perimetral en tiempo real en la garita.
  * @location /trustlink-backend/src/modules/passes/passes.controller.js
  */
 
 const db = require('../../config/db');
 const crypto = require('crypto');
 
-let hasVehiclePlateColumnCache = null;
-
 /**
- * Detecta de forma segura si la tabla access_passes dispone de la columna vehicle_plate.
+ * Asegura de forma idempotente que `access_passes` cuente con la columna `vehicle_plate`
+ * para persistir tanto el alta como la edición de vehículo en pases vigentes.
  */
-const checkHasVehiclePlateColumn = async () => {
-  if (hasVehiclePlateColumnCache !== null) return hasVehiclePlateColumnCache;
-  try {
-    const res = await db.query(
-      `
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'access_passes'
-          AND column_name = 'vehicle_plate'
-        LIMIT 1;
-      `
-    );
-    hasVehiclePlateColumnCache = res.rows.length > 0;
-  } catch {
-    hasVehiclePlateColumnCache = false;
-  }
-  return hasVehiclePlateColumnCache;
+const ensureVehiclePlateColumn = async () => {
+  await db.query(`
+    ALTER TABLE public.access_passes
+    ADD COLUMN IF NOT EXISTS vehicle_plate VARCHAR(20) NULL;
+  `);
 };
 
 /**
  * Marca como 'expired' en PostgreSQL los pases 'pending' cuya franja end_time ya venció.
  */
 const expireOverduePasses = async () => {
-  await db.query(
-    `
-      UPDATE public.access_passes
-      SET status = 'expired'::public.pass_status
-      WHERE status = 'pending'::public.pass_status
-        AND (end_time AT TIME ZONE 'UTC') < NOW();
-    `
-  );
+  await db.query(`
+    UPDATE public.access_passes
+    SET status = 'expired'::public.pass_status
+    WHERE status = 'pending'::public.pass_status
+      AND (end_time AT TIME ZONE 'UTC') < NOW();
+  `);
 };
 
 /**
- * Genera un nuevo pase de acceso con un token QR único cifrado.
+ * Genera un nuevo pase de acceso con un token QR único cifrado y patente opcional.
  * Roles permitidos: 'owner', 'family'
  */
 const createPass = async (req, res) => {
   try {
+    await ensureVehiclePlateColumn();
+
     const {
       provider_id,
       fraction_number,
@@ -87,72 +74,50 @@ const createPass = async (req, res) => {
 
     const qr_token = crypto.randomBytes(32).toString('hex');
     const cleanPlate = vehicle_plate ? String(vehicle_plate).trim().toUpperCase() : null;
-    const hasPlateCol = await checkHasVehiclePlateColumn();
 
-    const query = hasPlateCol
-      ? `
-          INSERT INTO access_passes (
-            country_id,
-            owner_id,
-            provider_id,
-            fraction_number,
-            lot_number,
-            vehicle_plate,
-            qr_token,
-            start_time,
-            end_time,
-            status
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamp, $9::timestamp, 'pending')
-          RETURNING id, qr_token, fraction_number, lot_number, vehicle_plate, start_time, end_time, status, created_at;
-        `
-      : `
-          INSERT INTO access_passes (
-            country_id,
-            owner_id,
-            provider_id,
-            fraction_number,
-            lot_number,
-            qr_token,
-            start_time,
-            end_time,
-            status
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7::timestamp, $8::timestamp, 'pending')
-          RETURNING id, qr_token, fraction_number, lot_number, start_time, end_time, status, created_at;
-        `;
+    const query = `
+      INSERT INTO public.access_passes (
+        country_id,
+        owner_id,
+        provider_id,
+        fraction_number,
+        lot_number,
+        vehicle_plate,
+        qr_token,
+        start_time,
+        end_time,
+        status
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamp, $9::timestamp, 'pending')
+      RETURNING
+        id,
+        qr_token,
+        fraction_number,
+        lot_number,
+        vehicle_plate,
+        start_time,
+        end_time,
+        status::text AS status,
+        created_at;
+    `;
 
-    const values = hasPlateCol
-      ? [
-          country_id,
-          owner_id,
-          provider_id,
-          fraction_number || null,
-          lot_number || null,
-          cleanPlate,
-          qr_token,
-          startDate.toISOString(),
-          endDate.toISOString()
-        ]
-      : [
-          country_id,
-          owner_id,
-          provider_id,
-          fraction_number || null,
-          lot_number || null,
-          qr_token,
-          startDate.toISOString(),
-          endDate.toISOString()
-        ];
+    const values = [
+      country_id,
+      owner_id,
+      provider_id,
+      fraction_number || null,
+      lot_number || null,
+      cleanPlate,
+      qr_token,
+      startDate.toISOString(),
+      endDate.toISOString()
+    ];
 
     const newPass = await db.query(query, values);
 
     return res.status(201).json({
       message: 'Pase de acceso generado exitosamente.',
-      pass: {
-        ...newPass.rows[0],
-        vehicle_plate: newPass.rows[0]?.vehicle_plate || cleanPlate
-      }
+      pass: newPass.rows[0]
     });
   } catch (error) {
     console.error('Error al generar el pase de acceso:', error);
@@ -168,11 +133,10 @@ const createPass = async (req, res) => {
  */
 const getMyPasses = async (req, res) => {
   try {
+    await ensureVehiclePlateColumn();
     await expireOverduePasses();
 
     const ownerId = req.user.userId;
-    const hasPlateCol = await checkHasVehiclePlateColumn();
-    const plateSelect = hasPlateCol ? 'ap.vehicle_plate' : 'NULL::varchar AS vehicle_plate';
 
     const query = `
       SELECT
@@ -182,7 +146,7 @@ const getMyPasses = async (req, res) => {
         ap.provider_id,
         ap.fraction_number,
         ap.lot_number,
-        ${plateSelect},
+        ap.vehicle_plate,
         ap.qr_token,
         ap.start_time,
         ap.end_time,
@@ -212,10 +176,12 @@ const getMyPasses = async (req, res) => {
 
 /**
  * Permite al residente/familia editar un pase QR que esté realmente VIGENTE
- * (estado 'pending' y end_time en el futuro). Bloquea pases 'expired', 'cancelled' o 'used'.
+ * (estado 'pending' y end_time en el futuro), incluyendo `vehicle_plate`.
+ * Bloquea pases 'expired', 'cancelled' o 'used'.
  */
 const updatePass = async (req, res) => {
   try {
+    await ensureVehiclePlateColumn();
     await expireOverduePasses();
 
     const passId = parseInt(req.params.id, 10);
@@ -279,57 +245,43 @@ const updatePass = async (req, res) => {
     }
 
     const cleanPlate =
-      vehicle_plate !== undefined
-        ? String(vehicle_plate).trim().toUpperCase() || null
+      vehicle_plate !== undefined && vehicle_plate !== null && String(vehicle_plate).trim()
+        ? String(vehicle_plate).trim().toUpperCase()
         : null;
-    const hasPlateCol = await checkHasVehiclePlateColumn();
 
-    const updateQuery = hasPlateCol
-      ? `
-          UPDATE public.access_passes
-          SET fraction_number = COALESCE($1, fraction_number),
-              lot_number = COALESCE($2, lot_number),
-              vehicle_plate = $3,
-              start_time = $4::timestamp,
-              end_time = $5::timestamp
-          WHERE id = $6
-          RETURNING id, qr_token, fraction_number, lot_number, vehicle_plate, start_time, end_time, status::text AS status;
-        `
-      : `
-          UPDATE public.access_passes
-          SET fraction_number = COALESCE($1, fraction_number),
-              lot_number = COALESCE($2, lot_number),
-              start_time = $3::timestamp,
-              end_time = $4::timestamp
-          WHERE id = $5
-          RETURNING id, qr_token, fraction_number, lot_number, start_time, end_time, status::text AS status;
-        `;
+    const updateQuery = `
+      UPDATE public.access_passes
+      SET fraction_number = COALESCE($1, fraction_number),
+          lot_number = COALESCE($2, lot_number),
+          vehicle_plate = $3,
+          start_time = $4::timestamp,
+          end_time = $5::timestamp
+      WHERE id = $6
+      RETURNING
+        id,
+        qr_token,
+        fraction_number,
+        lot_number,
+        vehicle_plate,
+        start_time,
+        end_time,
+        status::text AS status;
+    `;
 
-    const values = hasPlateCol
-      ? [
-          fraction_number !== undefined ? String(fraction_number).trim() || null : null,
-          lot_number !== undefined ? String(lot_number).trim() || null : null,
-          cleanPlate,
-          nextStartDate.toISOString(),
-          nextEndDate.toISOString(),
-          passId
-        ]
-      : [
-          fraction_number !== undefined ? String(fraction_number).trim() || null : null,
-          lot_number !== undefined ? String(lot_number).trim() || null : null,
-          nextStartDate.toISOString(),
-          nextEndDate.toISOString(),
-          passId
-        ];
+    const values = [
+      fraction_number !== undefined ? String(fraction_number).trim() || null : null,
+      lot_number !== undefined ? String(lot_number).trim() || null : null,
+      cleanPlate,
+      nextStartDate.toISOString(),
+      nextEndDate.toISOString(),
+      passId
+    ];
 
     const updated = await db.query(updateQuery, values);
 
     return res.status(200).json({
       message: `Pase #${passId} actualizado correctamente.`,
-      pass: {
-        ...updated.rows[0],
-        vehicle_plate: updated.rows[0]?.vehicle_plate ?? cleanPlate
-      }
+      pass: updated.rows[0]
     });
   } catch (error) {
     console.error('Error al actualizar pase QR vigente:', error);
@@ -341,10 +293,12 @@ const updatePass = async (req, res) => {
 
 /**
  * Valida un pase de acceso en la garita mediante el token QR.
+ * Prioriza `ap.vehicle_plate` si fue asignada en el pase y cae en `pv.plate` si no.
  * Roles permitidos: 'security', 'admin', 'superadmin'
  */
 const verifyPassByQR = async (req, res) => {
   try {
+    await ensureVehiclePlateColumn();
     await expireOverduePasses();
 
     const { qr_token } = req.body;
@@ -364,6 +318,7 @@ const verifyPassByQR = async (req, res) => {
         ap.start_time,
         ap.end_time,
         ap.country_id,
+        ap.vehicle_plate AS pass_vehicle_plate,
         u_prov.first_name AS provider_first_name,
         u_prov.last_name AS provider_last_name,
         u_prov.dni AS provider_dni,
@@ -371,17 +326,20 @@ const verifyPassByQR = async (req, res) => {
         pv.brand,
         pv.model,
         pv.color,
-        pv.plate,
+        COALESCE(ap.vehicle_plate, pv.plate) AS plate,
         u_owner.first_name AS owner_first_name,
         u_owner.last_name AS owner_last_name,
         ap.fraction_number,
         ap.lot_number
-      FROM access_passes ap
-      JOIN providers p ON ap.provider_id = p.id
-      JOIN users u_prov ON p.user_id = u_prov.id
-      JOIN users u_owner ON ap.owner_id = u_owner.id
-      LEFT JOIN provider_vehicles pv ON pv.provider_id = p.id
+      FROM public.access_passes ap
+      JOIN public.providers p ON ap.provider_id = p.id
+      JOIN public.users u_prov ON p.user_id = u_prov.id
+      JOIN public.users u_owner ON ap.owner_id = u_owner.id
+      LEFT JOIN public.provider_vehicles pv
+        ON pv.provider_id = p.id
+       AND (ap.vehicle_plate IS NULL OR UPPER(pv.plate) = UPPER(ap.vehicle_plate))
       WHERE ap.qr_token = $1
+      ORDER BY pv.id DESC NULLS LAST
       LIMIT 1;
     `;
 
