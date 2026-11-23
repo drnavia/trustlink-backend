@@ -1,8 +1,9 @@
 /**
  * @file passes.controller.js
  * @description Controlador para agenda online del prestador (horarios bloqueados, visitas externas
- * y bloqueo automático), coordinación bidireccional de visitas, emisión/consulta/cancelación
- * de pases QR y validación perimetral en garita.
+ * y bloqueo automático), coordinación bidireccional de visitas, emisión con ubicación automática
+ * y bloqueada desde los datos del residente (Manzana/Fracción/N/A y Lote), consulta, edición,
+ * cancelación y validación perimetral en garita.
  * @location /trustlink-backend/src/modules/passes/passes.controller.js
  */
 
@@ -115,6 +116,9 @@ const upsertScheduleBlock = async ({
   );
 };
 
+/**
+ * Normaliza el campo messages de una solicitud de visita a un array.
+ */
 const parseMessagesArray = (rawMessages) => {
   if (Array.isArray(rawMessages)) return rawMessages;
   if (typeof rawMessages === 'string' && rawMessages.trim()) {
@@ -128,6 +132,9 @@ const parseMessagesArray = (rawMessages) => {
   return [];
 };
 
+/**
+ * Marca como 'expired' los pases 'pending' cuya end_time ya venció en UTC.
+ */
 const expireOverduePasses = async () => {
   await db.query(
     `UPDATE access_passes
@@ -137,6 +144,9 @@ const expireOverduePasses = async () => {
   );
 };
 
+/**
+ * Verifica si existe la columna vehicle_plate en access_passes para compatibilidad de esquema.
+ */
 const hasVehiclePlateColumn = async () => {
   const res = await db.query(
     `SELECT 1
@@ -150,7 +160,80 @@ const hasVehiclePlateColumn = async () => {
 };
 
 /**
- * Obtiene la agenda del prestador (bloques manuales/externos + pases QR vigentes/pendientes).
+ * Obtiene y valida la ubicación residencial registrada del residente en la tabla `users`.
+ * - Toma automáticamente `fraction_type` ('manzana' | 'fraccion' | 'na'), `fraction_number` y `lot_number`.
+ * - Exige que el residente tenga un `lot_number` cargado en su cuenta.
+ * - Si se recibe un `lot_number` o `fraction_number` distinto al registrado del residente, rechaza la operación
+ *   para garantizar que el residente solo pida visitas o emita pases hacia su propia ubicación registrada.
+ */
+const resolveResidentLocation = async (residentUserId, requestedFractionNumber, requestedLotNumber) => {
+  const res = await db.query(
+    `SELECT
+       COALESCE(fraction_type, 'na') AS fraction_type,
+       fraction_number,
+       lot_number
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [Number(residentUserId)]
+  );
+
+  if (res.rows.length === 0) {
+    return { error: 'No se encontró el registro del residente en la base de datos.' };
+  }
+
+  const resident = res.rows[0];
+  const registeredLot = resident.lot_number ? String(resident.lot_number).trim() : '';
+
+  if (!registeredLot) {
+    return {
+      error: 'Tu cuenta aún no tiene un número de Lote registrado. Complétalo en Mi Cuenta antes de solicitar visitas o emitir pases.',
+    };
+  }
+
+  if (
+    requestedLotNumber !== undefined &&
+    requestedLotNumber !== null &&
+    String(requestedLotNumber).trim() !== '' &&
+    String(requestedLotNumber).trim() !== registeredLot
+  ) {
+    return {
+      error: `Solo podés solicitar visitas o emitir pases para tu Lote registrado (${registeredLot}).`,
+    };
+  }
+
+  const registeredFractionType = String(resident.fraction_type || 'na').toLowerCase();
+  const registeredFractionNum =
+    registeredFractionType === 'na' || !resident.fraction_number
+      ? null
+      : String(resident.fraction_number).trim();
+
+  if (
+    requestedFractionNumber !== undefined &&
+    requestedFractionNumber !== null &&
+    String(requestedFractionNumber).trim() !== '' &&
+    String(requestedFractionNumber).trim() !== (registeredFractionNum || '')
+  ) {
+    return {
+      error: 'Solo podés solicitar visitas o emitir pases para tu Manzana/Fracción registrada.',
+    };
+  }
+
+  const fractionDisplay =
+    registeredFractionType === 'na' || !registeredFractionNum
+      ? 'N/A'
+      : `${registeredFractionType === 'fraccion' ? 'Fracción' : 'Manzana'} ${registeredFractionNum}`;
+
+  return {
+    fractionType: registeredFractionType,
+    fractionNumber: registeredFractionNum,
+    fractionDisplay,
+    lotNumber: registeredLot,
+  };
+};
+
+/**
+ * Obtiene la agenda del prestador (bloques manuales/externos/automáticos + pases QR vigentes/pendientes).
  * GET /api/v1/passes/schedule/provider
  */
 const getProviderSchedule = async (req, res) => {
@@ -303,6 +386,11 @@ const deleteScheduleBlock = async (req, res) => {
   }
 };
 
+/**
+ * Crea una solicitud de visita/coordinación bidireccional del residente hacia un prestador.
+ * Toma automáticamente Manzana/Fracción/N/A y Lote desde el registro del residente en `users`.
+ * POST /api/v1/passes/visit-requests
+ */
 const createVisitCoordination = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
@@ -330,7 +418,7 @@ const createVisitCoordination = async (req, res) => {
     }
 
     const providerCheck = await db.query(
-      'SELECT id FROM providers WHERE id = $1 LIMIT 1',
+      'SELECT id, country_id FROM providers WHERE id = $1 LIMIT 1',
       [Number(provider_id)]
     );
 
@@ -338,6 +426,12 @@ const createVisitCoordination = async (req, res) => {
       return res.status(404).json({ error: 'El prestador seleccionado no existe.' });
     }
 
+    const locationResult = await resolveResidentLocation(ownerId, fraction_number, lot_number);
+    if (locationResult.error) {
+      return res.status(400).json({ error: locationResult.error });
+    }
+
+    const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
     const cleanNotes = String(notes).trim();
     const initialMessages = [
       {
@@ -357,11 +451,11 @@ const createVisitCoordination = async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'pending_provider')
        RETURNING *`,
       [
-        countryId,
+        effectiveCountryId,
         ownerId,
         Number(provider_id),
-        fraction_number ? String(fraction_number).trim() : null,
-        lot_number ? String(lot_number).trim() : null,
+        locationResult.fractionDisplay,
+        locationResult.lotNumber,
         preferred_date ? String(preferred_date).trim() : null,
         cleanNotes,
         JSON.stringify(initialMessages),
@@ -384,6 +478,10 @@ const createVisitCoordination = async (req, res) => {
   }
 };
 
+/**
+ * Lista las solicitudes de visita del residente autenticado.
+ * GET /api/v1/passes/visit-requests/my
+ */
 const listMyVisitRequests = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
@@ -414,6 +512,10 @@ const listMyVisitRequests = async (req, res) => {
   }
 };
 
+/**
+ * Lista las solicitudes de visita recibidas por el prestador autenticado.
+ * GET /api/v1/passes/visit-requests/provider
+ */
 const listProviderVisitRequests = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
@@ -455,6 +557,10 @@ const listProviderVisitRequests = async (req, res) => {
   }
 };
 
+/**
+ * Agrega un mensaje dentro del hilo de coordinación de una visita.
+ * POST /api/v1/passes/visit-requests/:id/messages
+ */
 const addVisitRequestMessage = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
@@ -522,6 +628,10 @@ const addVisitRequestMessage = async (req, res) => {
   }
 };
 
+/**
+ * Responde a una solicitud de visita (confirmar, proponer horario o rechazar) y bloquea agenda si se confirma.
+ * PATCH /api/v1/passes/visit-requests/:id/respond
+ */
 const respondVisitRequest = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
@@ -622,10 +732,16 @@ const respondVisitRequest = async (req, res) => {
   }
 };
 
+/**
+ * Emite un nuevo Pase QR para un prestador.
+ * Toma automáticamente Manzana/Fracción/N/A y Lote del residente registrado en `users`
+ * y bloquea la franja horaria en la agenda del prestador.
+ * POST /api/v1/passes/create
+ */
 const createPass = async (req, res) => {
   try {
-    const ownerId = req.user.userId;
-    const countryId = req.user.countryId || null;
+    const ownerId = Number(req.user?.userId || req.user?.id);
+    const countryId = req.user?.countryId ? Number(req.user.countryId) : null;
     const {
       provider_id,
       fraction_number,
@@ -642,7 +758,7 @@ const createPass = async (req, res) => {
     }
 
     const providerCheck = await db.query(
-      'SELECT id FROM providers WHERE id = $1 LIMIT 1',
+      'SELECT id, country_id FROM providers WHERE id = $1 LIMIT 1',
       [Number(provider_id)]
     );
 
@@ -650,6 +766,12 @@ const createPass = async (req, res) => {
       return res.status(404).json({ error: 'El prestador seleccionado no existe.' });
     }
 
+    const locationResult = await resolveResidentLocation(ownerId, fraction_number, lot_number);
+    if (locationResult.error) {
+      return res.status(400).json({ error: locationResult.error });
+    }
+
+    const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
     const qrToken = crypto.randomBytes(32).toString('hex');
     const supportsPlate = await hasVehiclePlateColumn();
 
@@ -669,22 +791,22 @@ const createPass = async (req, res) => {
 
     const params = supportsPlate
       ? [
-          countryId,
+          effectiveCountryId,
           ownerId,
           Number(provider_id),
-          fraction_number ? String(fraction_number).trim() : null,
-          lot_number ? String(lot_number).trim() : null,
+          locationResult.fractionDisplay,
+          locationResult.lotNumber,
           vehicle_plate ? String(vehicle_plate).trim().toUpperCase() : null,
           qrToken,
           start_time,
           end_time,
         ]
       : [
-          countryId,
+          effectiveCountryId,
           ownerId,
           Number(provider_id),
-          fraction_number ? String(fraction_number).trim() : null,
-          lot_number ? String(lot_number).trim() : null,
+          locationResult.fractionDisplay,
+          locationResult.lotNumber,
           qrToken,
           start_time,
           end_time,
@@ -696,7 +818,7 @@ const createPass = async (req, res) => {
     await upsertScheduleBlock({
       providerId: Number(provider_id),
       blockType: 'trustlink_pass',
-      title: `Pase QR #${createdPass.id} (${fraction_number || ''} ${lot_number || ''})`.trim(),
+      title: `Pase QR #${createdPass.id} (${locationResult.fractionDisplay} · Lote ${locationResult.lotNumber})`,
       startAt: start_time,
       endAt: end_time,
       sourceRef: `pass-${createdPass.id}`,
@@ -712,6 +834,10 @@ const createPass = async (req, res) => {
   }
 };
 
+/**
+ * Lista los pases QR emitidos por el residente/familia autenticado.
+ * GET /api/v1/passes/my
+ */
 const getMyPasses = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -752,6 +878,10 @@ const getMyPasses = async (req, res) => {
   }
 };
 
+/**
+ * Lista los pases QR asignados al prestador autenticado.
+ * GET /api/v1/passes/provider
+ */
 const listProviderPasses = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -806,11 +936,16 @@ const listProviderPasses = async (req, res) => {
   }
 };
 
+/**
+ * Permite editar un pase QR vigente propio del residente/familia.
+ * Conserva y valida que la ubicación pertenezca a la cuenta registrada del residente.
+ * PATCH /api/v1/passes/:id
+ */
 const updatePass = async (req, res) => {
   try {
     await expireOverduePasses();
     const passId = Number(req.params.id);
-    const ownerId = req.user.userId;
+    const ownerId = Number(req.user.userId);
 
     if (!Number.isInteger(passId) || passId <= 0) {
       return res.status(400).json({ error: 'ID de pase inválido.' });
@@ -832,7 +967,7 @@ const updatePass = async (req, res) => {
     }
 
     const currentPass = currentRes.rows[0];
-    if (Number(currentPass.owner_id) !== Number(ownerId)) {
+    if (Number(currentPass.owner_id) !== ownerId) {
       return res.status(403).json({ error: 'No tenés permiso para editar este pase.' });
     }
 
@@ -847,20 +982,25 @@ const updatePass = async (req, res) => {
     }
 
     const { fraction_number, lot_number, vehicle_plate, start_time, end_time } = req.body;
+    const locationResult = await resolveResidentLocation(ownerId, fraction_number, lot_number);
+    if (locationResult.error) {
+      return res.status(400).json({ error: locationResult.error });
+    }
+
     const supportsPlate = await hasVehiclePlateColumn();
 
     const updateSql = supportsPlate
       ? `UPDATE access_passes
-         SET fraction_number = COALESCE($1, fraction_number),
-             lot_number = COALESCE($2, lot_number),
+         SET fraction_number = $1,
+             lot_number = $2,
              vehicle_plate = $3,
              start_time = COALESCE($4, start_time),
              end_time = COALESCE($5, end_time)
          WHERE id = $6
          RETURNING *`
       : `UPDATE access_passes
-         SET fraction_number = COALESCE($1, fraction_number),
-             lot_number = COALESCE($2, lot_number),
+         SET fraction_number = $1,
+             lot_number = $2,
              start_time = COALESCE($3, start_time),
              end_time = COALESCE($4, end_time)
          WHERE id = $5
@@ -873,16 +1013,16 @@ const updatePass = async (req, res) => {
 
     const params = supportsPlate
       ? [
-          fraction_number !== undefined ? String(fraction_number).trim() || null : null,
-          lot_number !== undefined ? String(lot_number).trim() || null : null,
+          locationResult.fractionDisplay,
+          locationResult.lotNumber,
           normalizedPlate,
           start_time || null,
           end_time || null,
           passId,
         ]
       : [
-          fraction_number !== undefined ? String(fraction_number).trim() || null : null,
-          lot_number !== undefined ? String(lot_number).trim() || null : null,
+          locationResult.fractionDisplay,
+          locationResult.lotNumber,
           start_time || null,
           end_time || null,
           passId,
@@ -900,6 +1040,10 @@ const updatePass = async (req, res) => {
   }
 };
 
+/**
+ * Cancela un pase QR pendiente propio o por rol administrativo y libera el bloque automático de agenda.
+ * PATCH /api/v1/passes/:id/cancel
+ */
 const cancelPass = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -961,6 +1105,10 @@ const cancelPass = async (req, res) => {
   }
 };
 
+/**
+ * Valida un pase QR en garita / consola de seguridad.
+ * POST /api/v1/passes/verify
+ */
 const verifyPassByQR = async (req, res) => {
   try {
     await expireOverduePasses();

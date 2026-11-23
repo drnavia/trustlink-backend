@@ -16,6 +16,7 @@ const paymentsRoutes = require('./modules/payments/payments.routes');
 const externalRoutes = require('./modules/external/external.routes');
 const reviewsRoutes = require('./modules/reviews/reviews.routes');
 const brandingRoutes = require('./modules/branding/branding.routes');
+const accountRoutes = require('./modules/auth/account.routes');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -54,6 +55,7 @@ app.use('/api/v1/payments', paymentsRoutes);
 app.use('/api/v1/external', externalRoutes);
 app.use('/api/v1/reviews', reviewsRoutes);
 app.use('/api/v1/branding', brandingRoutes);
+app.use('/api/v1/account', accountRoutes);
 
 // ENDPOINT DE SALUD DEL SERVIDOR
 app.get('/health', (req, res) => {
