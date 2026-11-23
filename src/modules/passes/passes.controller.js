@@ -1,7 +1,7 @@
 /**
  * @file passes.controller.js
- * @description Controlador para emisión, consulta (residente y prestador), edición y
- * validación perimetral de pases QR en TrustLink.
+ * @description Controlador para emisión, consulta (residente y prestador), edición,
+ * cancelación y validación perimetral de pases QR en TrustLink.
  * @location /trustlink-backend/src/modules/passes/passes.controller.js
  */
 
@@ -170,7 +170,6 @@ const listProviderPasses = async (req, res) => {
     await expireOverduePasses();
     const userId = req.user.userId;
 
-    // Obtener todos los IDs de perfil de prestador asociados a este usuario
     const providerProfilesRes = await db.query(
       'SELECT id FROM providers WHERE user_id = $1',
       [userId]
@@ -318,6 +317,68 @@ const updatePass = async (req, res) => {
 };
 
 /**
+ * Cancela un pase QR pendiente propio o por rol administrativo (PATCH /api/v1/passes/:id/cancel).
+ */
+const cancelPass = async (req, res) => {
+  try {
+    await expireOverduePasses();
+    const passId = Number(req.params.id);
+    const userId = req.user.userId;
+    const userRole = String(req.user.role || '').toLowerCase();
+
+    if (!Number.isInteger(passId) || passId <= 0) {
+      return res.status(400).json({ error: 'ID de pase inválido.' });
+    }
+
+    const currentRes = await db.query(
+      'SELECT id, owner_id, status FROM access_passes WHERE id = $1 LIMIT 1',
+      [passId]
+    );
+
+    if (currentRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Pase QR no encontrado.' });
+    }
+
+    const passRecord = currentRes.rows[0];
+    const isAdminRole = userRole === 'admin' || userRole === 'superadmin';
+
+    if (!isAdminRole && Number(passRecord.owner_id) !== Number(userId)) {
+      return res.status(403).json({ error: 'No tenés permiso para cancelar este pase QR.' });
+    }
+
+    const currentStatus = String(passRecord.status || '').toLowerCase();
+    if (currentStatus === 'cancelled') {
+      return res.status(200).json({
+        message: 'El pase QR ya se encontraba cancelado.',
+        pass: passRecord,
+      });
+    }
+
+    if (currentStatus !== 'pending') {
+      return res.status(400).json({
+        error: `No se puede cancelar un pase en estado ${currentStatus}.`,
+      });
+    }
+
+    const updated = await db.query(
+      `UPDATE access_passes
+       SET status = 'cancelled'::pass_status
+       WHERE id = $1
+       RETURNING *`,
+      [passId]
+    );
+
+    return res.status(200).json({
+      message: `Pase QR #${passId} cancelado correctamente.`,
+      pass: updated.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al cancelar pase QR:', error);
+    return res.status(500).json({ error: 'Error interno al cancelar el pase QR.' });
+  }
+};
+
+/**
  * Valida un pase QR en garita / consola de seguridad (POST /api/v1/passes/verify).
  */
 const verifyPassByQR = async (req, res) => {
@@ -439,5 +500,6 @@ module.exports = {
   getMyPasses,
   listProviderPasses,
   updatePass,
+  cancelPass,
   verifyPassByQR,
 };
