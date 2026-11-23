@@ -8,13 +8,16 @@
 const crypto = require('crypto');
 const db = require('../../config/db');
 
+/**
+ * Crea o actualiza de forma idempotente la tabla visit_requests y sus columnas.
+ */
 const ensureVisitRequestsTable = async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS visit_requests (
       id SERIAL PRIMARY KEY,
       country_id INTEGER NULL,
-      owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+      owner_id INTEGER NOT NULL,
+      provider_id INTEGER NOT NULL,
       fraction_number VARCHAR(100) NULL,
       lot_number VARCHAR(100) NULL,
       preferred_date VARCHAR(50) NULL,
@@ -23,8 +26,18 @@ const ensureVisitRequestsTable = async () => {
       created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
     );
   `);
+
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS country_id INTEGER NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS fraction_number VARCHAR(100) NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS lot_number VARCHAR(100) NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS preferred_date VARCHAR(50) NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS notes TEXT NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'coordinated';`);
 };
 
+/**
+ * Marca como 'expired' los pases 'pending' cuya end_time ya venció en UTC.
+ */
 const expireOverduePasses = async () => {
   await db.query(
     `UPDATE access_passes
@@ -34,6 +47,9 @@ const expireOverduePasses = async () => {
   );
 };
 
+/**
+ * Verifica si existe la columna vehicle_plate en access_passes para compatibilidad de esquema.
+ */
 const hasVehiclePlateColumn = async () => {
   const res = await db.query(
     `SELECT 1
@@ -53,8 +69,9 @@ const hasVehiclePlateColumn = async () => {
 const createVisitCoordination = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
-    const ownerId = req.user.userId;
-    const countryId = req.user.countryId || null;
+
+    const ownerId = Number(req.user?.userId || req.user?.id);
+    const countryId = req.user?.countryId ? Number(req.user.countryId) : null;
     const {
       provider_id,
       fraction_number,
@@ -62,6 +79,12 @@ const createVisitCoordination = async (req, res) => {
       preferred_date,
       notes,
     } = req.body;
+
+    if (!ownerId) {
+      return res.status(401).json({
+        error: 'Sesión de residente inválida o expirada. Volvé a iniciar sesión.',
+      });
+    }
 
     if (!provider_id || !notes || !String(notes).trim()) {
       return res.status(400).json({
@@ -103,10 +126,15 @@ const createVisitCoordination = async (req, res) => {
     });
   } catch (error) {
     console.error('Error al registrar coordinación de visita:', error);
-    return res.status(500).json({ error: 'Error interno al registrar la visita.' });
+    return res.status(500).json({
+      error: `Error interno al registrar la visita: ${error.message}`,
+    });
   }
 };
 
+/**
+ * Crea un nuevo pase QR para un prestador (Roles: owner, family).
+ */
 const createPass = async (req, res) => {
   try {
     const ownerId = req.user.userId;
@@ -188,6 +216,9 @@ const createPass = async (req, res) => {
   }
 };
 
+/**
+ * Lista los pases QR emitidos por el residente/familia autenticado (GET /api/v1/passes/my).
+ */
 const getMyPasses = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -228,6 +259,9 @@ const getMyPasses = async (req, res) => {
   }
 };
 
+/**
+ * Lista los pases QR asignados al prestador autenticado (GET /api/v1/passes/provider).
+ */
 const listProviderPasses = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -282,6 +316,9 @@ const listProviderPasses = async (req, res) => {
   }
 };
 
+/**
+ * Permite editar un pase QR vigente propio del residente/familia (PATCH /api/v1/passes/:id).
+ */
 const updatePass = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -376,6 +413,9 @@ const updatePass = async (req, res) => {
   }
 };
 
+/**
+ * Cancela un pase QR pendiente propio o por rol administrativo (PATCH /api/v1/passes/:id/cancel).
+ */
 const cancelPass = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -435,6 +475,9 @@ const cancelPass = async (req, res) => {
   }
 };
 
+/**
+ * Valida un pase QR en garita / consola de seguridad (POST /api/v1/passes/verify).
+ */
 const verifyPassByQR = async (req, res) => {
   try {
     await expireOverduePasses();
