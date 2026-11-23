@@ -1,16 +1,30 @@
 /**
  * @file passes.controller.js
- * @description Controlador para emisión, consulta (residente y prestador), edición,
- * cancelación y validación perimetral de pases QR en TrustLink.
+ * @description Controlador para coordinación previa de visitas, emisión de pases QR,
+ * consulta (residente y prestador), edición, cancelación y validación perimetral.
  * @location /trustlink-backend/src/modules/passes/passes.controller.js
  */
 
 const crypto = require('crypto');
 const db = require('../../config/db');
 
-/**
- * Marca como 'expired' los pases 'pending' cuya end_time ya venció en UTC.
- */
+const ensureVisitRequestsTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS visit_requests (
+      id SERIAL PRIMARY KEY,
+      country_id INTEGER NULL,
+      owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+      fraction_number VARCHAR(100) NULL,
+      lot_number VARCHAR(100) NULL,
+      preferred_date VARCHAR(50) NULL,
+      notes TEXT NULL,
+      status VARCHAR(30) NOT NULL DEFAULT 'coordinated',
+      created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+    );
+  `);
+};
+
 const expireOverduePasses = async () => {
   await db.query(
     `UPDATE access_passes
@@ -20,9 +34,6 @@ const expireOverduePasses = async () => {
   );
 };
 
-/**
- * Verifica si existe la columna vehicle_plate en access_passes para compatibilidad de esquema.
- */
 const hasVehiclePlateColumn = async () => {
   const res = await db.query(
     `SELECT 1
@@ -36,8 +47,66 @@ const hasVehiclePlateColumn = async () => {
 };
 
 /**
- * Crea un nuevo pase QR para un prestador (Roles: owner, family).
+ * Registra la coordinación/solicitud de visita dentro de TrustLink antes de emitir el QR.
+ * POST /api/v1/passes/visit-requests
  */
+const createVisitCoordination = async (req, res) => {
+  try {
+    await ensureVisitRequestsTable();
+    const ownerId = req.user.userId;
+    const countryId = req.user.countryId || null;
+    const {
+      provider_id,
+      fraction_number,
+      lot_number,
+      preferred_date,
+      notes,
+    } = req.body;
+
+    if (!provider_id || !notes || !String(notes).trim()) {
+      return res.status(400).json({
+        error: 'Indicá el prestador y el detalle/mensaje de coordinación de la visita.',
+      });
+    }
+
+    const providerCheck = await db.query(
+      'SELECT id, country_id FROM providers WHERE id = $1 LIMIT 1',
+      [Number(provider_id)]
+    );
+
+    if (providerCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'El prestador seleccionado no existe.' });
+    }
+
+    const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
+
+    const inserted = await db.query(
+      `INSERT INTO visit_requests (
+         country_id, owner_id, provider_id, fraction_number, lot_number, preferred_date, notes, status
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'coordinated')
+       RETURNING *`,
+      [
+        effectiveCountryId,
+        ownerId,
+        Number(provider_id),
+        fraction_number ? String(fraction_number).trim() : null,
+        lot_number ? String(lot_number).trim() : null,
+        preferred_date ? String(preferred_date).trim() : null,
+        String(notes).trim(),
+      ]
+    );
+
+    return res.status(201).json({
+      message: 'Visita coordinada en TrustLink. Ya podés emitir el Pase QR correspondiente.',
+      visit: inserted.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al registrar coordinación de visita:', error);
+    return res.status(500).json({ error: 'Error interno al registrar la visita.' });
+  }
+};
+
 const createPass = async (req, res) => {
   try {
     const ownerId = req.user.userId;
@@ -119,9 +188,6 @@ const createPass = async (req, res) => {
   }
 };
 
-/**
- * Lista los pases QR emitidos por el residente/familia autenticado (GET /api/v1/passes/my).
- */
 const getMyPasses = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -162,9 +228,6 @@ const getMyPasses = async (req, res) => {
   }
 };
 
-/**
- * Lista los pases QR asignados al prestador autenticado (GET /api/v1/passes/provider).
- */
 const listProviderPasses = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -219,9 +282,6 @@ const listProviderPasses = async (req, res) => {
   }
 };
 
-/**
- * Permite editar un pase QR vigente propio del residente/familia (PATCH /api/v1/passes/:id).
- */
 const updatePass = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -316,9 +376,6 @@ const updatePass = async (req, res) => {
   }
 };
 
-/**
- * Cancela un pase QR pendiente propio o por rol administrativo (PATCH /api/v1/passes/:id/cancel).
- */
 const cancelPass = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -378,9 +435,6 @@ const cancelPass = async (req, res) => {
   }
 };
 
-/**
- * Valida un pase QR en garita / consola de seguridad (POST /api/v1/passes/verify).
- */
 const verifyPassByQR = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -496,6 +550,7 @@ const verifyPassByQR = async (req, res) => {
 };
 
 module.exports = {
+  createVisitCoordination,
   createPass,
   getMyPasses,
   listProviderPasses,
