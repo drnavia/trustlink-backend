@@ -1,8 +1,8 @@
 /**
  * @file passes.controller.js
- * @description Controlador para coordinación bidireccional de visitas (solicitud, hilo de mensajes,
- * confirmación de disponibilidad del prestador), emisión/consulta/edición/cancelación de pases QR
- * y validación perimetral en garita.
+ * @description Controlador para agenda online del prestador (horarios bloqueados, visitas externas
+ * y bloqueo automático), coordinación bidireccional de visitas, emisión/consulta/cancelación
+ * de pases QR y validación perimetral en garita.
  * @location /trustlink-backend/src/modules/passes/passes.controller.js
  */
 
@@ -39,8 +39,82 @@ const ensureVisitRequestsTable = async () => {
 };
 
 /**
- * Normaliza el arreglo de mensajes almacenado en visit_requests.
+ * Crea o actualiza de forma idempotente la tabla provider_schedule_blocks
+ * para gestionar horarios no laborables, visitas externas y bloqueos automáticos de TrustLink.
  */
+const ensureScheduleBlocksTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS provider_schedule_blocks (
+      id SERIAL PRIMARY KEY,
+      provider_id INTEGER NOT NULL,
+      block_type VARCHAR(30) NOT NULL DEFAULT 'unavailable',
+      title VARCHAR(160) NOT NULL,
+      start_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+      end_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+      source_ref VARCHAR(80) NULL,
+      created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await db.query(`ALTER TABLE provider_schedule_blocks ADD COLUMN IF NOT EXISTS block_type VARCHAR(30) NOT NULL DEFAULT 'unavailable';`);
+  await db.query(`ALTER TABLE provider_schedule_blocks ADD COLUMN IF NOT EXISTS title VARCHAR(160) NULL;`);
+  await db.query(`ALTER TABLE provider_schedule_blocks ADD COLUMN IF NOT EXISTS start_at TIMESTAMP WITHOUT TIME ZONE NULL;`);
+  await db.query(`ALTER TABLE provider_schedule_blocks ADD COLUMN IF NOT EXISTS end_at TIMESTAMP WITHOUT TIME ZONE NULL;`);
+  await db.query(`ALTER TABLE provider_schedule_blocks ADD COLUMN IF NOT EXISTS source_ref VARCHAR(80) NULL;`);
+};
+
+/**
+ * Registra un bloque de agenda para un prestador evitando duplicados exactos por source_ref.
+ */
+const upsertScheduleBlock = async ({
+  providerId,
+  blockType,
+  title,
+  startAt,
+  endAt,
+  sourceRef = null,
+}) => {
+  await ensureScheduleBlocksTable();
+  const parsedStart = new Date(startAt);
+  if (Number.isNaN(parsedStart.getTime())) return;
+
+  const parsedEnd = endAt
+    ? new Date(endAt)
+    : new Date(parsedStart.getTime() + 2 * 60 * 60 * 1000);
+  const safeEnd = Number.isNaN(parsedEnd.getTime()) || parsedEnd <= parsedStart
+    ? new Date(parsedStart.getTime() + 2 * 60 * 60 * 1000)
+    : parsedEnd;
+
+  if (sourceRef) {
+    const existing = await db.query(
+      'SELECT id FROM provider_schedule_blocks WHERE provider_id = $1 AND source_ref = $2 LIMIT 1',
+      [Number(providerId), String(sourceRef)]
+    );
+    if (existing.rows.length > 0) {
+      await db.query(
+        `UPDATE provider_schedule_blocks
+         SET block_type = $1, title = $2, start_at = $3, end_at = $4
+         WHERE id = $5`,
+        [blockType, title, parsedStart.toISOString(), safeEnd.toISOString(), existing.rows[0].id]
+      );
+      return;
+    }
+  }
+
+  await db.query(
+    `INSERT INTO provider_schedule_blocks (provider_id, block_type, title, start_at, end_at, source_ref)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      Number(providerId),
+      blockType,
+      title,
+      parsedStart.toISOString(),
+      safeEnd.toISOString(),
+      sourceRef,
+    ]
+  );
+};
+
 const parseMessagesArray = (rawMessages) => {
   if (Array.isArray(rawMessages)) return rawMessages;
   if (typeof rawMessages === 'string' && rawMessages.trim()) {
@@ -54,9 +128,6 @@ const parseMessagesArray = (rawMessages) => {
   return [];
 };
 
-/**
- * Marca como 'expired' los pases 'pending' cuya end_time ya venció en UTC.
- */
 const expireOverduePasses = async () => {
   await db.query(
     `UPDATE access_passes
@@ -66,9 +137,6 @@ const expireOverduePasses = async () => {
   );
 };
 
-/**
- * Verifica si existe la columna vehicle_plate en access_passes para compatibilidad de esquema.
- */
 const hasVehiclePlateColumn = async () => {
   const res = await db.query(
     `SELECT 1
@@ -82,10 +150,159 @@ const hasVehiclePlateColumn = async () => {
 };
 
 /**
- * Registra una solicitud/coordinación de visita en estado 'pending_provider'
- * e inicia el hilo de mensajes dentro de TrustLink.
- * POST /api/v1/passes/visit-requests
+ * Obtiene la agenda del prestador (bloques manuales/externos + pases QR vigentes/pendientes).
+ * GET /api/v1/passes/schedule/provider
  */
+const getProviderSchedule = async (req, res) => {
+  try {
+    await ensureScheduleBlocksTable();
+    await expireOverduePasses();
+
+    const userId = Number(req.user?.userId || req.user?.id);
+    const providerProfilesRes = await db.query(
+      'SELECT id FROM providers WHERE user_id = $1',
+      [userId]
+    );
+    const providerIds = providerProfilesRes.rows.map((r) => Number(r.id)).filter(Boolean);
+
+    if (providerIds.length === 0) {
+      return res.status(200).json({ blocks: [], passes: [] });
+    }
+
+    const blocksRes = await db.query(
+      `SELECT *
+       FROM provider_schedule_blocks
+       WHERE provider_id = ANY($1::int[])
+       ORDER BY start_at ASC, id DESC`,
+      [providerIds]
+    );
+
+    const passesRes = await db.query(
+      `SELECT
+         ap.id,
+         ap.provider_id,
+         ap.fraction_number,
+         ap.lot_number,
+         ap.start_time,
+         ap.end_time,
+         ap.status,
+         TRIM(CONCAT(COALESCE(u_owner.first_name, ''), ' ', COALESCE(u_owner.last_name, ''))) AS owner_name
+       FROM access_passes ap
+       LEFT JOIN users u_owner ON ap.owner_id = u_owner.id
+       WHERE ap.provider_id = ANY($1::int[])
+         AND ap.status IN ('pending'::pass_status, 'used'::pass_status)
+       ORDER BY ap.start_time ASC`,
+      [providerIds]
+    );
+
+    return res.status(200).json({
+      blocks: blocksRes.rows,
+      passes: passesRes.rows,
+    });
+  } catch (error) {
+    console.error('Error al obtener agenda del prestador:', error);
+    return res.status(500).json({ error: 'Error interno al consultar la agenda del prestador.' });
+  }
+};
+
+/**
+ * Crea un bloque manual en la agenda del prestador (horario no laborable o visita externa).
+ * POST /api/v1/passes/schedule/blocks
+ */
+const createScheduleBlock = async (req, res) => {
+  try {
+    await ensureScheduleBlocksTable();
+    const userId = Number(req.user?.userId || req.user?.id);
+    const { block_type, title, start_at, end_at } = req.body;
+
+    const providerProfilesRes = await db.query(
+      'SELECT id FROM providers WHERE user_id = $1 ORDER BY id ASC LIMIT 1',
+      [userId]
+    );
+
+    if (providerProfilesRes.rows.length === 0) {
+      return res.status(404).json({ error: 'No se encontró un perfil de prestador asociado.' });
+    }
+
+    const providerId = Number(providerProfilesRes.rows[0].id);
+    const normalizedType =
+      String(block_type || '').toLowerCase() === 'external_visit'
+        ? 'external_visit'
+        : 'unavailable';
+
+    if (!start_at || !end_at) {
+      return res.status(400).json({ error: 'Completá fecha/hora de inicio y fin.' });
+    }
+
+    const startDate = new Date(start_at);
+    const endDate = new Date(end_at);
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || endDate <= startDate) {
+      return res.status(400).json({ error: 'El rango horario es inválido.' });
+    }
+
+    const cleanTitle =
+      String(title || '').trim() ||
+      (normalizedType === 'external_visit' ? 'Visita externa agendada' : 'Horario no laborable');
+
+    const inserted = await db.query(
+      `INSERT INTO provider_schedule_blocks (provider_id, block_type, title, start_at, end_at)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [providerId, normalizedType, cleanTitle, startDate.toISOString(), endDate.toISOString()]
+    );
+
+    return res.status(201).json({
+      message:
+        normalizedType === 'external_visit'
+          ? 'Visita externa registrada y franja bloqueada en tu agenda.'
+          : 'Horario no laborable bloqueado en tu agenda.',
+      block: inserted.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al crear bloque de agenda:', error);
+    return res.status(500).json({ error: 'Error interno al guardar el bloque en la agenda.' });
+  }
+};
+
+/**
+ * Elimina un bloque manual de agenda del prestador.
+ * DELETE /api/v1/passes/schedule/blocks/:blockId
+ */
+const deleteScheduleBlock = async (req, res) => {
+  try {
+    await ensureScheduleBlocksTable();
+    const blockId = Number(req.params.blockId);
+    const userId = Number(req.user?.userId || req.user?.id);
+
+    if (!Number.isInteger(blockId) || blockId <= 0) {
+      return res.status(400).json({ error: 'ID de bloque inválido.' });
+    }
+
+    const providerProfilesRes = await db.query(
+      'SELECT id FROM providers WHERE user_id = $1',
+      [userId]
+    );
+    const providerIds = providerProfilesRes.rows.map((r) => Number(r.id)).filter(Boolean);
+
+    const deleted = await db.query(
+      `DELETE FROM provider_schedule_blocks
+       WHERE id = $1
+         AND provider_id = ANY($2::int[])
+       RETURNING id`,
+      [blockId, providerIds]
+    );
+
+    if (deleted.rows.length === 0) {
+      return res.status(404).json({ error: 'Bloque no encontrado o sin permisos.' });
+    }
+
+    return res.status(200).json({ message: 'Bloque eliminado de la agenda.' });
+  } catch (error) {
+    console.error('Error al eliminar bloque de agenda:', error);
+    return res.status(500).json({ error: 'Error interno al eliminar el bloque.' });
+  }
+};
+
 const createVisitCoordination = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
@@ -167,10 +384,6 @@ const createVisitCoordination = async (req, res) => {
   }
 };
 
-/**
- * Lista las visitas coordinadas/solicitadas por el residente autenticado.
- * GET /api/v1/passes/visit-requests/my
- */
 const listMyVisitRequests = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
@@ -201,10 +414,6 @@ const listMyVisitRequests = async (req, res) => {
   }
 };
 
-/**
- * Lista las solicitudes de visita recibidas por el prestador autenticado.
- * GET /api/v1/passes/visit-requests/provider
- */
 const listProviderVisitRequests = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
@@ -246,10 +455,6 @@ const listProviderVisitRequests = async (req, res) => {
   }
 };
 
-/**
- * Agrega un mensaje al hilo de coordinación entre residente y prestador.
- * POST /api/v1/passes/visit-requests/:id/messages
- */
 const addVisitRequestMessage = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
@@ -317,10 +522,6 @@ const addVisitRequestMessage = async (req, res) => {
   }
 };
 
-/**
- * Permite al prestador confirmar disponibilidad, proponer horario o rechazar una visita.
- * PATCH /api/v1/passes/visit-requests/:id/respond
- */
 const respondVisitRequest = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
@@ -392,11 +593,21 @@ const respondVisitRequest = async (req, res) => {
       [nextStatus, nextDate, JSON.stringify(updatedMessages), visitId]
     );
 
+    if (normalizedAction === 'confirm' && nextDate) {
+      await upsertScheduleBlock({
+        providerId: visit.provider_id,
+        blockType: 'trustlink_visit',
+        title: `Visita TrustLink #${visitId} (${visit.fraction_number || ''} ${visit.lot_number || ''})`.trim(),
+        startAt: nextDate,
+        sourceRef: `visit-${visitId}`,
+      });
+    }
+
     const row = updated.rows[0];
     return res.status(200).json({
       message:
         normalizedAction === 'confirm'
-          ? 'Disponibilidad confirmada. El residente ya puede emitir el Pase QR.'
+          ? 'Disponibilidad confirmada y horario bloqueado en tu agenda.'
           : normalizedAction === 'decline'
           ? 'Visita marcada como sin disponibilidad.'
           : 'Propuesta enviada al residente.',
@@ -411,9 +622,6 @@ const respondVisitRequest = async (req, res) => {
   }
 };
 
-/**
- * Crea un nuevo pase QR para un prestador (Roles: owner, family).
- */
 const createPass = async (req, res) => {
   try {
     const ownerId = req.user.userId;
@@ -483,10 +691,20 @@ const createPass = async (req, res) => {
         ];
 
     const created = await db.query(insertSql, params);
+    const createdPass = created.rows[0];
+
+    await upsertScheduleBlock({
+      providerId: Number(provider_id),
+      blockType: 'trustlink_pass',
+      title: `Pase QR #${createdPass.id} (${fraction_number || ''} ${lot_number || ''})`.trim(),
+      startAt: start_time,
+      endAt: end_time,
+      sourceRef: `pass-${createdPass.id}`,
+    });
 
     return res.status(201).json({
-      message: 'Pase QR emitido correctamente.',
-      pass: created.rows[0],
+      message: 'Pase QR emitido correctamente y franja reservada en la agenda del prestador.',
+      pass: createdPass,
     });
   } catch (error) {
     console.error('Error al emitir pase QR:', error);
@@ -494,9 +712,6 @@ const createPass = async (req, res) => {
   }
 };
 
-/**
- * Lista los pases QR emitidos por el residente/familia autenticado (GET /api/v1/passes/my).
- */
 const getMyPasses = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -537,9 +752,6 @@ const getMyPasses = async (req, res) => {
   }
 };
 
-/**
- * Lista los pases QR asignados al prestador autenticado (GET /api/v1/passes/provider).
- */
 const listProviderPasses = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -594,9 +806,6 @@ const listProviderPasses = async (req, res) => {
   }
 };
 
-/**
- * Permite editar un pase QR vigente propio del residente/familia (PATCH /api/v1/passes/:id).
- */
 const updatePass = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -691,9 +900,6 @@ const updatePass = async (req, res) => {
   }
 };
 
-/**
- * Cancela un pase QR pendiente propio o por rol administrativo (PATCH /api/v1/passes/:id/cancel).
- */
 const cancelPass = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -743,8 +949,10 @@ const cancelPass = async (req, res) => {
       [passId]
     );
 
+    await db.query('DELETE FROM provider_schedule_blocks WHERE source_ref = $1', [`pass-${passId}`]);
+
     return res.status(200).json({
-      message: `Pase QR #${passId} cancelado correctamente.`,
+      message: `Pase QR #${passId} cancelado correctamente y franja liberada en la agenda.`,
       pass: updated.rows[0],
     });
   } catch (error) {
@@ -753,9 +961,6 @@ const cancelPass = async (req, res) => {
   }
 };
 
-/**
- * Valida un pase QR en garita / consola de seguridad (POST /api/v1/passes/verify).
- */
 const verifyPassByQR = async (req, res) => {
   try {
     await expireOverduePasses();
@@ -871,6 +1076,9 @@ const verifyPassByQR = async (req, res) => {
 };
 
 module.exports = {
+  getProviderSchedule,
+  createScheduleBlock,
+  deleteScheduleBlock,
   createVisitCoordination,
   listMyVisitRequests,
   listProviderVisitRequests,
