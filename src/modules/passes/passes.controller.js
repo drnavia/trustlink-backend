@@ -93,15 +93,13 @@ const createVisitCoordination = async (req, res) => {
     }
 
     const providerCheck = await db.query(
-      'SELECT id, country_id FROM providers WHERE id = $1 LIMIT 1',
+      'SELECT id FROM providers WHERE id = $1 LIMIT 1',
       [Number(provider_id)]
     );
 
     if (providerCheck.rows.length === 0) {
       return res.status(404).json({ error: 'El prestador seleccionado no existe.' });
     }
-
-    const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
 
     const inserted = await db.query(
       `INSERT INTO visit_requests (
@@ -110,7 +108,7 @@ const createVisitCoordination = async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'coordinated')
        RETURNING *`,
       [
-        effectiveCountryId,
+        countryId,
         ownerId,
         Number(provider_id),
         fraction_number ? String(fraction_number).trim() : null,
@@ -155,7 +153,7 @@ const createPass = async (req, res) => {
     }
 
     const providerCheck = await db.query(
-      'SELECT id, country_id FROM providers WHERE id = $1 LIMIT 1',
+      'SELECT id FROM providers WHERE id = $1 LIMIT 1',
       [Number(provider_id)]
     );
 
@@ -163,7 +161,6 @@ const createPass = async (req, res) => {
       return res.status(404).json({ error: 'El prestador seleccionado no existe.' });
     }
 
-    const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
     const qrToken = crypto.randomBytes(32).toString('hex');
     const supportsPlate = await hasVehiclePlateColumn();
 
@@ -183,7 +180,7 @@ const createPass = async (req, res) => {
 
     const params = supportsPlate
       ? [
-          effectiveCountryId,
+          countryId,
           ownerId,
           Number(provider_id),
           fraction_number ? String(fraction_number).trim() : null,
@@ -194,7 +191,7 @@ const createPass = async (req, res) => {
           end_time,
         ]
       : [
-          effectiveCountryId,
+          countryId,
           ownerId,
           Number(provider_id),
           fraction_number ? String(fraction_number).trim() : null,
