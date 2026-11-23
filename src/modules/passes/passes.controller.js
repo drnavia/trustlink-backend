@@ -1,7 +1,8 @@
 /**
  * @file passes.controller.js
- * @description Controlador para coordinación previa de visitas, emisión de pases QR,
- * consulta (residente y prestador), edición, cancelación y validación perimetral.
+ * @description Controlador para coordinación bidireccional de visitas (solicitud, hilo de mensajes,
+ * confirmación de disponibilidad del prestador), emisión/consulta/edición/cancelación de pases QR
+ * y validación perimetral en garita.
  * @location /trustlink-backend/src/modules/passes/passes.controller.js
  */
 
@@ -22,7 +23,8 @@ const ensureVisitRequestsTable = async () => {
       lot_number VARCHAR(100) NULL,
       preferred_date VARCHAR(50) NULL,
       notes TEXT NULL,
-      status VARCHAR(30) NOT NULL DEFAULT 'coordinated',
+      messages JSONB NOT NULL DEFAULT '[]'::jsonb,
+      status VARCHAR(30) NOT NULL DEFAULT 'pending_provider',
       created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
     );
   `);
@@ -32,7 +34,24 @@ const ensureVisitRequestsTable = async () => {
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS lot_number VARCHAR(100) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS preferred_date VARCHAR(50) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS notes TEXT NULL;`);
-  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'coordinated';`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS messages JSONB NOT NULL DEFAULT '[]'::jsonb;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'pending_provider';`);
+};
+
+/**
+ * Normaliza el arreglo de mensajes almacenado en visit_requests.
+ */
+const parseMessagesArray = (rawMessages) => {
+  if (Array.isArray(rawMessages)) return rawMessages;
+  if (typeof rawMessages === 'string' && rawMessages.trim()) {
+    try {
+      const parsed = JSON.parse(rawMessages);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
 };
 
 /**
@@ -63,7 +82,8 @@ const hasVehiclePlateColumn = async () => {
 };
 
 /**
- * Registra la coordinación/solicitud de visita dentro de TrustLink antes de emitir el QR.
+ * Registra una solicitud/coordinación de visita en estado 'pending_provider'
+ * e inicia el hilo de mensajes dentro de TrustLink.
  * POST /api/v1/passes/visit-requests
  */
 const createVisitCoordination = async (req, res) => {
@@ -101,11 +121,23 @@ const createVisitCoordination = async (req, res) => {
       return res.status(404).json({ error: 'El prestador seleccionado no existe.' });
     }
 
+    const cleanNotes = String(notes).trim();
+    const initialMessages = [
+      {
+        id: `msg-${Date.now()}`,
+        sender_role: 'owner',
+        sender_id: ownerId,
+        text: cleanNotes,
+        created_at: new Date().toISOString(),
+      },
+    ];
+
     const inserted = await db.query(
       `INSERT INTO visit_requests (
-         country_id, owner_id, provider_id, fraction_number, lot_number, preferred_date, notes, status
+         country_id, owner_id, provider_id, fraction_number, lot_number,
+         preferred_date, notes, messages, status
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'coordinated')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'pending_provider')
        RETURNING *`,
       [
         countryId,
@@ -114,19 +146,268 @@ const createVisitCoordination = async (req, res) => {
         fraction_number ? String(fraction_number).trim() : null,
         lot_number ? String(lot_number).trim() : null,
         preferred_date ? String(preferred_date).trim() : null,
-        String(notes).trim(),
+        cleanNotes,
+        JSON.stringify(initialMessages),
       ]
     );
 
+    const row = inserted.rows[0];
     return res.status(201).json({
-      message: 'Visita coordinada en TrustLink. Ya podés emitir el Pase QR correspondiente.',
-      visit: inserted.rows[0],
+      message: 'Solicitud enviada al prestador. Esperá o coordiná su confirmación antes de emitir el QR.',
+      visit: {
+        ...row,
+        messages: parseMessagesArray(row.messages),
+      },
     });
   } catch (error) {
     console.error('Error al registrar coordinación de visita:', error);
     return res.status(500).json({
       error: `Error interno al registrar la visita: ${error.message}`,
     });
+  }
+};
+
+/**
+ * Lista las visitas coordinadas/solicitadas por el residente autenticado.
+ * GET /api/v1/passes/visit-requests/my
+ */
+const listMyVisitRequests = async (req, res) => {
+  try {
+    await ensureVisitRequestsTable();
+    const ownerId = Number(req.user?.userId || req.user?.id);
+
+    const result = await db.query(
+      `SELECT
+         vr.*,
+         TRIM(CONCAT(COALESCE(u_prov.first_name, ''), ' ', COALESCE(u_prov.last_name, ''))) AS provider_name,
+         p.specialty AS provider_specialty
+       FROM visit_requests vr
+       LEFT JOIN providers p ON vr.provider_id = p.id
+       LEFT JOIN users u_prov ON p.user_id = u_prov.id
+       WHERE vr.owner_id = $1
+       ORDER BY vr.id DESC`,
+      [ownerId]
+    );
+
+    const visits = result.rows.map((r) => ({
+      ...r,
+      messages: parseMessagesArray(r.messages),
+    }));
+
+    return res.status(200).json({ visits });
+  } catch (error) {
+    console.error('Error al listar visitas del residente:', error);
+    return res.status(500).json({ error: 'Error interno al consultar las visitas del residente.' });
+  }
+};
+
+/**
+ * Lista las solicitudes de visita recibidas por el prestador autenticado.
+ * GET /api/v1/passes/visit-requests/provider
+ */
+const listProviderVisitRequests = async (req, res) => {
+  try {
+    await ensureVisitRequestsTable();
+    const userId = Number(req.user?.userId || req.user?.id);
+
+    const providerProfilesRes = await db.query(
+      'SELECT id FROM providers WHERE user_id = $1',
+      [userId]
+    );
+
+    const providerIds = providerProfilesRes.rows.map((r) => Number(r.id)).filter(Boolean);
+    if (providerIds.length === 0) {
+      return res.status(200).json({ visits: [] });
+    }
+
+    const result = await db.query(
+      `SELECT
+         vr.*,
+         TRIM(CONCAT(COALESCE(u_owner.first_name, ''), ' ', COALESCE(u_owner.last_name, ''))) AS owner_name,
+         u_owner.phone AS owner_phone,
+         p.specialty AS provider_specialty
+       FROM visit_requests vr
+       LEFT JOIN users u_owner ON vr.owner_id = u_owner.id
+       LEFT JOIN providers p ON vr.provider_id = p.id
+       WHERE vr.provider_id = ANY($1::int[])
+       ORDER BY vr.id DESC`,
+      [providerIds]
+    );
+
+    const visits = result.rows.map((r) => ({
+      ...r,
+      messages: parseMessagesArray(r.messages),
+    }));
+
+    return res.status(200).json({ visits });
+  } catch (error) {
+    console.error('Error al listar visitas del prestador:', error);
+    return res.status(500).json({ error: 'Error interno al consultar las visitas del prestador.' });
+  }
+};
+
+/**
+ * Agrega un mensaje al hilo de coordinación entre residente y prestador.
+ * POST /api/v1/passes/visit-requests/:id/messages
+ */
+const addVisitRequestMessage = async (req, res) => {
+  try {
+    await ensureVisitRequestsTable();
+    const visitId = Number(req.params.id);
+    const userId = Number(req.user?.userId || req.user?.id);
+    const userRole = String(req.user?.role || '').toLowerCase();
+    const text = String(req.body?.text || req.body?.message || '').trim();
+
+    if (!Number.isInteger(visitId) || visitId <= 0) {
+      return res.status(400).json({ error: 'ID de visita inválido.' });
+    }
+    if (!text) {
+      return res.status(400).json({ error: 'Escribí un mensaje antes de enviar.' });
+    }
+
+    const visitRes = await db.query('SELECT * FROM visit_requests WHERE id = $1 LIMIT 1', [visitId]);
+    if (visitRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Solicitud de visita no encontrada.' });
+    }
+
+    const visit = visitRes.rows[0];
+    const providerProfilesRes = await db.query(
+      'SELECT id FROM providers WHERE user_id = $1',
+      [userId]
+    );
+    const myProviderIds = providerProfilesRes.rows.map((r) => Number(r.id));
+
+    const isOwner = Number(visit.owner_id) === userId;
+    const isAssignedProvider = myProviderIds.includes(Number(visit.provider_id));
+    const isAdmin = userRole === 'admin' || userRole === 'superadmin';
+
+    if (!isOwner && !isAssignedProvider && !isAdmin) {
+      return res.status(403).json({ error: 'No tenés permiso para participar en esta visita.' });
+    }
+
+    const currentMessages = parseMessagesArray(visit.messages);
+    const newMsg = {
+      id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      sender_role: isAssignedProvider ? 'provider' : 'owner',
+      sender_id: userId,
+      text,
+      created_at: new Date().toISOString(),
+    };
+
+    const updatedMessages = [...currentMessages, newMsg];
+    const updated = await db.query(
+      `UPDATE visit_requests
+       SET messages = $1::jsonb
+       WHERE id = $2
+       RETURNING *`,
+      [JSON.stringify(updatedMessages), visitId]
+    );
+
+    const row = updated.rows[0];
+    return res.status(200).json({
+      message: 'Mensaje agregado al hilo de coordinación.',
+      visit: {
+        ...row,
+        messages: parseMessagesArray(row.messages),
+      },
+    });
+  } catch (error) {
+    console.error('Error al enviar mensaje de visita:', error);
+    return res.status(500).json({ error: 'Error interno al enviar el mensaje.' });
+  }
+};
+
+/**
+ * Permite al prestador confirmar disponibilidad, proponer horario o rechazar una visita.
+ * PATCH /api/v1/passes/visit-requests/:id/respond
+ */
+const respondVisitRequest = async (req, res) => {
+  try {
+    await ensureVisitRequestsTable();
+    const visitId = Number(req.params.id);
+    const userId = Number(req.user?.userId || req.user?.id);
+    const { action, preferred_date, reply_text } = req.body;
+
+    if (!Number.isInteger(visitId) || visitId <= 0) {
+      return res.status(400).json({ error: 'ID de visita inválido.' });
+    }
+
+    const normalizedAction = String(action || '').toLowerCase();
+    if (!['confirm', 'decline', 'propose'].includes(normalizedAction)) {
+      return res.status(400).json({ error: 'Acción inválida (confirm | propose | decline).' });
+    }
+
+    const visitRes = await db.query('SELECT * FROM visit_requests WHERE id = $1 LIMIT 1', [visitId]);
+    if (visitRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Solicitud de visita no encontrada.' });
+    }
+
+    const visit = visitRes.rows[0];
+    const providerProfilesRes = await db.query(
+      'SELECT id FROM providers WHERE user_id = $1',
+      [userId]
+    );
+    const myProviderIds = providerProfilesRes.rows.map((r) => Number(r.id));
+
+    if (!myProviderIds.includes(Number(visit.provider_id))) {
+      return res.status(403).json({ error: 'Solo el prestador asignado puede responder esta visita.' });
+    }
+
+    const nextStatus =
+      normalizedAction === 'confirm'
+        ? 'confirmed'
+        : normalizedAction === 'decline'
+        ? 'declined'
+        : 'pending_provider';
+
+    const nextDate = preferred_date ? String(preferred_date).trim() : visit.preferred_date;
+    const currentMessages = parseMessagesArray(visit.messages);
+
+    const autoSummaryText =
+      String(reply_text || '').trim() ||
+      (normalizedAction === 'confirm'
+        ? `Disponibilidad confirmada${nextDate ? ` para ${nextDate}` : ''}. Ya podés emitir el Pase QR.`
+        : normalizedAction === 'decline'
+        ? 'No tengo disponibilidad para esa visita en este momento.'
+        : `Propongo coordinar para ${nextDate || 'otro horario'}.`);
+
+    const updatedMessages = [
+      ...currentMessages,
+      {
+        id: `msg-${Date.now()}`,
+        sender_role: 'provider',
+        sender_id: userId,
+        text: autoSummaryText,
+        created_at: new Date().toISOString(),
+      },
+    ];
+
+    const updated = await db.query(
+      `UPDATE visit_requests
+       SET status = $1,
+           preferred_date = $2,
+           messages = $3::jsonb
+       WHERE id = $4
+       RETURNING *`,
+      [nextStatus, nextDate, JSON.stringify(updatedMessages), visitId]
+    );
+
+    const row = updated.rows[0];
+    return res.status(200).json({
+      message:
+        normalizedAction === 'confirm'
+          ? 'Disponibilidad confirmada. El residente ya puede emitir el Pase QR.'
+          : normalizedAction === 'decline'
+          ? 'Visita marcada como sin disponibilidad.'
+          : 'Propuesta enviada al residente.',
+      visit: {
+        ...row,
+        messages: parseMessagesArray(row.messages),
+      },
+    });
+  } catch (error) {
+    console.error('Error al responder solicitud de visita:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar la solicitud de visita.' });
   }
 };
 
@@ -591,6 +872,10 @@ const verifyPassByQR = async (req, res) => {
 
 module.exports = {
   createVisitCoordination,
+  listMyVisitRequests,
+  listProviderVisitRequests,
+  addVisitRequestMessage,
+  respondVisitRequest,
   createPass,
   getMyPasses,
   listProviderPasses,
