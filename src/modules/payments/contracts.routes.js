@@ -7,6 +7,7 @@
 const { Router } = require('express');
 const {
   listMyContracts,
+  listProviderContracts,
   createContract,
   checkoutContractPayment,
   completeContract,
@@ -19,7 +20,13 @@ const { verifyToken, verifyRole, verifyRoleOrPortal } = require('../../middlewar
 
 const router = Router();
 
-// Listado y resolución de reclamos/disputas (colocado antes de /:id para evitar colisión de ruta)
+// Listado de contratos/ingresos para Portal Prestador y reclamos/disputas (antes de /:id)
+router.get(
+  '/provider',
+  verifyToken,
+  verifyRoleOrPortal(['provider', 'superadmin'], 'provider'),
+  listProviderContracts
+);
 router.get('/disputes', verifyToken, listContractDisputes);
 router.patch(
   '/disputes/:disputeId/resolve',

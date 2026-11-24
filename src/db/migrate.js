@@ -333,6 +333,15 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    id: '016_provider_specialty_visibility',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.providers
+          ADD COLUMN IF NOT EXISTS is_visible_in_directory BOOLEAN NOT NULL DEFAULT TRUE;
+      `);
+    },
+  },
 ];
 
 async function runMigrations() {

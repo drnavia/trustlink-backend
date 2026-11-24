@@ -1132,9 +1132,110 @@ const resolveContractDispute = async (req, res) => {
   }
 };
 
+/**
+ * Lista todos los contratos asignados al prestador autenticado junto con resumen de ingresos netos (93%).
+ * GET /api/v1/contracts/provider
+ */
+const listProviderContracts = async (req, res) => {
+  try {
+    await Promise.all([ensureTransactionGatewayColumns(), ensureCompletionAndDisputesSchema()]);
+    const userId = Number(req.user.userId);
+    const config = getGatewayConfig();
+
+    const query = `
+      SELECT
+        sc.id,
+        sc.country_id,
+        sc.owner_id,
+        sc.provider_id,
+        sc.pass_id,
+        sc.description,
+        sc.agreed_amount,
+        sc.status,
+        sc.created_at,
+        sc.completed_at,
+        sc.completion_notes,
+        p.specialty,
+        TRIM(CONCAT(COALESCE(u_own.first_name, ''), ' ', COALESCE(u_own.last_name, ''))) AS owner_name,
+        u_own.phone AS owner_phone,
+        u_own.fraction_number,
+        u_own.lot_number,
+        tx.status AS payment_status,
+        tx.platform_fee,
+        tx.provider_payout,
+        tx.gateway_provider,
+        (
+          SELECT COUNT(*)::int
+          FROM public.service_disputes sd
+          WHERE sd.contract_id = sc.id AND sd.status IN ('open', 'in_review')
+        ) AS open_disputes_count
+      FROM service_contracts sc
+      JOIN providers p ON p.id = sc.provider_id
+      JOIN users u_own ON u_own.id = sc.owner_id
+      LEFT JOIN LATERAL (
+        SELECT status, platform_fee, provider_payout, gateway_provider
+        FROM transactions
+        WHERE contract_id = sc.id
+        ORDER BY id DESC
+        LIMIT 1
+      ) tx ON TRUE
+      WHERE p.user_id = $1
+      ORDER BY sc.created_at DESC, sc.id DESC;
+    `;
+
+    const result = await db.query(query, [userId]);
+    const contracts = result.rows.map((row) => {
+      const agreed = Number(row.agreed_amount || 0);
+      const fallback = calculateSplit(agreed, config.platformFeePercent);
+      return {
+        ...row,
+        agreed_amount: agreed,
+        platform_fee: row.platform_fee !== null && row.platform_fee !== undefined ? Number(row.platform_fee) : fallback.platformFee,
+        provider_payout: row.provider_payout !== null && row.provider_payout !== undefined ? Number(row.provider_payout) : fallback.providerPayout,
+        payment_status: row.payment_status || 'unpaid',
+      };
+    });
+
+    const summary = contracts.reduce(
+      (acc, c) => {
+        acc.total_contracts += 1;
+        const st = String(c.status || '').toLowerCase();
+        if (st === 'completed') acc.completed_count += 1;
+        if (st === 'pending') acc.pending_count += 1;
+        if (st === 'in_progress') acc.in_progress_count += 1;
+        acc.open_disputes_count += Number(c.open_disputes_count || 0);
+        if (st !== 'cancelled') {
+          acc.total_gross = Number((acc.total_gross + c.agreed_amount).toFixed(2));
+          acc.total_net_payout = Number((acc.total_net_payout + c.provider_payout).toFixed(2));
+        }
+        return acc;
+      },
+      {
+        total_contracts: 0,
+        completed_count: 0,
+        in_progress_count: 0,
+        pending_count: 0,
+        open_disputes_count: 0,
+        total_gross: 0,
+        total_net_payout: 0,
+      }
+    );
+
+    return res.status(200).json({
+      count: contracts.length,
+      summary,
+      contracts,
+    });
+  } catch (error) {
+    console.error('Error al listar contratos del prestador:', error);
+    return res.status(500).json({ error: 'Error interno al consultar los contratos del prestador.' });
+  }
+};
+
 module.exports = {
   getPaymentGatewayPublicConfig,
   listMyContracts,
+  listProviderContracts,
   createContract,
   getPendingContracts,
   checkoutContractPayment,

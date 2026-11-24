@@ -56,33 +56,25 @@ Los ingresos se estructuran en tres capas complementarias, desacoplando la soste
 
 | Capa | Actor | Mecanismo | Propuesta de Valor | Estado en Código |
 | :--- | :--- | :--- | :--- | :--- |
-| **1. Membresía "Socio Verificado"** | Prestadores (B2C) | Abono mensual recurrente | Verificación activa, insignia distintiva, visibilidad prioritaria en directorio, pases QR y reputación acumulable (incluso si parte de los trabajos se cobran en efectivo). | *Pendiente (Roadmap Fase 1)* |
-| **2. Licenciamiento B2B a Comunidades** | Barrios / Countries (B2B) | Abono mensual SaaS | Acceso a Consola Garita, API Universal (`x-api-key` por comunidad), auditoría de accesos y alertas de vencimiento sin auditar antecedentes por cuenta propia. | *Infraestructura base lista; falta capa comercial/planes (Roadmap Fase 2)* |
-| **3. Comisión por Transacción (Take Rate)** | Transacciones In-App | 6%–8% (referencia actual: **7%**) | Desglose transparente (7% plataforma / 93% prestador) para operaciones procesadas en plataforma con trazabilidad financiera. | *Cálculo 7%/93% y webhook HMAC listos; pasarela real pendiente (Roadmap Fase 3)* |
+| **1. Membresía "Socio Verificado"** | Prestadores (B2C) | Abono mensual/trimestral recurrente | Verificación activa, insignia distintiva, visibilidad prioritaria en directorio, pases QR y reputación acumulable (incluso si parte de los trabajos se cobran en efectivo). | **✅ Implementado (Fase 1)** — `provider_subscriptions`, `/api/v1/billing`, ranking prioritario y gestión Superadmin |
+| **2. Licenciamiento B2B a Comunidades** | Barrios / Countries (B2B) | Abono mensual SaaS | Acceso a Consola Garita, API Universal (`x-api-key` por comunidad), auditoría de accesos y alertas de vencimiento sin auditar antecedentes por cuenta propia. | **✅ Implementado (Fase 2)** — Planes B2B en `countries`, cuota mensual QR, enforcement en API externa y vistas Admin/Superadmin |
+| **3. Comisión por Transacción (Take Rate)** | Transacciones In-App | 6%–8% (referencia actual: **7%**) | Desglose transparente (7% plataforma / 93% prestador) para operaciones procesadas en plataforma con trazabilidad financiera. | **✅ Implementado en modo dual (Fase 3)** — Checkout Pro Mercado Pago + firma `x-signature` oficial + modo `mock` piloto |
 
 ---
 
 ## 5. Estado Real de la Plataforma (Alineado al Código Actual)
 
-### Capacidades Ya Implementadas
-- **Arquitectura y Despliegue:** Backend modular en Node.js/Express + PostgreSQL (Supabase/local) y Frontend en React + Vite + Tailwind CSS.
+### Capacidades Ya Implementadas (Fases 1–4 + Mejoras Evolutivas Completadas)
+- **Arquitectura, Seguridad y PWA:** Backend modular en Node.js/Express + PostgreSQL (Supabase/local) y Frontend en React + Vite + Tailwind CSS con **PWA instalable** (`manifest.webmanifest` + ícono dedicado).
 - **Identidad Dual y Cuentas:** Una misma persona puede operar como residente y/o prestador (`can_use_resident`, `can_use_provider`, `primary_portal`), con recuperación y cambio de contraseña autenticado, hardening HTTP y rate limiting.
-- **Portal Prestador Completo:**
-  - Gestión de credenciales/especialidades con historial de versiones documentales (`provider_document_versions`) sin sobrescribir registros previos.
-  - Flota vehicular con póliza y vigencia.
-  - CRUD de ayudantes/cuadrilla (`provider_employees`) con DNI y seguro, adjuntables al pase QR.
-  - Agenda online con bloqueos horarios, coordinación de visitas con mensajería interna y vista de Pases QR asignados.
-- **Portal Residente:** Buscador rápido y chips de rubros, directorio de prestadores verificados con flota, solicitudes de visita, emisión/edición/cancelación de pases QR con selección de cuadrilla, atajos de WhatsApp y panel de contratos/pagos/reseñas.
-- **Gobernanza Central (Superadmin / Master Mode) y Admin Local:**
-  - Auditoría centralizada de compliance (`providers`) con pendientes priorizados.
-  - Gestión de comunidades (`countries`), generación/rotación/revocación de API Keys por comunidad (`country_integrations`) y auditoría de accesos (`gate_access_logs`).
-  - Suspensiones operativas locales por comunidad (`provider_local_suspensions`) y alertas proactivas de vencimientos (`/api/v1/providers/expiry-alerts`).
-  - Consola Garita con escáner QR en vivo y validación perimetral con consumo atómico de ingreso único.
-  - Marca blanca configurable por zonas (`branding`).
+- **Compliance Estricto con Bloqueo Automático (Fase 1.1):** Bloqueo automático de emisión de pases y acceso en garita (`CRIMINAL_RECORD_EXPIRED`, `INSURANCE_EXPIRED`, `CREW_INSURANCE_EXPIRED`) con auditoría en `gate_access_logs`.
+- **Membresía "Socio Verificado" (Fase 1.2):** Planes mensual/trimestral/Pro, insignia distintiva, orden prioritario en directorio, autogestión en Portal Prestador y control en Operaciones.
+- **Portal Prestador Completo:** Credenciales versionadas, **visibilidad persistente por especialidad** en directorio (`is_visible_in_directory`), flota vehicular, cuadrilla/ayudantes, agenda online, visitas, pases QR, **resumen de ingresos netos (93%)**, comprobantes imprimibles y reseñas cruzadas.
+- **Portal Residente y Pagos (Fases 3–4):** Directorio con filtro *Solo Socios Verificados*, ordenamiento y vista de reseñas verificadas; pasarela dual `mock | mercadopago` (Checkout Pro + webhook `x-signature`); **conformidad final** (digital o efectivo) con liberación escrow, **Comprobante del Hogar** imprimible (`TLK-REC-...`) y canal de **reclamos/garantía**.
+- **Gobernanza Central (Superadmin) y Admin Local (Fase 2):** Auditoría de compliance y mediación de reclamos, licenciamiento B2B por comunidad con consumo mensual de QR, rotación de API Keys, suspensiones locales, alertas proactivas y **exportación CSV** para administraciones.
 
-### Próximos Hitos Estratégicos
-Ver el desglose técnico detallado en [ROADMAP_TECNICO.md](./ROADMAP_TECNICO.md):
-1. **Membresía "Socio Verificado"** para prestadores (planes, vigencia, insignia y prioridad en directorio).
-2. **Licenciamiento B2B** por comunidad (planes, estado comercial y enforcement en API externa).
-3. **Integración real de Mercado Pago** (Checkout Pro / Marketplace Split sobre el webhook HMAC ya existente).
-4. **Bloqueo automático por vencimiento documental** en validación QR y **flujo de conformidad/reclamos post-servicio**.
+### Backlog Diferido (Dependencias Externas para Salida a Producción Comercial)
+Ver detalle en [ROADMAP_TECNICO.md](./ROADMAP_TECNICO.md):
+1. Activación de credenciales reales de **Mercado Pago** en Railway (Sandbox → Producción) y cobro automatizado de suscripciones.
+2. **Subida directa de archivos** (PDF/fotos de ART y antecedentes) vía **Supabase Storage** con enlaces firmados.
+3. **Notificaciones transaccionales reales** por email (**Resend** / SMTP) para recuperación de contraseña y vencimientos.

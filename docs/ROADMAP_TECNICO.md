@@ -4,14 +4,16 @@ Este documento traduce las brechas identificadas entre la tesis comercial ([TRUS
 
 ---
 
-## Resumen de Prioridades
+## Resumen de Prioridades y Estado
 
-| Fase | Prioridad | Iniciativa | Impacto Principal |
+| Fase | Prioridad | Iniciativa | Estado |
 | :--- | :--- | :--- | :--- |
-| **Fase 1** | **P0** | Bloqueo por vencimiento documental + Membresía **"Socio Verificado"** | Cumple la promesa de compliance estricto y habilita ingresos recurrentes inmunes al efectivo. |
-| **Fase 2** | **P1** | **Licenciamiento B2B** a comunidades (`countries` SaaS) | Monetización directa de barrios que consumen Consola Garita / API Universal. |
-| **Fase 3** | **P1** | Integración real de **Mercado Pago** (Checkout + Split 7% / 93%) | Reemplaza el checkout simulado por cobro real con conciliación vía webhook HMAC. |
-| **Fase 4** | **P2** | **Conformidad final, garantía y reclamos** post-servicio | Cierra el ciclo contractual con respaldo formal y comprobante de servicio. |
+| **Fase 1** | **P0** | Bloqueo por vencimiento documental + Membresía **"Socio Verificado"** | **✅ Completada** (Migración `012`, `/api/v1/billing`, `complianceExpiry.js`, UI y E2E) |
+| **Fase 2** | **P1** | **Licenciamiento B2B** a comunidades (`countries` SaaS) | **✅ Completada** (Migración `013`, enforcement API externa, `SystemHealthDashboard` y `LocalAdminView`) |
+| **Fase 3** | **P1** | Integración real de **Mercado Pago** (Checkout Pro + firma `x-signature`, modo dual) | **✅ Completada** (Migración `014`, `mercadopago.service.js`, `/payments/config`, retorno UI) |
+| **Fase 4** | **P2** | **Conformidad final, garantía/reclamos y Comprobante del Hogar** | **✅ Completada** (Migración `015`, `/contracts/:id/complete`, `/receipt`, `/dispute`, panel Ops) |
+| **Evolutivas** | **P2** | Visibilidad por especialidad DB, ingresos prestador, filtros directorio, CSV y PWA | **✅ Completadas** (Migración `016`, `/contracts/provider`, `csvExport.js`, `manifest.webmanifest`) |
+| **Externos** | **Diferido** | Credenciales MP Live/Suscripciones, Supabase Storage (PDFs) y Email transaccional (Resend/SMTP) | *Pendiente (habilitadores para primer piloto comercial con servicios externos)* |
 
 ---
 

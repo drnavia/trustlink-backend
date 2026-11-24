@@ -1227,4 +1227,49 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     // Limpieza
     await db.query('DELETE FROM service_contracts WHERE id = $1', [f4ContractId]);
   });
+
+  it('persiste visibilidad por especialidad sin alterar compliance y expone contratos/ingresos en /contracts/provider (Evolutivas 1-2)', async () => {
+    // 1. Ocultar especialidad del directorio manteniendo status = 'approved'
+    const hideRes = await req(
+      'PATCH',
+      `/api/v1/providers/profile/${providerId}/visibility`,
+      { is_visible_in_directory: false },
+      provToken
+    );
+    assert.equal(hideRes.status, 200);
+    assert.equal(hideRes.data.provider.is_visible_in_directory, false);
+    assert.equal(hideRes.data.provider.status, 'approved');
+
+    const dirHidden = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dirHidden.status, 200);
+    assert.equal(
+      dirHidden.data.providers.some((p) => Number(p.provider_id) === Number(providerId)),
+      false,
+      'Una especialidad oculta no debe aparecer en el directorio de residentes'
+    );
+
+    // 2. Volver a mostrarla y verificar que reaparece en el directorio
+    const showRes = await req(
+      'PATCH',
+      `/api/v1/providers/profile/${providerId}/visibility`,
+      { is_visible_in_directory: true },
+      provToken
+    );
+    assert.equal(showRes.status, 200);
+    assert.equal(showRes.data.provider.is_visible_in_directory, true);
+
+    const dirVisible = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dirVisible.status, 200);
+    assert.equal(
+      dirVisible.data.providers.some((p) => Number(p.provider_id) === Number(providerId)),
+      true
+    );
+
+    // 3. Consultar resumen de contratos e ingresos netos (93%) del prestador
+    const earnRes = await req('GET', '/api/v1/contracts/provider', undefined, provToken);
+    assert.equal(earnRes.status, 200);
+    assert.equal(Array.isArray(earnRes.data.contracts), true);
+    assert.equal(typeof earnRes.data.summary.total_net_payout, 'number');
+    assert.ok(earnRes.data.summary.total_contracts >= 1);
+  });
 });

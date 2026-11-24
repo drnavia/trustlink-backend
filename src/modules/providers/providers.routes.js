@@ -10,6 +10,7 @@ const { Router } = require('express');
 const {
   updateProviderProfile,
   editProviderProfile,
+  toggleSpecialtyVisibility,
   addVehicle,
   editVehicle,
   listProviderEmployees,
@@ -37,6 +38,9 @@ router.post('/profile', verifyToken, verifyRoleOrPortal(['provider', 'superadmin
 
 // Editar una credencial de compliance existente por ID
 router.patch('/profile/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), editProviderProfile);
+
+// Mostrar u ocultar una especialidad en el directorio sin afectar el compliance aprobado
+router.patch('/profile/:id/visibility', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), toggleSpecialtyVisibility);
 
 // Asociar un nuevo vehículo a la flota del prestador
 router.post('/vehicle', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), addVehicle);

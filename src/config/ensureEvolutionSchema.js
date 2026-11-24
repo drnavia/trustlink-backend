@@ -181,6 +181,12 @@ async function ensureEvolutionSchema() {
         ON public.service_disputes (contract_id, status)
       `);
 
+      // 8. Asegurar control de visibilidad por especialidad en el directorio (`providers`)
+      await db.query(`
+        ALTER TABLE public.providers
+        ADD COLUMN IF NOT EXISTS is_visible_in_directory BOOLEAN NOT NULL DEFAULT TRUE
+      `);
+
       schemaInitialized = true;
     } catch (err) {
       schemaPromise = null;

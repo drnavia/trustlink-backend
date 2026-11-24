@@ -596,8 +596,58 @@ const buildProviderExpiryAlerts = ({
  * Obtiene especialidades, historial completo de versiones documentales
  * y flota vehicular del prestador logueado.
  */
+/**
+ * Activa u oculta una especialidad en el directorio de residentes sin modificar su estado de compliance.
+ * PATCH /api/v1/providers/profile/:id/visibility
+ */
+const toggleSpecialtyVisibility = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const userId = Number(req.user.userId);
+    const providerId = Number(req.params.id);
+    if (!Number.isInteger(providerId) || providerId <= 0) {
+      return res.status(400).json({ error: 'ID de especialidad inválido.' });
+    }
+
+    const existing = await db.query(
+      `SELECT id, specialty, status, COALESCE(is_visible_in_directory, TRUE) AS is_visible_in_directory
+       FROM providers
+       WHERE id = $1 AND user_id = $2
+       LIMIT 1`,
+      [providerId, userId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Especialidad no encontrada o sin permisos.' });
+    }
+
+    const nextVisible =
+      typeof req.body?.is_visible_in_directory === 'boolean'
+        ? req.body.is_visible_in_directory
+        : !existing.rows[0].is_visible_in_directory;
+
+    const updated = await db.query(
+      `UPDATE providers
+       SET is_visible_in_directory = $1
+       WHERE id = $2 AND user_id = $3
+       RETURNING id, user_id, specialty, status, is_visible_in_directory`,
+      [nextVisible, providerId, userId]
+    );
+
+    return res.status(200).json({
+      message: nextVisible
+        ? `Especialidad "${updated.rows[0].specialty}" visible nuevamente en el directorio.`
+        : `Especialidad "${updated.rows[0].specialty}" ocultada temporalmente del directorio (tu compliance sigue intacto).`,
+      provider: updated.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al cambiar visibilidad de especialidad:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar la visibilidad de la especialidad.' });
+  }
+};
+
 const getMyProviderProfile = async (req, res) => {
   try {
+    await ensureEvolutionSchema();
     await ensureDocumentVersionsTable();
     await ensureVehicleInsuranceColumns();
     await ensureProviderEmployeesColumns();
@@ -613,6 +663,7 @@ const getMyProviderProfile = async (req, res) => {
           insurance_policy_url,
           insurance_expiry,
           status,
+          COALESCE(is_visible_in_directory, TRUE) AS is_visible_in_directory,
           rating_avg,
           created_at
         FROM providers
@@ -882,6 +933,7 @@ const listVerifiedProviders = async (req, res) => {
         FROM providers p
         JOIN users u ON p.user_id = u.id
         WHERE p.status = 'approved'::provider_status
+          AND COALESCE(p.is_visible_in_directory, TRUE) = TRUE
           AND COALESCE(u.is_active, TRUE) = TRUE
           AND COALESCE(u.can_use_provider, FALSE) = TRUE
       )
@@ -1475,6 +1527,7 @@ const listExpiryAlertsForAdmin = async (req, res) => {
 module.exports = {
   updateProviderProfile,
   editProviderProfile,
+  toggleSpecialtyVisibility,
   addVehicle,
   editVehicle,
   listProviderEmployees,
