@@ -206,6 +206,15 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    id: '010_access_passes_authorized_employees',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.access_passes
+          ADD COLUMN IF NOT EXISTS authorized_employees JSONB NOT NULL DEFAULT '[]'::jsonb;
+      `);
+    },
+  },
 ];
 
 async function runMigrations() {

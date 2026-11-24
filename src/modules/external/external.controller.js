@@ -1210,6 +1210,11 @@ const verifyExternalPassByQR = async (req, res) => {
   }
 
   try {
+    await db.query(`
+      ALTER TABLE public.access_passes
+        ADD COLUMN IF NOT EXISTS authorized_employees JSONB NOT NULL DEFAULT '[]'::jsonb;
+    `);
+
     const passRes = await db.query(
       `
         SELECT
@@ -1218,6 +1223,7 @@ const verifyExternalPassByQR = async (req, res) => {
           c.name AS country_name,
           ap.owner_id,
           TRIM(CONCAT(COALESCE(u_own.first_name, ''), ' ', COALESCE(u_own.last_name, ''))) AS owner_name,
+          u_own.phone AS owner_phone,
           ap.provider_id,
           TRIM(CONCAT(COALESCE(u_prov.first_name, ''), ' ', COALESCE(u_prov.last_name, ''))) AS provider_name,
           u_prov.dni AS provider_dni,
@@ -1225,6 +1231,7 @@ const verifyExternalPassByQR = async (req, res) => {
           p.status AS compliance_status,
           ap.fraction_number,
           ap.lot_number,
+          COALESCE(ap.authorized_employees, '[]'::jsonb) AS authorized_employees,
           ap.start_time,
           ap.end_time,
           (EXTRACT(EPOCH FROM (ap.start_time AT TIME ZONE 'UTC')) * 1000)::bigint AS start_utc_ms,
@@ -1553,12 +1560,16 @@ const verifyExternalPassByQR = async (req, res) => {
         country_id: record.country_id,
         country_name: record.country_name,
         owner_name: record.owner_name,
+        owner_phone: record.owner_phone || null,
         provider_name: record.provider_name,
         provider_dni: record.provider_dni,
         specialty: record.specialty,
         compliance_status: record.compliance_status,
         fraction_number: record.fraction_number,
         lot_number: record.lot_number,
+        authorized_employees: Array.isArray(record.authorized_employees)
+          ? record.authorized_employees
+          : [],
         start_time: record.start_time,
         end_time: record.end_time,
         start_utc_ms: record.start_utc_ms,

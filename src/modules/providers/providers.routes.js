@@ -22,7 +22,8 @@ const {
   listVerifiedProviders,
   listLocalSuspensions,
   createLocalSuspension,
-  liftLocalSuspension
+  liftLocalSuspension,
+  listExpiryAlertsForAdmin
 } = require('./providers.controller');
 const { verifyToken, verifyRole, verifyRoleOrPortal } = require('../../middlewares/auth.middleware');
 
@@ -83,6 +84,14 @@ router.patch(
   verifyToken,
   verifyRole(['admin', 'superadmin']),
   liftLocalSuspension
+);
+
+// Alertas proactivas de vencimiento documental (ART, antecedentes, seguro vehicular y cuadrilla)
+router.get(
+  '/expiry-alerts',
+  verifyToken,
+  verifyRole(['admin', 'superadmin']),
+  listExpiryAlertsForAdmin
 );
 
 module.exports = router;

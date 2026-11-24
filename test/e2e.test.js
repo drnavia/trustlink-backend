@@ -576,4 +576,91 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     const delEmp = await req('DELETE', `/api/v1/providers/employees/${empId}`, undefined, provToken);
     assert.equal(delEmp.status, 200);
   });
+
+  it('adjunta ayudantes de cuadrilla al Pase QR, los expone en garita y calcula alertas de vencimiento', async () => {
+    const soonDate = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const addEmp = await req(
+      'POST',
+      '/api/v1/providers/employees',
+      {
+        full_name: 'Lucas Cuadrilla',
+        dni: `88${String(ts).slice(-6)}`,
+        role_label: 'Ayudante de Obra',
+        insurance_expiry: soonDate,
+      },
+      provToken
+    );
+    assert.equal(addEmp.status, 201);
+    const crewEmpId = addEmp.data.employee.id;
+
+    // 1. El prestador recibe la alerta de vencimiento próximo en /providers/me
+    const myProf = await req('GET', '/api/v1/providers/me', undefined, provToken);
+    assert.equal(myProf.status, 200);
+    assert.ok(
+      Array.isArray(myProf.data.expiry_alerts) &&
+        myProf.data.expiry_alerts.some(
+          (a) => a.category === 'employee_art' && a.severity === 'expiring_soon'
+        ),
+      'Debe incluir alerta expiring_soon de ART del ayudante'
+    );
+
+    // 2. Admin / Superadmin recibe alertas globales en /providers/expiry-alerts
+    const adminAlerts = await req(
+      'GET',
+      '/api/v1/providers/expiry-alerts?days=30',
+      undefined,
+      superToken
+    );
+    assert.equal(adminAlerts.status, 200);
+    assert.ok(adminAlerts.data.summary.expiring_soon >= 1);
+    assert.ok(
+      adminAlerts.data.alerts.some((a) => a.id === `employee-${crewEmpId}`),
+      'La alerta del ayudante debe figurar en el panel administrativo'
+    );
+
+    // 3. El directorio del residente expone los ayudantes activos del prestador
+    const dir = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dir.status, 200);
+    const dirProv = dir.data.providers.find((p) => Number(p.provider_id) === Number(providerId));
+    assert.ok(dirProv, 'El prestador aprobado debe figurar en el directorio');
+    assert.ok(
+      Array.isArray(dirProv.employees) && dirProv.employees.some((e) => e.id === crewEmpId),
+      'El directorio debe listar la cuadrilla activa del prestador'
+    );
+
+    // 4. Emitir Pase QR adjuntando employee_ids y editarlo manteniendo la cuadrilla
+    const now = Date.now();
+    const crewPass = await req(
+      'POST',
+      '/api/v1/passes/create',
+      {
+        provider_id: providerId,
+        employee_ids: [crewEmpId],
+        start_time: new Date(now - 5 * 60 * 1000).toISOString(),
+        end_time: new Date(now + 2 * 60 * 60 * 1000).toISOString(),
+      },
+      ownerToken
+    );
+    assert.equal(crewPass.status, 201);
+    assert.equal(crewPass.data.pass.authorized_employees.length, 1);
+    assert.equal(crewPass.data.pass.authorized_employees[0].full_name, 'Lucas Cuadrilla');
+    const crewPassId = crewPass.data.pass.id;
+    const crewQrToken = crewPass.data.pass.qr_token;
+
+    // 5. Validar en Consola Garita y verificar que devuelve la cuadrilla autorizada
+    const gateCheck = await req(
+      'POST',
+      '/api/v1/passes/verify',
+      { qr_token: crewQrToken },
+      secToken
+    );
+    assert.equal(gateCheck.status, 200);
+    assert.equal(gateCheck.data.authorized, true);
+    assert.equal(gateCheck.data.details.authorized_employees.length, 1);
+    assert.equal(gateCheck.data.details.authorized_employees[0].full_name, 'Lucas Cuadrilla');
+
+    // Limpieza del pase y ayudante
+    await db.query('DELETE FROM access_passes WHERE id = $1', [crewPassId]);
+    await req('DELETE', `/api/v1/providers/employees/${crewEmpId}`, undefined, provToken);
+  });
 });

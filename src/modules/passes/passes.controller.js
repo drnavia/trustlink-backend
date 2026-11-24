@@ -250,6 +250,74 @@ const hasVehiclePlateColumn = async () => {
 };
 
 /**
+ * Asegura la columna authorized_employees (JSONB) en access_passes para adjuntar ayudantes al Pase QR.
+ */
+const ensureAuthorizedEmployeesColumn = async () => {
+  await db.query(`
+    ALTER TABLE public.access_passes
+      ADD COLUMN IF NOT EXISTS authorized_employees JSONB NOT NULL DEFAULT '[]'::jsonb;
+  `);
+};
+
+const parseAuthorizedEmployeesArray = (rawVal) => {
+  if (Array.isArray(rawVal)) return rawVal;
+  if (typeof rawVal === 'string' && rawVal.trim()) {
+    try {
+      const parsed = JSON.parse(rawVal);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+};
+
+/**
+ * Resuelve un snapshot validado de ayudantes activos pertenecientes al mismo prestador (por user_id).
+ */
+const resolveAuthorizedEmployeesSnapshot = async (providerId, rawEmployeeIds) => {
+  if (!Array.isArray(rawEmployeeIds) || rawEmployeeIds.length === 0) {
+    return [];
+  }
+  const cleanIds = [
+    ...new Set(
+      rawEmployeeIds
+        .map((id) => Number(id))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    ),
+  ];
+  if (cleanIds.length === 0) return [];
+
+  const empRes = await db.query(
+    `SELECT
+       pe.id,
+       COALESCE(pe.full_name, TRIM(CONCAT(COALESCE(u_emp.first_name, ''), ' ', COALESCE(u_emp.last_name, '')))) AS full_name,
+       COALESCE(pe.dni, u_emp.dni) AS dni,
+       COALESCE(pe.role_label, 'Ayudante') AS role_label,
+       pe.insurance_expiry
+     FROM public.provider_employees pe
+     JOIN public.providers p_emp ON p_emp.id = pe.provider_id
+     JOIN public.providers p_target ON p_target.id = $1
+     LEFT JOIN public.users u_emp ON u_emp.id = pe.employee_user_id
+     WHERE pe.id = ANY($2::int[])
+       AND p_emp.user_id = p_target.user_id
+       AND COALESCE(pe.is_active, TRUE) = TRUE
+     ORDER BY pe.id ASC`,
+    [Number(providerId), cleanIds]
+  );
+
+  return empRes.rows.map((row) => ({
+    id: row.id,
+    full_name: row.full_name || 'Ayudante',
+    dni: row.dni || null,
+    role_label: row.role_label || 'Ayudante',
+    insurance_expiry: row.insurance_expiry
+      ? new Date(row.insurance_expiry).toISOString().slice(0, 10)
+      : null,
+  }));
+};
+
+/**
  * Obtiene y valida la ubicación residencial registrada del residente en la tabla `users`.
  * - Toma automáticamente `fraction_type` ('manzana' | 'fraccion' | 'na'), `fraction_number` y `lot_number`.
  * - Exige que el residente tenga un `lot_number` cargado en su cuenta.
@@ -845,6 +913,7 @@ const respondVisitRequest = async (req, res) => {
  */
 const createPass = async (req, res) => {
   try {
+    await ensureAuthorizedEmployeesColumn();
     const ownerId = Number(req.user?.userId || req.user?.id);
     const countryId = req.user?.countryId ? Number(req.user.countryId) : null;
     const {
@@ -852,6 +921,7 @@ const createPass = async (req, res) => {
       fraction_number,
       lot_number,
       vehicle_plate,
+      employee_ids,
       start_time,
       end_time,
     } = req.body;
@@ -880,6 +950,11 @@ const createPass = async (req, res) => {
       return res.status(400).json({ error: locationResult.error });
     }
 
+    const authorizedEmployees = await resolveAuthorizedEmployeesSnapshot(
+      Number(provider_id),
+      employee_ids
+    );
+
     const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
     const qrToken = crypto.randomBytes(32).toString('hex');
     const supportsPlate = await hasVehiclePlateColumn();
@@ -887,15 +962,15 @@ const createPass = async (req, res) => {
     const insertSql = supportsPlate
       ? `INSERT INTO access_passes (
            country_id, owner_id, provider_id, fraction_number, lot_number,
-           vehicle_plate, qr_token, start_time, end_time, status
+           vehicle_plate, authorized_employees, qr_token, start_time, end_time, status
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, 'pending')
          RETURNING *`
       : `INSERT INTO access_passes (
            country_id, owner_id, provider_id, fraction_number, lot_number,
-           qr_token, start_time, end_time, status
+           authorized_employees, qr_token, start_time, end_time, status
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, 'pending')
          RETURNING *`;
 
     const params = supportsPlate
@@ -906,6 +981,7 @@ const createPass = async (req, res) => {
           locationResult.fractionDisplay,
           locationResult.lotNumber,
           vehicle_plate ? String(vehicle_plate).trim().toUpperCase() : null,
+          JSON.stringify(authorizedEmployees),
           qrToken,
           start_time,
           end_time,
@@ -916,13 +992,17 @@ const createPass = async (req, res) => {
           Number(provider_id),
           locationResult.fractionDisplay,
           locationResult.lotNumber,
+          JSON.stringify(authorizedEmployees),
           qrToken,
           start_time,
           end_time,
         ];
 
     const created = await db.query(insertSql, params);
-    const createdPass = created.rows[0];
+    const createdPass = {
+      ...created.rows[0],
+      authorized_employees: parseAuthorizedEmployeesArray(created.rows[0].authorized_employees),
+    };
 
     await upsertScheduleBlock({
       providerId: Number(provider_id),
@@ -949,6 +1029,7 @@ const createPass = async (req, res) => {
  */
 const getMyPasses = async (req, res) => {
   try {
+    await ensureAuthorizedEmployeesColumn();
     await expireOverduePasses();
     const ownerId = req.user.userId;
     const supportsPlate = await hasVehiclePlateColumn();
@@ -963,12 +1044,14 @@ const getMyPasses = async (req, res) => {
          ap.fraction_number,
          ap.lot_number,
          ${plateSelect}
+         COALESCE(ap.authorized_employees, '[]'::jsonb) AS authorized_employees,
          ap.qr_token,
          ap.start_time,
          ap.end_time,
          ap.status,
          ap.created_at,
          TRIM(CONCAT(COALESCE(u_prov.first_name, ''), ' ', COALESCE(u_prov.last_name, ''))) AS provider_name,
+         u_prov.phone AS provider_phone,
          p.specialty AS provider_specialty,
          c.name AS country_name
        FROM access_passes ap
@@ -980,7 +1063,12 @@ const getMyPasses = async (req, res) => {
       [ownerId]
     );
 
-    return res.status(200).json({ passes: result.rows });
+    const passes = result.rows.map((row) => ({
+      ...row,
+      authorized_employees: parseAuthorizedEmployeesArray(row.authorized_employees),
+    }));
+
+    return res.status(200).json({ passes });
   } catch (error) {
     console.error('Error al obtener pases del residente:', error);
     return res.status(500).json({ error: 'Error interno al consultar los pases QR.' });
@@ -993,6 +1081,7 @@ const getMyPasses = async (req, res) => {
  */
 const listProviderPasses = async (req, res) => {
   try {
+    await ensureAuthorizedEmployeesColumn();
     await expireOverduePasses();
     const userId = req.user.userId;
 
@@ -1019,6 +1108,7 @@ const listProviderPasses = async (req, res) => {
          ap.fraction_number,
          ap.lot_number,
          ${plateSelect}
+         COALESCE(ap.authorized_employees, '[]'::jsonb) AS authorized_employees,
          ap.qr_token,
          ap.start_time,
          ap.end_time,
@@ -1026,6 +1116,7 @@ const listProviderPasses = async (req, res) => {
          ap.created_at,
          u_owner.first_name AS owner_first_name,
          u_owner.last_name AS owner_last_name,
+         u_owner.phone AS owner_phone,
          TRIM(CONCAT(COALESCE(u_owner.first_name, ''), ' ', COALESCE(u_owner.last_name, ''))) AS authorized_by,
          p.specialty AS provider_specialty,
          c.name AS country_name
@@ -1038,7 +1129,12 @@ const listProviderPasses = async (req, res) => {
       [providerIds]
     );
 
-    return res.status(200).json({ passes: result.rows });
+    const passes = result.rows.map((row) => ({
+      ...row,
+      authorized_employees: parseAuthorizedEmployeesArray(row.authorized_employees),
+    }));
+
+    return res.status(200).json({ passes });
   } catch (error) {
     console.error('Error al listar pases QR del prestador:', error);
     return res.status(500).json({ error: 'Error interno al consultar los pases QR del prestador.' });
@@ -1052,6 +1148,7 @@ const listProviderPasses = async (req, res) => {
  */
 const updatePass = async (req, res) => {
   try {
+    await ensureAuthorizedEmployeesColumn();
     await expireOverduePasses();
     const passId = Number(req.params.id);
     const ownerId = Number(req.user.userId);
@@ -1062,7 +1159,8 @@ const updatePass = async (req, res) => {
 
     const currentRes = await db.query(
       `SELECT
-         id, owner_id, status, start_time, end_time,
+         id, owner_id, provider_id, status, start_time, end_time,
+         COALESCE(authorized_employees, '[]'::jsonb) AS authorized_employees,
          (EXTRACT(EPOCH FROM (end_time AT TIME ZONE 'UTC')) * 1000)::bigint AS end_utc_ms,
          (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint AS now_utc_ms
        FROM access_passes
@@ -1090,11 +1188,15 @@ const updatePass = async (req, res) => {
       });
     }
 
-    const { fraction_number, lot_number, vehicle_plate, start_time, end_time } = req.body;
+    const { fraction_number, lot_number, vehicle_plate, employee_ids, start_time, end_time } = req.body;
     const locationResult = await resolveResidentLocation(ownerId, fraction_number, lot_number);
     if (locationResult.error) {
       return res.status(400).json({ error: locationResult.error });
     }
+
+    const nextAuthorizedEmployees = Array.isArray(employee_ids)
+      ? await resolveAuthorizedEmployeesSnapshot(Number(currentPass.provider_id), employee_ids)
+      : parseAuthorizedEmployeesArray(currentPass.authorized_employees);
 
     const supportsPlate = await hasVehiclePlateColumn();
 
@@ -1103,16 +1205,18 @@ const updatePass = async (req, res) => {
          SET fraction_number = $1,
              lot_number = $2,
              vehicle_plate = $3,
-             start_time = COALESCE($4, start_time),
-             end_time = COALESCE($5, end_time)
-         WHERE id = $6
+             authorized_employees = $4::jsonb,
+             start_time = COALESCE($5, start_time),
+             end_time = COALESCE($6, end_time)
+         WHERE id = $7
          RETURNING *`
       : `UPDATE access_passes
          SET fraction_number = $1,
              lot_number = $2,
-             start_time = COALESCE($3, start_time),
-             end_time = COALESCE($4, end_time)
-         WHERE id = $5
+             authorized_employees = $3::jsonb,
+             start_time = COALESCE($4, start_time),
+             end_time = COALESCE($5, end_time)
+         WHERE id = $6
          RETURNING *`;
 
     const normalizedPlate =
@@ -1125,6 +1229,7 @@ const updatePass = async (req, res) => {
           locationResult.fractionDisplay,
           locationResult.lotNumber,
           normalizedPlate,
+          JSON.stringify(nextAuthorizedEmployees),
           start_time || null,
           end_time || null,
           passId,
@@ -1132,16 +1237,21 @@ const updatePass = async (req, res) => {
       : [
           locationResult.fractionDisplay,
           locationResult.lotNumber,
+          JSON.stringify(nextAuthorizedEmployees),
           start_time || null,
           end_time || null,
           passId,
         ];
 
     const updated = await db.query(updateSql, params);
+    const updatedPass = {
+      ...updated.rows[0],
+      authorized_employees: parseAuthorizedEmployeesArray(updated.rows[0].authorized_employees),
+    };
 
     return res.status(200).json({
       message: 'Pase QR actualizado correctamente.',
-      pass: updated.rows[0],
+      pass: updatedPass,
     });
   } catch (error) {
     console.error('Error al actualizar pase QR:', error);
@@ -1223,6 +1333,7 @@ const verifyPassByQR = async (req, res) => {
   const { qr_token } = req.body || {};
 
   try {
+    await ensureAuthorizedEmployeesColumn();
     await expireOverduePasses();
 
     if (!qr_token || !String(qr_token).trim()) {
@@ -1244,6 +1355,9 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
+    const supportsPlate = await hasVehiclePlateColumn();
+    const plateSelect = supportsPlate ? 'ap.vehicle_plate,' : 'NULL::text AS vehicle_plate,';
+
     const query = `
       SELECT
         ap.id AS pass_id,
@@ -1257,13 +1371,17 @@ const verifyPassByQR = async (req, res) => {
         (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint AS now_utc_ms,
         ap.fraction_number,
         ap.lot_number,
+        ${plateSelect}
+        COALESCE(ap.authorized_employees, '[]'::jsonb) AS authorized_employees,
         u_prov.first_name AS provider_first_name,
         u_prov.last_name AS provider_last_name,
         u_prov.dni AS provider_dni,
+        u_prov.phone AS provider_phone,
         p.specialty AS provider_specialty,
         p.status AS compliance_status,
         u_owner.first_name AS owner_first_name,
         u_owner.last_name AS owner_last_name,
+        u_owner.phone AS owner_phone,
         pv.vehicle_type,
         pv.brand,
         pv.model,
@@ -1274,7 +1392,9 @@ const verifyPassByQR = async (req, res) => {
       JOIN users u_prov ON p.user_id = u_prov.id
       JOIN users u_owner ON ap.owner_id = u_owner.id
       LEFT JOIN provider_vehicles pv ON pv.provider_id = p.id
+        AND (${supportsPlate ? 'ap.vehicle_plate IS NULL OR UPPER(pv.plate) = UPPER(ap.vehicle_plate)' : 'TRUE'})
       WHERE ap.qr_token = $1
+      ORDER BY pv.id DESC
       LIMIT 1
     `;
 
@@ -1450,6 +1570,9 @@ const verifyPassByQR = async (req, res) => {
       httpStatus: 200,
     });
 
+    const authorizedEmployees = parseAuthorizedEmployeesArray(passInfo.authorized_employees);
+    const effectivePlate = passInfo.vehicle_plate || passInfo.plate || null;
+
     return res.status(200).json({
       authorized: true,
       code: 'ACCESS_GRANTED',
@@ -1459,20 +1582,24 @@ const verifyPassByQR = async (req, res) => {
         status: 'used',
         provider_name: `${passInfo.provider_first_name} ${passInfo.provider_last_name}`,
         provider_dni: passInfo.provider_dni,
+        provider_phone: passInfo.provider_phone || null,
         specialty: passInfo.provider_specialty,
         authorized_by: `${passInfo.owner_first_name} ${passInfo.owner_last_name}`,
+        owner_phone: passInfo.owner_phone || null,
         fraction_number: passInfo.fraction_number,
         lot_number: passInfo.lot_number,
         start_time: passInfo.start_time,
         end_time: passInfo.end_time,
+        vehicle_plate: effectivePlate,
+        authorized_employees: authorizedEmployees,
         vehicle:
-          passInfo.brand || passInfo.plate
+          passInfo.brand || effectivePlate
             ? {
                 vehicle_type: passInfo.vehicle_type,
                 brand: passInfo.brand,
                 model: passInfo.model,
                 color: passInfo.color,
-                plate: passInfo.plate,
+                plate: effectivePlate,
               }
             : null,
       },

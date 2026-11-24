@@ -466,6 +466,127 @@ const editVehicle = async (req, res) => {
 };
 
 /**
+ * Calcula alertas de vencimiento (vencidos o próximos a vencer dentro de `windowDays` días)
+ * para documentación personal, flota vehicular y cuadrilla de ayudantes.
+ */
+const evaluateExpiryDate = (rawDate, windowDays = 30) => {
+  if (!rawDate) return null;
+  const parsed = new Date(rawDate);
+  if (Number.isNaN(parsed.getTime())) return null;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const target = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+  const diffDays = Math.ceil((target.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+
+  if (diffDays < 0) {
+    return {
+      severity: 'expired',
+      days_remaining: diffDays,
+      expiry_date: target.toISOString().slice(0, 10),
+    };
+  }
+  if (diffDays <= windowDays) {
+    return {
+      severity: 'expiring_soon',
+      days_remaining: diffDays,
+      expiry_date: target.toISOString().slice(0, 10),
+    };
+  }
+  return null;
+};
+
+const buildProviderExpiryAlerts = ({
+  providers = [],
+  vehicles = [],
+  employees = [],
+  windowDays = 30,
+  providerMetaById = {},
+}) => {
+  const alerts = [];
+
+  providers.forEach((p) => {
+    const meta = providerMetaById[p.id] || {};
+    const ownerLabel = meta.provider_name || p.specialty || `Perfil #${p.id}`;
+
+    const crimEval = evaluateExpiryDate(p.criminal_record_expiry, windowDays);
+    if (crimEval) {
+      alerts.push({
+        id: `criminal-${p.id}`,
+        provider_id: p.id,
+        provider_name: meta.provider_name || null,
+        provider_phone: meta.provider_phone || null,
+        provider_email: meta.provider_email || null,
+        category: 'criminal_record',
+        target_step: 'credentials',
+        title: 'Antecedentes Penales',
+        subtitle: `${ownerLabel}${p.specialty ? ` · ${p.specialty}` : ''}`,
+        ...crimEval,
+      });
+    }
+
+    const insEval = evaluateExpiryDate(p.insurance_expiry, windowDays);
+    if (insEval) {
+      alerts.push({
+        id: `insurance-${p.id}`,
+        provider_id: p.id,
+        provider_name: meta.provider_name || null,
+        provider_phone: meta.provider_phone || null,
+        provider_email: meta.provider_email || null,
+        category: 'provider_art',
+        target_step: 'credentials',
+        title: 'Póliza ART / Seguro Personal',
+        subtitle: `${ownerLabel}${p.specialty ? ` · ${p.specialty}` : ''}`,
+        ...insEval,
+      });
+    }
+  });
+
+  vehicles.forEach((v) => {
+    const meta = providerMetaById[v.provider_id] || {};
+    const vehEval = evaluateExpiryDate(v.vehicle_insurance_expiry, windowDays);
+    if (vehEval) {
+      alerts.push({
+        id: `vehicle-${v.id}`,
+        provider_id: v.provider_id,
+        provider_name: meta.provider_name || null,
+        provider_phone: meta.provider_phone || null,
+        provider_email: meta.provider_email || null,
+        category: 'vehicle_insurance',
+        target_step: 'vehicles',
+        title: `Seguro Vehicular (${v.plate || 'Sin patente'})`,
+        subtitle: [meta.provider_name, [v.brand, v.model].filter(Boolean).join(' ')].filter(Boolean).join(' · ') || 'Vehículo registrado',
+        ...vehEval,
+      });
+    }
+  });
+
+  employees
+    .filter((e) => e.is_active !== false)
+    .forEach((emp) => {
+      const meta = providerMetaById[emp.provider_id] || {};
+      const empEval = evaluateExpiryDate(emp.insurance_expiry, windowDays);
+      if (empEval) {
+        alerts.push({
+          id: `employee-${emp.id}`,
+          provider_id: emp.provider_id,
+          provider_name: meta.provider_name || null,
+          provider_phone: meta.provider_phone || null,
+          provider_email: meta.provider_email || null,
+          category: 'employee_art',
+          target_step: 'vehicles',
+          title: `ART Ayudante: ${emp.full_name || 'Sin nombre'}`,
+          subtitle: [meta.provider_name, emp.dni ? `DNI ${emp.dni}` : null, emp.role_label].filter(Boolean).join(' · '),
+          ...empEval,
+        });
+      }
+    });
+
+  alerts.sort((a, b) => a.days_remaining - b.days_remaining);
+  return alerts;
+};
+
+/**
  * Obtiene especialidades, historial completo de versiones documentales
  * y flota vehicular del prestador logueado.
  */
@@ -564,11 +685,19 @@ const getMyProviderProfile = async (req, res) => {
       employees = employeesRes.rows;
     }
 
+    const expiryAlerts = buildProviderExpiryAlerts({
+      providers: providersRes.rows,
+      vehicles,
+      employees,
+      windowDays: 30,
+    });
+
     return res.status(200).json({
       providers: providersRes.rows,
       document_history: versionsRes.rows,
       vehicles,
       employees,
+      expiry_alerts: expiryAlerts,
     });
   } catch (error) {
     console.error('Error al obtener perfil del prestador:', error);
@@ -682,6 +811,7 @@ const updateComplianceStatus = async (req, res) => {
 const listVerifiedProviders = async (req, res) => {
   try {
     await ensureVehicleInsuranceColumns();
+    await ensureProviderEmployeesColumns();
 
     const query = `
       WITH approved_profiles AS (
@@ -735,7 +865,27 @@ const listVerifiedProviders = async (req, res) => {
             WHERE p2.user_id = ap.user_id
           ),
           '[]'::json
-        ) AS vehicles
+        ) AS vehicles,
+        COALESCE(
+          (
+            SELECT JSON_AGG(
+              JSON_BUILD_OBJECT(
+                'id', pe.id,
+                'full_name', COALESCE(pe.full_name, TRIM(CONCAT(COALESCE(u_emp.first_name, ''), ' ', COALESCE(u_emp.last_name, '')))),
+                'dni', COALESCE(pe.dni, u_emp.dni),
+                'role_label', COALESCE(pe.role_label, 'Ayudante'),
+                'insurance_expiry', pe.insurance_expiry,
+                'is_active', pe.is_active
+              )
+              ORDER BY pe.id DESC
+            )
+            FROM public.provider_employees pe
+            JOIN providers p3 ON p3.id = pe.provider_id
+            LEFT JOIN public.users u_emp ON u_emp.id = pe.employee_user_id
+            WHERE p3.user_id = ap.user_id AND COALESCE(pe.is_active, TRUE) = TRUE
+          ),
+          '[]'::json
+        ) AS employees
       FROM approved_profiles ap
       GROUP BY ap.user_id, ap.first_name, ap.last_name, ap.phone, ap.email
       ORDER BY AVG(ap.rating_avg) DESC, ap.user_id ASC;
@@ -1151,6 +1301,92 @@ const deleteProviderEmployee = async (req, res) => {
   }
 };
 
+/**
+ * Lista alertas proactivas de vencimiento (vencidos o próximos a vencer en N días)
+ * para administración local o central de TrustLink.
+ * GET /api/v1/providers/expiry-alerts?days=30
+ */
+const listExpiryAlertsForAdmin = async (req, res) => {
+  try {
+    await Promise.all([
+      ensureVehicleInsuranceColumns(),
+      ensureProviderEmployeesColumns(),
+    ]);
+
+    const rawDays = parseInt(req.query.days, 10);
+    const windowDays = Number.isInteger(rawDays) && rawDays >= 1 && rawDays <= 180 ? rawDays : 30;
+
+    const [provRes, vehRes, empRes] = await Promise.all([
+      db.query(`
+        SELECT
+          p.id,
+          p.user_id,
+          p.specialty,
+          p.criminal_record_expiry,
+          p.insurance_expiry,
+          p.status,
+          TRIM(CONCAT(COALESCE(u.first_name, ''), ' ', COALESCE(u.last_name, ''))) AS provider_name,
+          u.phone AS provider_phone,
+          u.email AS provider_email
+        FROM public.providers p
+        JOIN public.users u ON u.id = p.user_id
+        ORDER BY p.id ASC
+      `),
+      db.query(`
+        SELECT id, provider_id, vehicle_type, brand, model, plate, vehicle_insurance_expiry
+        FROM public.provider_vehicles
+        WHERE vehicle_insurance_expiry IS NOT NULL
+      `),
+      db.query(`
+        SELECT
+          pe.id,
+          pe.provider_id,
+          COALESCE(pe.full_name, TRIM(CONCAT(COALESCE(u.first_name, ''), ' ', COALESCE(u.last_name, '')))) AS full_name,
+          COALESCE(pe.dni, u.dni) AS dni,
+          COALESCE(pe.role_label, 'Ayudante') AS role_label,
+          pe.insurance_expiry,
+          pe.is_active
+        FROM public.provider_employees pe
+        LEFT JOIN public.users u ON u.id = pe.employee_user_id
+        WHERE COALESCE(pe.is_active, TRUE) = TRUE AND pe.insurance_expiry IS NOT NULL
+      `),
+    ]);
+
+    const providerMetaById = {};
+    provRes.rows.forEach((p) => {
+      providerMetaById[p.id] = {
+        provider_name: p.provider_name || p.provider_email || `Prestador #${p.id}`,
+        provider_phone: p.provider_phone || null,
+        provider_email: p.provider_email || null,
+      };
+    });
+
+    const alerts = buildProviderExpiryAlerts({
+      providers: provRes.rows,
+      vehicles: vehRes.rows,
+      employees: empRes.rows,
+      windowDays,
+      providerMetaById,
+    });
+
+    const expiredCount = alerts.filter((a) => a.severity === 'expired').length;
+    const expiringSoonCount = alerts.filter((a) => a.severity === 'expiring_soon').length;
+
+    return res.status(200).json({
+      window_days: windowDays,
+      summary: {
+        total: alerts.length,
+        expired: expiredCount,
+        expiring_soon: expiringSoonCount,
+      },
+      alerts,
+    });
+  } catch (error) {
+    console.error('Error al consultar alertas de vencimiento:', error);
+    return res.status(500).json({ error: 'Error interno al consultar alertas de vencimiento.' });
+  }
+};
+
 module.exports = {
   updateProviderProfile,
   editProviderProfile,
@@ -1166,5 +1402,6 @@ module.exports = {
   listVerifiedProviders,
   listLocalSuspensions,
   createLocalSuspension,
-  liftLocalSuspension
+  liftLocalSuspension,
+  listExpiryAlertsForAdmin
 };
