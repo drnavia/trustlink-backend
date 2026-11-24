@@ -729,8 +729,9 @@ const listLocalSuspensions = async (req, res) => {
   try {
     await ensureLocalSuspensionsTable();
     const countryIdParam = req.query.country_id ? parseInt(req.query.country_id, 10) : null;
+    const isSuperadmin = req.user.role === 'superadmin';
     const effectiveCountryId =
-      req.user.role === 'superadmin' && countryIdParam ? countryIdParam : req.user.countryId;
+      isSuperadmin && countryIdParam ? countryIdParam : req.user.countryId;
 
     const params = [];
     let whereClause = '';
@@ -748,9 +749,12 @@ const listLocalSuspensions = async (req, res) => {
         p.specialty,
         u.first_name,
         u.last_name,
+        u.first_name AS provider_first_name,
+        u.last_name AS provider_last_name,
         u.email,
         pls.reason,
         pls.active,
+        CASE WHEN pls.active THEN 'active' ELSE 'lifted' END AS status,
         pls.created_at,
         pls.lifted_at
       FROM public.provider_local_suspensions pls
@@ -761,8 +765,40 @@ const listLocalSuspensions = async (req, res) => {
       ORDER BY pls.active DESC, pls.id DESC;
     `;
 
-    const result = await db.query(query, params);
-    return res.status(200).json({ count: result.rows.length, suspensions: result.rows });
+    const countriesQuery = isSuperadmin
+      ? db.query('SELECT id, name, is_active FROM public.countries ORDER BY id ASC')
+      : effectiveCountryId
+      ? db.query('SELECT id, name, is_active FROM public.countries WHERE id = $1 ORDER BY id ASC', [
+          effectiveCountryId,
+        ])
+      : Promise.resolve({ rows: [] });
+
+    const providersQuery = db.query(`
+      SELECT
+        p.id AS provider_id,
+        p.specialty,
+        p.status,
+        u.first_name,
+        u.last_name,
+        u.email
+      FROM public.providers p
+      JOIN public.users u ON u.id = p.user_id
+      ORDER BY u.first_name ASC, u.last_name ASC, p.id ASC
+    `);
+
+    const [result, countriesRes, providersRes] = await Promise.all([
+      db.query(query, params),
+      countriesQuery,
+      providersQuery,
+    ]);
+
+    return res.status(200).json({
+      count: result.rows.length,
+      effective_country_id: effectiveCountryId || countriesRes.rows[0]?.id || null,
+      countries: countriesRes.rows,
+      providers: providersRes.rows,
+      suspensions: result.rows,
+    });
   } catch (error) {
     console.error('Error al listar suspensiones locales:', error);
     return res.status(500).json({ error: 'Error interno al consultar suspensiones locales.' });
@@ -817,16 +853,27 @@ const liftLocalSuspension = async (req, res) => {
   try {
     await ensureLocalSuspensionsTable();
     const { id } = req.params;
+    const isAdminLocal = req.user.role === 'admin' && req.user.countryId;
 
-    const updated = await db.query(
-      `
-        UPDATE public.provider_local_suspensions
-        SET active = FALSE, lifted_at = NOW()
-        WHERE id = $1
-        RETURNING *;
-      `,
-      [id]
-    );
+    const updated = isAdminLocal
+      ? await db.query(
+          `
+            UPDATE public.provider_local_suspensions
+            SET active = FALSE, lifted_at = NOW()
+            WHERE id = $1 AND country_id = $2
+            RETURNING *;
+          `,
+          [id, req.user.countryId]
+        )
+      : await db.query(
+          `
+            UPDATE public.provider_local_suspensions
+            SET active = FALSE, lifted_at = NOW()
+            WHERE id = $1
+            RETURNING *;
+          `,
+          [id]
+        );
 
     if (updated.rows.length === 0) {
       return res.status(404).json({ error: 'Suspensión local no encontrada.' });

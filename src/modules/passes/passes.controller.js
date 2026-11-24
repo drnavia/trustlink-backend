@@ -9,6 +9,96 @@
 
 const crypto = require('crypto');
 const db = require('../../config/db');
+const { ensureEvolutionSchema } = require('../../config/ensureEvolutionSchema');
+
+/**
+ * Asegura la existencia de la tabla gate_access_logs para auditar validaciones de Consola Garita.
+ */
+const ensureGateAccessLogsTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS gate_access_logs (
+      id SERIAL PRIMARY KEY,
+      qr_token VARCHAR(255) NULL,
+      pass_id INTEGER NULL,
+      country_id INTEGER NULL,
+      integration_label VARCHAR(120) NULL,
+      auth_mode VARCHAR(40) NOT NULL DEFAULT 'jwt',
+      authorized BOOLEAN NOT NULL DEFAULT FALSE,
+      reason_code VARCHAR(80) NOT NULL,
+      message TEXT NOT NULL,
+      http_status INTEGER NOT NULL DEFAULT 200,
+      created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+    );
+  `);
+};
+
+const maskQrToken = (token) => {
+  if (!token) return null;
+  const clean = String(token).trim();
+  if (clean.length <= 12) return clean;
+  return `${clean.slice(0, 8)}...${clean.slice(-6)}`;
+};
+
+const recordGateAccessLog = async ({
+  qrToken,
+  passId = null,
+  countryId = null,
+  integrationLabel = 'Consola Garita',
+  authMode = 'jwt',
+  authorized = false,
+  reasonCode = 'UNKNOWN',
+  message = '',
+  httpStatus = 200,
+}) => {
+  try {
+    await ensureGateAccessLogsTable();
+    await db.query(
+      `INSERT INTO gate_access_logs (
+         qr_token, pass_id, country_id, integration_label, auth_mode,
+         authorized, reason_code, message, http_status
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        maskQrToken(qrToken),
+        passId,
+        countryId,
+        integrationLabel,
+        authMode,
+        authorized,
+        reasonCode,
+        message,
+        httpStatus,
+      ]
+    );
+  } catch (err) {
+    console.error('Error al registrar auditoría en gate_access_logs:', err);
+  }
+};
+
+const findActiveLocalSuspension = async (countryId, providerId) => {
+  if (!countryId || !providerId) return null;
+  try {
+    const tableCheck = await db.query(
+      `SELECT 1 FROM information_schema.tables
+       WHERE table_schema = 'public' AND table_name = 'provider_local_suspensions'
+       LIMIT 1`
+    );
+    if (tableCheck.rows.length === 0) return null;
+
+    const res = await db.query(
+      `SELECT id, reason
+       FROM public.provider_local_suspensions
+       WHERE country_id = $1 AND provider_id = $2 AND active = TRUE
+       ORDER BY id DESC
+       LIMIT 1`,
+      [Number(countryId), Number(providerId)]
+    );
+    return res.rows[0] || null;
+  } catch (err) {
+    console.error('Aviso al consultar suspensiones locales en garita:', err.message);
+    return null;
+  }
+};
 
 /**
  * Crea o actualiza de forma idempotente la tabla visit_requests y sus columnas.
@@ -167,6 +257,8 @@ const hasVehiclePlateColumn = async () => {
  *   para garantizar que el residente solo pida visitas o emita pases hacia su propia ubicación registrada.
  */
 const resolveResidentLocation = async (residentUserId, requestedFractionNumber, requestedLotNumber) => {
+  await ensureEvolutionSchema();
+
   const res = await db.query(
     `SELECT
        COALESCE(fraction_type, 'na') AS fraction_type,
@@ -195,7 +287,7 @@ const resolveResidentLocation = async (residentUserId, requestedFractionNumber, 
     requestedLotNumber !== undefined &&
     requestedLotNumber !== null &&
     String(requestedLotNumber).trim() !== '' &&
-    String(requestedLotNumber).trim() !== registeredLot
+    String(requestedLotNumber).trim().toLowerCase() !== registeredLot.toLowerCase()
   ) {
     return {
       error: `Solo podés solicitar visitas o emitir pases para tu Lote registrado (${registeredLot}).`,
@@ -203,26 +295,35 @@ const resolveResidentLocation = async (residentUserId, requestedFractionNumber, 
   }
 
   const registeredFractionType = String(resident.fraction_type || 'na').toLowerCase();
-  const registeredFractionNum =
-    registeredFractionType === 'na' || !resident.fraction_number
-      ? null
-      : String(resident.fraction_number).trim();
+  const rawStoredFraction = resident.fraction_number ? String(resident.fraction_number).trim() : '';
+  const hasStoredFraction =
+    rawStoredFraction !== '' && !['N/A', 'NA', 'NO APLICA', '-'].includes(rawStoredFraction.toUpperCase());
 
-  if (
-    requestedFractionNumber !== undefined &&
-    requestedFractionNumber !== null &&
-    String(requestedFractionNumber).trim() !== '' &&
-    String(requestedFractionNumber).trim() !== (registeredFractionNum || '')
-  ) {
-    return {
-      error: 'Solo podés solicitar visitas o emitir pases para tu Manzana/Fracción registrada.',
-    };
+  const registeredFractionNum = hasStoredFraction ? rawStoredFraction : null;
+
+  const fractionDisplay = !registeredFractionNum
+    ? 'N/A'
+    : registeredFractionType === 'fraccion' && /^\d+$/.test(registeredFractionNum)
+    ? `Fracción ${registeredFractionNum}`
+    : registeredFractionType === 'manzana' && /^\d+$/.test(registeredFractionNum)
+    ? `Manzana ${registeredFractionNum}`
+    : registeredFractionNum;
+
+  const cleanRequestedFraction =
+    requestedFractionNumber !== undefined && requestedFractionNumber !== null
+      ? String(requestedFractionNumber).trim()
+      : '';
+
+  if (cleanRequestedFraction !== '' && !['N/A', 'NA'].includes(cleanRequestedFraction.toUpperCase())) {
+    const allowedMatches = [registeredFractionNum, fractionDisplay]
+      .filter(Boolean)
+      .map((v) => v.toLowerCase());
+    if (!allowedMatches.includes(cleanRequestedFraction.toLowerCase())) {
+      return {
+        error: 'Solo podés solicitar visitas o emitir pases para tu Manzana/Fracción registrada.',
+      };
+    }
   }
-
-  const fractionDisplay =
-    registeredFractionType === 'na' || !registeredFractionNum
-      ? 'N/A'
-      : `${registeredFractionType === 'fraccion' ? 'Fracción' : 'Manzana'} ${registeredFractionNum}`;
 
   return {
     fractionType: registeredFractionType,
@@ -418,7 +519,11 @@ const createVisitCoordination = async (req, res) => {
     }
 
     const providerCheck = await db.query(
-      'SELECT id, country_id FROM providers WHERE id = $1 LIMIT 1',
+      `SELECT p.id, u.country_id
+       FROM providers p
+       LEFT JOIN users u ON u.id = p.user_id
+       WHERE p.id = $1
+       LIMIT 1`,
       [Number(provider_id)]
     );
 
@@ -758,7 +863,11 @@ const createPass = async (req, res) => {
     }
 
     const providerCheck = await db.query(
-      'SELECT id, country_id FROM providers WHERE id = $1 LIMIT 1',
+      `SELECT p.id, u.country_id
+       FROM providers p
+       LEFT JOIN users u ON u.id = p.user_id
+       WHERE p.id = $1
+       LIMIT 1`,
       [Number(provider_id)]
     );
 
@@ -1110,20 +1219,36 @@ const cancelPass = async (req, res) => {
  * POST /api/v1/passes/verify
  */
 const verifyPassByQR = async (req, res) => {
+  const integrationLabel = `Consola Garita (${req.user?.role || 'security'})`;
+  const { qr_token } = req.body || {};
+
   try {
     await expireOverduePasses();
-    const { qr_token } = req.body;
 
     if (!qr_token || !String(qr_token).trim()) {
+      const msg = 'Debe proporcionar el token QR para validar el acceso.';
+      await recordGateAccessLog({
+        qrToken: qr_token,
+        countryId: req.user?.countryId || null,
+        integrationLabel,
+        authorized: false,
+        reasonCode: 'MISSING_QR_TOKEN',
+        message: msg,
+        httpStatus: 400,
+      });
       return res.status(400).json({
         authorized: false,
-        error: 'Debe proporcionar el token QR para validar el acceso.',
+        code: 'MISSING_QR_TOKEN',
+        error: msg,
+        message: msg,
       });
     }
 
     const query = `
       SELECT
         ap.id AS pass_id,
+        ap.country_id,
+        ap.provider_id,
         ap.status AS pass_status,
         ap.start_time,
         ap.end_time,
@@ -1156,25 +1281,87 @@ const verifyPassByQR = async (req, res) => {
     const result = await db.query(query, [String(qr_token).trim()]);
 
     if (result.rows.length === 0) {
+      const msg = 'Pase QR inválido o inexistente.';
+      await recordGateAccessLog({
+        qrToken: qr_token,
+        countryId: req.user?.countryId || null,
+        integrationLabel,
+        authorized: false,
+        reasonCode: 'PASS_NOT_FOUND',
+        message: msg,
+        httpStatus: 404,
+      });
       return res.status(404).json({
         authorized: false,
-        error: 'Pase QR inválido o inexistente.',
+        code: 'PASS_NOT_FOUND',
+        error: msg,
+        message: msg,
       });
     }
 
     const passInfo = result.rows[0];
 
     if (passInfo.compliance_status !== 'approved') {
+      const msg = `El prestador no posee compliance aprobado (estado: ${passInfo.compliance_status}).`;
+      await recordGateAccessLog({
+        qrToken: qr_token,
+        passId: passInfo.pass_id,
+        countryId: passInfo.country_id,
+        integrationLabel,
+        authorized: false,
+        reasonCode: 'COMPLIANCE_NOT_APPROVED',
+        message: msg,
+        httpStatus: 403,
+      });
       return res.status(403).json({
         authorized: false,
-        error: `El prestador no posee compliance aprobado (estado: ${passInfo.compliance_status}).`,
+        code: 'COMPLIANCE_NOT_APPROVED',
+        error: msg,
+        message: msg,
+      });
+    }
+
+    const activeSuspension = await findActiveLocalSuspension(
+      passInfo.country_id || req.user?.countryId,
+      passInfo.provider_id
+    );
+    if (activeSuspension) {
+      const msg = `Ingreso bloqueado por suspensión operativa local en la comunidad: ${activeSuspension.reason}`;
+      await recordGateAccessLog({
+        qrToken: qr_token,
+        passId: passInfo.pass_id,
+        countryId: passInfo.country_id || req.user?.countryId || null,
+        integrationLabel,
+        authorized: false,
+        reasonCode: 'LOCAL_SUSPENSION_ACTIVE',
+        message: msg,
+        httpStatus: 403,
+      });
+      return res.status(403).json({
+        authorized: false,
+        code: 'LOCAL_SUSPENSION_ACTIVE',
+        error: msg,
+        message: msg,
       });
     }
 
     if (passInfo.pass_status !== 'pending') {
+      const msg = `El pase se encuentra en estado ${passInfo.pass_status}.`;
+      await recordGateAccessLog({
+        qrToken: qr_token,
+        passId: passInfo.pass_id,
+        countryId: passInfo.country_id,
+        integrationLabel,
+        authorized: false,
+        reasonCode: 'PASS_NOT_ELIGIBLE',
+        message: msg,
+        httpStatus: 400,
+      });
       return res.status(400).json({
         authorized: false,
-        error: `El pase se encuentra en estado ${passInfo.pass_status}.`,
+        code: 'PASS_NOT_ELIGIBLE',
+        error: msg,
+        message: msg,
       });
     }
 
@@ -1183,15 +1370,41 @@ const verifyPassByQR = async (req, res) => {
     const nowMs = Number(passInfo.now_utc_ms);
 
     if (nowMs < startMs || nowMs > endMs) {
+      const msg = 'El pase se encuentra fuera de la franja horaria autorizada.';
+      await recordGateAccessLog({
+        qrToken: qr_token,
+        passId: passInfo.pass_id,
+        countryId: passInfo.country_id,
+        integrationLabel,
+        authorized: false,
+        reasonCode: 'OUT_OF_TIME_WINDOW',
+        message: msg,
+        httpStatus: 400,
+      });
       return res.status(400).json({
         authorized: false,
-        error: 'El pase se encuentra fuera de la franja horaria autorizada.',
+        code: 'OUT_OF_TIME_WINDOW',
+        error: msg,
+        message: msg,
       });
     }
 
+    const grantedMsg = 'Acceso autorizado.';
+    await recordGateAccessLog({
+      qrToken: qr_token,
+      passId: passInfo.pass_id,
+      countryId: passInfo.country_id,
+      integrationLabel,
+      authorized: true,
+      reasonCode: 'ACCESS_GRANTED',
+      message: grantedMsg,
+      httpStatus: 200,
+    });
+
     return res.status(200).json({
       authorized: true,
-      message: 'Acceso autorizado.',
+      code: 'ACCESS_GRANTED',
+      message: grantedMsg,
       details: {
         pass_id: passInfo.pass_id,
         provider_name: `${passInfo.provider_first_name} ${passInfo.provider_last_name}`,
@@ -1218,6 +1431,7 @@ const verifyPassByQR = async (req, res) => {
     console.error('Error al validar pase en garita:', error);
     return res.status(500).json({
       authorized: false,
+      code: 'INTERNAL_SERVER_ERROR',
       error: 'Error interno del servidor al validar el acceso.',
     });
   }

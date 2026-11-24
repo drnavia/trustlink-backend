@@ -19,7 +19,7 @@ const router = Router();
 router.get('/contracts', verifyToken, verifyRole(['owner', 'family', 'provider', 'superadmin']), getContractsForReviews);
 
 // Residente califica al prestador (y recalcula rating_avg en providers)
-router.post('/provider', verifyToken, verifyRole(['owner', 'family']), createProviderReview);
+router.post('/provider', verifyToken, verifyRole(['owner', 'family', 'superadmin']), createProviderReview);
 
 // Prestador califica al residente/propietario
 router.post('/owner', verifyToken, verifyRole(['provider']), createOwnerReview);

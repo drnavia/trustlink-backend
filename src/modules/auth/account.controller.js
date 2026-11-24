@@ -7,6 +7,7 @@
  */
 
 const db = require('../../config/db');
+const { ensureEvolutionSchema } = require('../../config/ensureEvolutionSchema');
 
 /**
  * Normaliza y valida la ubicación residencial del usuario.
@@ -75,6 +76,7 @@ function normalizeLocationInput({ fractionType, fractionNumber, lotNumber }, req
  */
 async function getMyAccount(req, res) {
   try {
+    await ensureEvolutionSchema();
     const userId = req.user?.id || req.user?.userId;
     if (!userId) {
       return res.status(401).json({ error: 'Usuario no autenticado.' });
@@ -127,6 +129,7 @@ async function getMyAccount(req, res) {
  */
 async function updateMyProfile(req, res) {
   try {
+    await ensureEvolutionSchema();
     const userId = req.user?.id || req.user?.userId;
     if (!userId) {
       return res.status(401).json({ error: 'Usuario no autenticado.' });
@@ -246,6 +249,7 @@ async function updateMyProfile(req, res) {
  */
 async function updatePrimaryPortal(req, res) {
   try {
+    await ensureEvolutionSchema();
     const userId = req.user?.id || req.user?.userId;
     if (!userId) {
       return res.status(401).json({ error: 'Usuario no autenticado.' });

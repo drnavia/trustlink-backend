@@ -13,10 +13,12 @@ const authRoutes = require('./modules/auth/auth.routes');
 const passesRoutes = require('./modules/passes/passes.routes');
 const providersRoutes = require('./modules/providers/providers.routes');
 const paymentsRoutes = require('./modules/payments/payments.routes');
+const contractsRoutes = require('./modules/payments/contracts.routes');
 const externalRoutes = require('./modules/external/external.routes');
 const reviewsRoutes = require('./modules/reviews/reviews.routes');
 const brandingRoutes = require('./modules/branding/branding.routes');
 const accountRoutes = require('./modules/auth/account.routes');
+const { ensureEvolutionSchema } = require('./config/ensureEvolutionSchema');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -52,6 +54,7 @@ app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/passes', passesRoutes);
 app.use('/api/v1/providers', providersRoutes);
 app.use('/api/v1/payments', paymentsRoutes);
+app.use('/api/v1/contracts', contractsRoutes);
 app.use('/api/v1/external', externalRoutes);
 app.use('/api/v1/reviews', reviewsRoutes);
 app.use('/api/v1/branding', brandingRoutes);
@@ -74,4 +77,7 @@ app.get('/health', (req, res) => {
 // INICIO DEL SERVIDOR
 app.listen(PORT, () => {
   console.log(`🚀 Servidor modular de TrustLink corriendo en el puerto ${PORT}`);
+  ensureEvolutionSchema().catch((err) => {
+    console.warn('⚠️ Aviso al inicializar esquema evolutivo en arranque:', err.message);
+  });
 });

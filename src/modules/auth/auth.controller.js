@@ -6,40 +6,112 @@
 const db = require('../../config/db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const {
+  ensureEvolutionSchema,
+  normalizeAreaType,
+  getDefaultPrimaryPortal,
+} = require('../../config/ensureEvolutionSchema');
+
+const PUBLIC_ALLOWED_ROLES = ['owner', 'family', 'provider', 'security'];
+const PRIVILEGED_ALLOWED_ROLES = ['admin', 'superadmin', 'security'];
 
 const register = async (req, res) => {
   try {
-    const { country_id, role, first_name, last_name, dni, email, password, phone, fraction_number, lot_number, driver_license_url } = req.body;
+    await ensureEvolutionSchema();
 
-    if (!role || !first_name || !last_name || !dni || !email || !password) {
-      return res.status(400).json({ error: 'Faltan campos obligatorios para el registro.' });
-    }
-
-    const userExists = await db.query('SELECT id FROM users WHERE email = $1 OR dni = $2', [email, dni]);
-    if (userExists.rows.length > 0) {
-      return res.status(400).json({ error: 'Ya existe un usuario registrado con ese correo electrónico o DNI.' });
-    }
-
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(password, salt);
-
-    const query = `
-      INSERT INTO users (country_id, role, first_name, last_name, dni, email, password_hash, phone, fraction_number, lot_number, driver_license_url)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-      RETURNING id, country_id, role, first_name, last_name, dni, email, phone, is_active, created_at;
-    `;
-    const values = [
-      country_id || null,
+    const {
+      country_id,
       role,
       first_name,
       last_name,
       dni,
       email,
+      password,
+      phone,
+      fraction_type,
+      fraction_number,
+      fraction,
+      lot_number,
+      driver_license_url,
+    } = req.body;
+
+    if (!role || !first_name || !last_name || !dni || !email || !password) {
+      return res.status(400).json({ error: 'Faltan campos obligatorios para el registro.' });
+    }
+
+    const normalizedRole = String(role).trim().toLowerCase();
+    if (!PUBLIC_ALLOWED_ROLES.includes(normalizedRole)) {
+      return res.status(403).json({
+        error: 'El rol solicitado no está habilitado para registro público.',
+      });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const cleanDni = String(dni).trim();
+
+    const userExists = await db.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) OR dni = $2', [
+      cleanEmail,
+      cleanDni,
+    ]);
+    if (userExists.rows.length > 0) {
+      return res.status(400).json({ error: 'Ya existe un usuario registrado con ese correo electrónico o DNI.' });
+    }
+
+    const resolvedFractionNumber =
+      fraction_number !== undefined && fraction_number !== null && String(fraction_number).trim() !== ''
+        ? String(fraction_number).trim()
+        : fraction !== undefined && fraction !== null && String(fraction).trim() !== ''
+        ? String(fraction).trim()
+        : null;
+
+    const resolvedFractionType = fraction_type
+      ? normalizeAreaType(fraction_type)
+      : resolvedFractionNumber
+      ? /^mz|^manzana/i.test(resolvedFractionNumber)
+        ? 'manzana'
+        : 'fraccion'
+      : 'na';
+
+    const resolvedLotNumber =
+      lot_number !== undefined && lot_number !== null && String(lot_number).trim() !== ''
+        ? String(lot_number).trim()
+        : null;
+
+    const primaryPortal = getDefaultPrimaryPortal(normalizedRole);
+    const canUseResident = ['owner', 'family', 'resident'].includes(normalizedRole);
+    const canUseProvider = normalizedRole === 'provider';
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+
+    const query = `
+      INSERT INTO users (
+        country_id, role, first_name, last_name, dni, email, password_hash, phone,
+        fraction_type, fraction_number, lot_number, driver_license_url,
+        primary_portal, can_use_resident, can_use_provider
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      RETURNING id, country_id, role, first_name, last_name, dni, email, phone,
+                fraction_type, fraction_number, lot_number,
+                primary_portal, can_use_resident, can_use_provider,
+                is_active, created_at;
+    `;
+    const values = [
+      country_id || null,
+      normalizedRole,
+      String(first_name).trim(),
+      String(last_name).trim(),
+      cleanDni,
+      cleanEmail,
       passwordHash,
-      phone || null,
-      fraction_number || null,
-      lot_number || null,
-      driver_license_url || null
+      phone ? String(phone).trim() : null,
+      resolvedFractionType,
+      resolvedFractionNumber,
+      resolvedLotNumber,
+      driver_license_url || null,
+      primaryPortal,
+      canUseResident,
+      canUseProvider,
     ];
 
     const newUser = await db.query(query, values);
@@ -54,11 +126,75 @@ const register = async (req, res) => {
   }
 };
 
+const createPrivilegedUser = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+
+    const { country_id, role, first_name, last_name, dni, email, password, phone } = req.body;
+
+    if (!role || !first_name || !last_name || !dni || !email || !password) {
+      return res.status(400).json({ error: 'Faltan campos obligatorios para crear la cuenta privilegiada.' });
+    }
+
+    const normalizedRole = String(role).trim().toLowerCase();
+    if (!PRIVILEGED_ALLOWED_ROLES.includes(normalizedRole)) {
+      return res.status(400).json({ error: 'Rol privilegiado inválido (admin, superadmin o security).' });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const cleanDni = String(dni).trim();
+
+    const userExists = await db.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) OR dni = $2', [
+      cleanEmail,
+      cleanDni,
+    ]);
+    if (userExists.rows.length > 0) {
+      return res.status(400).json({ error: 'Ya existe un usuario registrado con ese correo electrónico o DNI.' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+
+    const isSuper = normalizedRole === 'superadmin';
+    const result = await db.query(
+      `INSERT INTO users (
+         country_id, role, first_name, last_name, dni, email, password_hash, phone,
+         primary_portal, can_use_resident, can_use_provider
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'resident', $9, $10)
+       RETURNING id, country_id, role, first_name, last_name, dni, email, phone, is_active, created_at;`,
+      [
+        isSuper ? null : country_id || null,
+        normalizedRole,
+        String(first_name).trim(),
+        String(last_name).trim(),
+        cleanDni,
+        cleanEmail,
+        passwordHash,
+        phone ? String(phone).trim() : null,
+        isSuper,
+        isSuper,
+      ]
+    );
+
+    return res.status(201).json({
+      message: 'Cuenta privilegiada creada correctamente.',
+      user: result.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al crear cuenta privilegiada:', error);
+    return res.status(500).json({ error: 'Error interno del servidor al crear la cuenta privilegiada.' });
+  }
+};
+
 const login = async (req, res) => {
   try {
+    await ensureEvolutionSchema();
     const { email, password } = req.body;
 
-    const result = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+    const result = await db.query('SELECT * FROM users WHERE LOWER(email) = LOWER($1)', [
+      String(email || '').trim(),
+    ]);
     if (result.rows.length === 0) {
       return res.status(401).json({ error: 'Credenciales inválidas.' });
     }
@@ -90,8 +226,15 @@ const login = async (req, res) => {
         id: user.id,
         first_name: user.first_name,
         last_name: user.last_name,
+        email: user.email,
         role: user.role,
-        country_id: user.country_id
+        country_id: user.country_id,
+        fraction_type: user.fraction_type || 'na',
+        fraction_number: user.fraction_number || null,
+        lot_number: user.lot_number || null,
+        primary_portal: user.primary_portal || getDefaultPrimaryPortal(user.role),
+        can_use_resident: Boolean(user.can_use_resident),
+        can_use_provider: Boolean(user.can_use_provider),
       }
     });
   } catch (error) {
@@ -167,6 +310,7 @@ const updatePrivilegedUser = async (req, res) => {
 module.exports = {
   register,
   login,
+  createPrivilegedUser,
   getPrivilegedUsers,
   updatePrivilegedUser
 };

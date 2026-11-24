@@ -30,16 +30,16 @@ router.get('/schedule/provider', verifyToken, verifyRole(['provider', 'superadmi
 router.post('/schedule/blocks', verifyToken, verifyRole(['provider', 'superadmin']), createScheduleBlock);
 router.delete('/schedule/blocks/:blockId', verifyToken, verifyRole(['provider', 'superadmin']), deleteScheduleBlock);
 
-router.post('/visit-requests', verifyToken, verifyRole(['owner', 'family']), createVisitCoordination);
-router.get('/visit-requests/my', verifyToken, verifyRole(['owner', 'family']), listMyVisitRequests);
+router.post('/visit-requests', verifyToken, verifyRole(['owner', 'family', 'superadmin']), createVisitCoordination);
+router.get('/visit-requests/my', verifyToken, verifyRole(['owner', 'family', 'superadmin']), listMyVisitRequests);
 router.get('/visit-requests/provider', verifyToken, verifyRole(['provider', 'superadmin']), listProviderVisitRequests);
 router.post('/visit-requests/:id/messages', verifyToken, verifyRole(['owner', 'family', 'provider', 'admin', 'superadmin']), addVisitRequestMessage);
 router.patch('/visit-requests/:id/respond', verifyToken, verifyRole(['provider', 'superadmin']), respondVisitRequest);
 
-router.post('/create', verifyToken, verifyRole(['owner', 'family']), createPass);
-router.get('/my', verifyToken, verifyRole(['owner', 'family']), getMyPasses);
+router.post('/create', verifyToken, verifyRole(['owner', 'family', 'superadmin']), createPass);
+router.get('/my', verifyToken, verifyRole(['owner', 'family', 'superadmin']), getMyPasses);
 router.get('/provider', verifyToken, verifyRole(['provider', 'superadmin']), listProviderPasses);
-router.patch('/:id', verifyToken, verifyRole(['owner', 'family']), updatePass);
+router.patch('/:id', verifyToken, verifyRole(['owner', 'family', 'superadmin']), updatePass);
 router.patch('/:id/cancel', verifyToken, verifyRole(['owner', 'family', 'admin', 'superadmin']), cancelPass);
 router.post('/verify', verifyToken, verifyRole(['security', 'admin', 'superadmin']), verifyPassByQR);
 
