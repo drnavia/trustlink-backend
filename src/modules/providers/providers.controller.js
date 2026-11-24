@@ -9,6 +9,7 @@
  */
 
 const db = require('../../config/db');
+const { ensureEvolutionSchema } = require('../../config/ensureEvolutionSchema');
 
 /**
  * Asegura la existencia de la tabla provider_document_versions de forma idempotente
@@ -810,6 +811,7 @@ const updateComplianceStatus = async (req, res) => {
  */
 const listVerifiedProviders = async (req, res) => {
   try {
+    await ensureEvolutionSchema();
     await ensureVehicleInsuranceColumns();
     await ensureProviderEmployeesColumns();
 
@@ -833,6 +835,8 @@ const listVerifiedProviders = async (req, res) => {
         FROM providers p
         JOIN users u ON p.user_id = u.id
         WHERE p.status = 'approved'::provider_status
+          AND COALESCE(u.is_active, TRUE) = TRUE
+          AND COALESCE(u.can_use_provider, FALSE) = TRUE
       )
       SELECT
         (ARRAY_AGG(ap.provider_id ORDER BY ap.ordered_id ASC))[1] AS provider_id,

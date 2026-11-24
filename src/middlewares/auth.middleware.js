@@ -44,9 +44,15 @@ const verifyRole = (allowedRoles) => {
   };
 };
 
+const PRIVILEGED_ROLES = new Set(['superadmin', 'admin', 'security']);
+
 /**
- * Permite el acceso si el rol base está en `allowedRoles` O si el usuario tiene habilitada
- * la capacidad de portal correspondiente (`can_use_resident` o `can_use_provider`) en PostgreSQL.
+ * Permite el acceso si:
+ * - El usuario tiene un rol privilegiado autorizado en `allowedRoles` (ej. superadmin/admin/security), O
+ * - Es un usuario estándar (owner/family/resident/provider) cuya cuenta activa tiene habilitada
+ *   en PostgreSQL la capacidad del portal correspondiente (`can_use_resident` o `can_use_provider`).
+ * De este modo, si un prestador desactiva el Portal Prestador para ser solo residente (o viceversa),
+ * pierde acceso de inmediato a los endpoints del portal desactivado.
  * @param {Array<string>} allowedRoles
  * @param {'resident'|'provider'} portal
  */
@@ -56,7 +62,8 @@ const verifyRoleOrPortal = (allowedRoles, portal) => {
       return res.status(401).json({ error: 'Usuario no autenticado.' });
     }
 
-    if (allowedRoles.includes(req.user.role)) {
+    const tokenRole = String(req.user.role || '').toLowerCase();
+    if (PRIVILEGED_ROLES.has(tokenRole) && allowedRoles.includes(tokenRole)) {
       return next();
     }
 
@@ -71,11 +78,19 @@ const verifyRoleOrPortal = (allowedRoles, portal) => {
       await ensureEvolutionSchema();
       const col = portal === 'provider' ? 'can_use_provider' : 'can_use_resident';
       const result = await db.query(
-        `SELECT ${col} AS allowed FROM users WHERE id = $1 AND is_active = TRUE LIMIT 1`,
+        `SELECT role, ${col} AS allowed FROM users WHERE id = $1 AND is_active = TRUE LIMIT 1`,
         [userId]
       );
 
-      if (result.rows[0]?.allowed) {
+      const row = result.rows[0];
+      if (!row) {
+        return res.status(403).json({
+          error: 'Cuenta inactiva o inexistente.',
+        });
+      }
+
+      const dbRole = String(row.role || '').toLowerCase();
+      if ((PRIVILEGED_ROLES.has(dbRole) && allowedRoles.includes(dbRole)) || row.allowed) {
         return next();
       }
     } catch (err) {

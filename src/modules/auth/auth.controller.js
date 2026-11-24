@@ -117,9 +117,9 @@ const register = async (req, res) => {
       INSERT INTO users (
         country_id, role, first_name, last_name, dni, email, password_hash, phone,
         fraction_type, fraction_number, lot_number, driver_license_url,
-        primary_portal, can_use_resident, can_use_provider
+        primary_portal, can_use_resident, can_use_provider, portals_configured
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE)
       RETURNING id, country_id, role, first_name, last_name, dni, email, phone,
                 fraction_type, fraction_number, lot_number,
                 primary_portal, can_use_resident, can_use_provider,
@@ -188,9 +188,9 @@ const createPrivilegedUser = async (req, res) => {
     const result = await db.query(
       `INSERT INTO users (
          country_id, role, first_name, last_name, dni, email, password_hash, phone,
-         primary_portal, can_use_resident, can_use_provider
+         primary_portal, can_use_resident, can_use_provider, portals_configured
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'resident', $9, $10)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'resident', $9, $10, TRUE)
        RETURNING id, country_id, role, first_name, last_name, dni, email, phone, is_active, created_at;`,
       [
         isSuper ? null : country_id || null,

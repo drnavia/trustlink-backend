@@ -215,6 +215,37 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    id: '011_users_portals_configured_and_cleanup',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.users
+          ADD COLUMN IF NOT EXISTS portals_configured BOOLEAN NOT NULL DEFAULT FALSE;
+      `);
+      await db.query(`
+        UPDATE public.users u
+        SET
+          can_use_provider = CASE
+            WHEN LOWER(COALESCE(u.role::text, '')) IN ('provider', 'superadmin') THEN TRUE
+            ELSE COALESCE(u.can_use_provider, FALSE)
+          END,
+          can_use_resident = CASE
+            WHEN LOWER(COALESCE(u.role::text, '')) IN ('owner', 'family', 'resident', 'superadmin') THEN TRUE
+            WHEN LOWER(COALESCE(u.role::text, '')) = 'provider' THEN (
+              u.lot_number IS NOT NULL AND BTRIM(u.lot_number::text) <> ''
+            )
+            ELSE FALSE
+          END,
+          primary_portal = CASE
+            WHEN LOWER(COALESCE(u.role::text, '')) = 'provider' THEN 'provider'
+            WHEN u.primary_portal IN ('resident', 'provider') THEN u.primary_portal
+            ELSE 'resident'
+          END,
+          portals_configured = TRUE
+        WHERE COALESCE(u.portals_configured, FALSE) = FALSE;
+      `);
+    },
+  },
 ];
 
 async function runMigrations() {

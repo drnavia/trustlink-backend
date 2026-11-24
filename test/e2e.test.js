@@ -663,4 +663,85 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     await db.query('DELETE FROM access_passes WHERE id = $1', [crewPassId]);
     await req('DELETE', `/api/v1/providers/employees/${crewEmpId}`, undefined, provToken);
   });
+
+  it('permite a un prestador pasar a Solo Residente (ocultándose del directorio y bloqueando API prestador) y volver a activarse', async () => {
+    // 1. El prestador (que ya activó Residente en test anterior con Lote 45) desactiva Portal Prestador
+    const toOnlyResident = await req(
+      'PATCH',
+      '/api/v1/account/profile',
+      {
+        activate_resident_portal: true,
+        activate_provider_portal: false,
+        fraction_type: 'manzana',
+        fraction_number: '2',
+        lot_number: '45',
+      },
+      provToken
+    );
+    assert.equal(toOnlyResident.status, 200);
+    assert.equal(toOnlyResident.data.account.can_use_resident, true);
+    assert.equal(toOnlyResident.data.account.can_use_provider, false);
+    assert.equal(toOnlyResident.data.account.primary_portal, 'resident');
+    assert.equal(toOnlyResident.data.account.role, 'owner');
+    assert.ok(toOnlyResident.data.token, 'Debe devolver token JWT actualizado con el nuevo rol por defecto');
+
+    // 2. No permite desactivar ambos portales a la vez
+    const noneActive = await req(
+      'PATCH',
+      '/api/v1/account/profile',
+      {
+        activate_resident_portal: false,
+        activate_provider_portal: false,
+      },
+      toOnlyResident.data.token
+    );
+    assert.equal(noneActive.status, 400);
+
+    // 3. Con Portal Prestador desactivado, pierde acceso inmediato a /api/v1/providers/me (incluso con el token viejo)
+    const blockedProvOldToken = await req('GET', '/api/v1/providers/me', undefined, provToken);
+    assert.equal(blockedProvOldToken.status, 403);
+
+    // 4. Desaparece del directorio de prestadores verificados para los residentes
+    const dirHidden = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dirHidden.status, 200);
+    assert.equal(
+      dirHidden.data.providers.some((p) => Number(p.provider_id) === Number(providerId)),
+      false,
+      'Un ex-prestador con Portal Prestador desactivado no debe figurar en el directorio'
+    );
+
+    // 5. Reactiva Portal Prestador y lo vuelve a definir como principal -> reaparece con su historial intacto
+    const reactivated = await req(
+      'PATCH',
+      '/api/v1/account/profile',
+      {
+        activate_resident_portal: true,
+        activate_provider_portal: true,
+        fraction_type: 'manzana',
+        fraction_number: '2',
+        lot_number: '45',
+      },
+      toOnlyResident.data.token
+    );
+    assert.equal(reactivated.status, 200);
+    assert.equal(reactivated.data.account.can_use_provider, true);
+
+    const setProvPrimary = await req(
+      'PATCH',
+      '/api/v1/account/primary-portal',
+      { primary_portal: 'provider' },
+      reactivated.data.token
+    );
+    assert.equal(setProvPrimary.status, 200);
+    assert.equal(setProvPrimary.data.account.primary_portal, 'provider');
+    assert.equal(setProvPrimary.data.account.role, 'provider');
+
+    const dirVisibleAgain = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dirVisibleAgain.status, 200);
+    assert.equal(
+      dirVisibleAgain.data.providers.some((p) => Number(p.provider_id) === Number(providerId)),
+      true,
+      'Al reactivar Portal Prestador debe reaparecer en el directorio con su compliance intacto'
+    );
+  });
 });

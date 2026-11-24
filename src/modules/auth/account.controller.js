@@ -6,8 +6,36 @@
  * @location /trustlink-backend/src/modules/auth/account.controller.js
  */
 
+const jwt = require('jsonwebtoken');
 const db = require('../../config/db');
 const { ensureEvolutionSchema } = require('../../config/ensureEvolutionSchema');
+
+const STANDARD_USER_ROLES = new Set(['owner', 'family', 'resident', 'provider']);
+
+function signSessionToken(userRow) {
+  if (!process.env.JWT_SECRET) return null;
+  return jwt.sign(
+    {
+      userId: userRow.id,
+      countryId: userRow.country_id,
+      role: userRow.role,
+      email: userRow.email,
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '8h' }
+  );
+}
+
+function resolveSyncedRole(currentRole, nextPrimaryPortal) {
+  const normalized = String(currentRole || '').toLowerCase();
+  if (!STANDARD_USER_ROLES.has(normalized)) {
+    return currentRole; // Nunca altera roles privilegiados (admin, superadmin, security)
+  }
+  if (nextPrimaryPortal === 'provider') {
+    return 'provider';
+  }
+  return normalized === 'family' ? 'family' : 'owner';
+}
 
 /**
  * Normaliza y valida la ubicación residencial del usuario.
@@ -94,12 +122,8 @@ async function getMyAccount(req, res) {
          u.country_id,
          u.is_active,
          COALESCE(u.primary_portal, CASE WHEN LOWER(u.role::text) = 'provider' THEN 'provider' ELSE 'resident' END) AS primary_portal,
-         COALESCE(u.can_use_resident, LOWER(u.role::text) IN ('owner', 'family', 'resident', 'superadmin')) AS can_use_resident,
-         COALESCE(
-           u.can_use_provider,
-           LOWER(u.role::text) IN ('provider', 'superadmin') OR EXISTS (SELECT 1 FROM providers p WHERE p.user_id = u.id),
-           FALSE
-         ) AS can_use_provider,
+         COALESCE(u.can_use_resident, FALSE) AS can_use_resident,
+         COALESCE(u.can_use_provider, FALSE) AS can_use_provider,
          COALESCE(u.fraction_type, 'na') AS fraction_type,
          u.fraction_number,
          u.lot_number,
@@ -159,10 +183,10 @@ async function updateMyProfile(req, res) {
 
     const currentRes = await db.query(
       `SELECT
-         id, first_name, last_name, phone, country_id, role,
+         id, first_name, last_name, email, phone, country_id, role,
          COALESCE(primary_portal, CASE WHEN LOWER(role::text) = 'provider' THEN 'provider' ELSE 'resident' END) AS primary_portal,
-         COALESCE(can_use_resident, LOWER(role::text) IN ('owner', 'family', 'resident', 'superadmin')) AS can_use_resident,
-         COALESCE(can_use_provider, LOWER(role::text) IN ('provider', 'superadmin'), FALSE) AS can_use_provider,
+         COALESCE(can_use_resident, FALSE) AS can_use_resident,
+         COALESCE(can_use_provider, FALSE) AS can_use_provider,
          COALESCE(fraction_type, 'na') AS fraction_type,
          fraction_number,
          lot_number
@@ -176,6 +200,9 @@ async function updateMyProfile(req, res) {
     }
 
     const current = currentRes.rows[0];
+    const currentRoleLower = String(current.role || '').toLowerCase();
+    const isStandardUser = STANDARD_USER_ROLES.has(currentRoleLower);
+
     const cleanFirstName =
       first_name !== undefined ? String(first_name).trim() : current.first_name;
     const cleanLastName =
@@ -197,6 +224,23 @@ async function updateMyProfile(req, res) {
       activate_provider_portal !== undefined
         ? Boolean(activate_provider_portal)
         : Boolean(current.can_use_provider);
+
+    if (isStandardUser && !nextCanResident && !nextCanProvider) {
+      return res.status(400).json({
+        error: 'Tu cuenta debe mantener al menos un portal operativo habilitado (Residente o Prestador).',
+      });
+    }
+
+    let nextPrimaryPortal = String(current.primary_portal || 'resident').toLowerCase();
+    if (nextCanResident && !nextCanProvider) {
+      nextPrimaryPortal = 'resident';
+    } else if (!nextCanResident && nextCanProvider) {
+      nextPrimaryPortal = 'provider';
+    } else if (!['resident', 'provider'].includes(nextPrimaryPortal)) {
+      nextPrimaryPortal = nextCanProvider && !nextCanResident ? 'provider' : 'resident';
+    }
+
+    const nextRole = resolveSyncedRole(current.role, nextPrimaryPortal);
 
     const locValidation = normalizeLocationInput(
       {
@@ -223,8 +267,11 @@ async function updateMyProfile(req, res) {
          fraction_number = $6,
          lot_number = $7,
          can_use_resident = $8,
-         can_use_provider = $9
-       WHERE id = $10
+         can_use_provider = $9,
+         primary_portal = $10,
+         role = $11,
+         portals_configured = TRUE
+       WHERE id = $12
        RETURNING
          id, first_name, last_name, dni, email, phone, role, country_id, is_active,
          primary_portal, can_use_resident, can_use_provider,
@@ -239,6 +286,8 @@ async function updateMyProfile(req, res) {
         locValidation.lotNumber,
         nextCanResident,
         nextCanProvider,
+        nextPrimaryPortal,
+        nextRole,
         userId,
       ]
     );
@@ -252,8 +301,11 @@ async function updateMyProfile(req, res) {
       countryName = cRes.rows[0]?.name || null;
     }
 
+    const refreshedToken = signSessionToken(updatedRow);
+
     return res.json({
-      message: 'Perfil y ubicación actualizados correctamente.',
+      message: 'Perfil, rol por defecto y ubicación actualizados correctamente.',
+      ...(refreshedToken ? { token: refreshedToken } : {}),
       account: {
         ...updatedRow,
         country_name: countryName,
@@ -286,13 +338,9 @@ async function updatePrimaryPortal(req, res) {
 
     const userRes = await db.query(
       `SELECT
-         id, role, lot_number,
-         COALESCE(can_use_resident, LOWER(role::text) IN ('owner', 'family', 'resident', 'superadmin')) AS can_use_resident,
-         COALESCE(
-           can_use_provider,
-           LOWER(role::text) IN ('provider', 'superadmin') OR EXISTS (SELECT 1 FROM providers p WHERE p.user_id = users.id),
-           FALSE
-         ) AS can_use_provider
+         id, role, email, country_id, lot_number,
+         COALESCE(can_use_resident, FALSE) AS can_use_resident,
+         COALESCE(can_use_provider, FALSE) AS can_use_provider
        FROM users
        WHERE id = $1`,
       [userId]
@@ -309,22 +357,31 @@ async function updatePrimaryPortal(req, res) {
       });
     }
 
-    if (portal === 'provider' && !u.can_use_provider) {
-      // Habilita automáticamente la capacidad de prestador en su cuenta para que pueda operar en Central de Especialidades
-      await db.query(`UPDATE users SET can_use_provider = TRUE WHERE id = $1`, [userId]);
-    }
+    const nextCanProvider = portal === 'provider' ? true : Boolean(u.can_use_provider);
+    const nextRole = resolveSyncedRole(u.role, portal);
 
     const resUpdate = await db.query(
       `UPDATE users
-       SET primary_portal = $1
-       WHERE id = $2
-       RETURNING id, role, primary_portal, can_use_resident, can_use_provider, fraction_type, fraction_number, lot_number`,
-      [portal, userId]
+       SET
+         primary_portal = $1,
+         can_use_provider = $2,
+         role = $3,
+         portals_configured = TRUE
+       WHERE id = $4
+       RETURNING
+         id, first_name, last_name, dni, email, phone, role, country_id, is_active,
+         primary_portal, can_use_resident, can_use_provider,
+         fraction_type, fraction_number, lot_number`,
+      [portal, nextCanProvider, nextRole, userId]
     );
 
+    const updatedRow = resUpdate.rows[0];
+    const refreshedToken = signSessionToken(updatedRow);
+
     return res.json({
-      message: `Portal principal actualizado a ${portal === 'resident' ? 'Residente' : 'Prestador'}.`,
-      account: resUpdate.rows[0],
+      message: `Rol y portal principal actualizado a ${portal === 'resident' ? 'Residente' : 'Prestador'}.`,
+      ...(refreshedToken ? { token: refreshedToken } : {}),
+      account: updatedRow,
     });
   } catch (err) {
     console.error('[account.controller] Error en updatePrimaryPortal:', err);

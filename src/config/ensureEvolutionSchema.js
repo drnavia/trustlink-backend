@@ -61,27 +61,31 @@ async function ensureEvolutionSchema() {
       await db.query(`
         ALTER TABLE users
         ADD COLUMN IF NOT EXISTS fraction_type VARCHAR(20) NOT NULL DEFAULT 'na',
-        ADD COLUMN IF NOT EXISTS can_use_resident BOOLEAN NOT NULL DEFAULT TRUE,
+        ADD COLUMN IF NOT EXISTS can_use_resident BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS can_use_provider BOOLEAN NOT NULL DEFAULT FALSE,
-        ADD COLUMN IF NOT EXISTS primary_portal VARCHAR(20) NOT NULL DEFAULT 'resident'
+        ADD COLUMN IF NOT EXISTS primary_portal VARCHAR(20) NOT NULL DEFAULT 'resident',
+        ADD COLUMN IF NOT EXISTS portals_configured BOOLEAN NOT NULL DEFAULT FALSE
       `);
 
-      // 2. Sincronizar valores iniciales coherentes según role y tabla providers
+      // 2. Backfill único solo para cuentas legacy que aún no tienen portals_configured = TRUE.
+      // Respeta futuras ediciones manuales desde Mi Cuenta (ej. ex-prestador que pasa a ser solo residente).
       await db.query(`
         UPDATE users u
         SET
           can_use_provider = CASE
-            WHEN LOWER(COALESCE(u.role::text, '')) IN ('provider', 'superadmin')
-                 OR EXISTS (SELECT 1 FROM providers p WHERE p.user_id = u.id) THEN TRUE
+            WHEN LOWER(COALESCE(u.role::text, '')) IN ('provider', 'superadmin') THEN TRUE
             ELSE COALESCE(u.can_use_provider, FALSE)
           END,
           can_use_resident = CASE
             WHEN LOWER(COALESCE(u.role::text, '')) IN ('owner', 'family', 'resident', 'superadmin') THEN TRUE
-            ELSE COALESCE(u.can_use_resident, FALSE)
+            WHEN LOWER(COALESCE(u.role::text, '')) = 'provider' THEN (
+              u.lot_number IS NOT NULL AND BTRIM(u.lot_number::text) <> ''
+            )
+            ELSE FALSE
           END,
           primary_portal = CASE
-            WHEN u.primary_portal IN ('resident', 'provider') THEN u.primary_portal
             WHEN LOWER(COALESCE(u.role::text, '')) = 'provider' THEN 'provider'
+            WHEN u.primary_portal IN ('resident', 'provider') THEN u.primary_portal
             ELSE 'resident'
           END,
           fraction_type = CASE
@@ -93,7 +97,9 @@ async function ensureEvolutionSchema() {
                 ELSE 'fraccion'
               END
             ELSE 'na'
-          END
+          END,
+          portals_configured = TRUE
+        WHERE COALESCE(u.portals_configured, FALSE) = FALSE
       `);
 
       // 3. Asegurar tabla owner_reviews para calificación cruzada Prestador -> Residente
