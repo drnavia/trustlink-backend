@@ -13,9 +13,9 @@ API REST modular de **TrustLink** — plataforma inteligente de servicios verifi
 ## Stack Tecnológico
 
 - **Runtime:** Node.js + Express (`src/server.js`)
-- **Base de datos:** PostgreSQL (`pg`) con soporte dual local (`DB_*`) y nube (`DATABASE_URL` + SSL dinámico) y 18 migraciones idempotentes (`src/db/migrate.js`)
+- **Base de datos:** PostgreSQL (`pg`) con soporte dual local (`DB_*`) y nube (`DATABASE_URL` + SSL dinámico) y 19 migraciones idempotentes (`src/db/migrate.js`)
 - **Autenticación y Seguridad:** JWT (`jsonwebtoken`), `bcryptjs`, cabeceras HTTP de hardening y rate limiting (`src/middlewares/security.middleware.js`)
-- **Tests:** Runner nativo de Node (`node --test`) — 18 tests E2E + 15 tests unitarios (`complianceExpiry`, `mercadopagoService`, `providerReputation`)
+- **Tests:** Runner nativo de Node (`node --test`) — 19 tests E2E + 16 tests unitarios (`complianceExpiry`, `mercadopagoService`, `providerReputation`)
 
 ---
 

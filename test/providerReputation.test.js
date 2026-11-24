@@ -10,6 +10,8 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   REVIEW_MICRO_TAGS,
+  STANDARD_SPECIALTIES_CATALOG,
+  resolveSpecialtyCatalogMatch,
   normalizeReviewTags,
   normalizeCommercialProfileInput,
   computeResponseTimeStats,
@@ -140,5 +142,17 @@ describe('providerReputation helper', () => {
     assert.equal(stats.answered_count, 2);
     assert.equal(stats.avg_response_minutes, 30);
     assert.equal(stats.response_label, 'Responde en ~30 min');
+  });
+
+  // Caso 7: Resolución de catálogo estándar oficial vs especialidad personalizada
+  it('identifica rubros del catálogo estándar sin importar tildes/mayúsculas y detecta personalizados', () => {
+    assert.ok(STANDARD_SPECIALTIES_CATALOG.length >= 15);
+    const std = resolveSpecialtyCatalogMatch('  climatizacion ');
+    assert.equal(std.isStandard, true);
+    assert.equal(std.canonicalSpecialty, 'Climatización');
+
+    const custom = resolveSpecialtyCatalogMatch('Instalador de Domótica KNX');
+    assert.equal(custom.isStandard, false);
+    assert.equal(custom.canonicalSpecialty, 'Instalador de Domótica KNX');
   });
 });

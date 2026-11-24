@@ -1600,4 +1600,73 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(meRes.data.commercial_profile.accepts_emergencies, true);
     assert.ok(Array.isArray(meRes.data.public_questions) && meRes.data.public_questions.length >= 1);
   });
+
+  // =========================================================================
+  // FASE 10: Fase 5.3 — Catálogo Estándar Auto-Aprobado vs. Especialidad Personalizada Moderada + Compliance por Persona
+  // =========================================================================
+  it('auto-aprueba especialidades del catálogo estándar para prestador verificado y exige aprobación Ops para especialidades personalizadas (Fase 5.3)', async () => {
+    const provAccount = await req('GET', '/api/v1/account/me', undefined, provToken);
+    assert.equal(provAccount.status, 200);
+    const provUserId = Number(provAccount.data.account?.id || provAccount.data.user?.id);
+
+    // 1. El prestador ya está aprobado -> agrega un rubro del catálogo estándar ("Plomero") sin documentos nuevos -> debe auto-aprobarse
+    const stdRes = await req(
+      'POST',
+      '/api/v1/providers/profile',
+      { specialty: 'Plomero' },
+      provToken
+    );
+    assert.equal(stdRes.status, 201);
+    assert.equal(stdRes.data.auto_approved, true);
+    assert.equal(stdRes.data.provider.status, 'approved');
+    assert.equal(stdRes.data.provider.is_custom_specialty, false);
+
+    // 2. El prestador propone una especialidad personalizada fuera del catálogo sin descripción -> debe rechazar 400 si marca is_custom_specialty=true
+    const badCustom = await req(
+      'POST',
+      '/api/v1/providers/profile',
+      { specialty: 'Domótica Residencial', is_custom_specialty: true, custom_specialty_description: 'abc' },
+      provToken
+    );
+    assert.equal(badCustom.status, 400);
+
+    // 3. Especialidad personalizada válida con descripción -> queda pendiente de moderación Ops y NO se auto-aprueba
+    const customRes = await req(
+      'POST',
+      '/api/v1/providers/profile',
+      {
+        specialty: 'Domótica Residencial',
+        is_custom_specialty: true,
+        custom_specialty_description: 'Instalación y programación de domótica, cortinas y riego inteligente.',
+      },
+      provToken
+    );
+    assert.equal(customRes.status, 201);
+    assert.equal(customRes.data.auto_approved, false);
+    assert.equal(customRes.data.provider.status, 'pending');
+    assert.equal(customRes.data.provider.is_custom_specialty, true);
+    assert.equal(customRes.data.provider.specialty_approval_status, 'pending');
+    const customProviderId = customRes.data.provider.id;
+
+    // 4. Compliance a nivel persona (PATCH /compliance/user) aprueba rubros estándar pero mantiene el custom en revisión puntual
+    const userApproveRes = await req(
+      'PATCH',
+      '/api/v1/providers/compliance/user',
+      { user_id: provUserId, status: 'approved' },
+      superToken
+    );
+    assert.equal(userApproveRes.status, 200);
+    assert.ok(userApproveRes.data.pending_custom_specialties >= 1);
+
+    // 5. Ops aprueba puntualmente la especialidad personalizada -> pasa a approved
+    const approveCustom = await req(
+      'PATCH',
+      '/api/v1/providers/compliance',
+      { provider_id: customProviderId, status: 'approved' },
+      superToken
+    );
+    assert.equal(approveCustom.status, 200);
+    assert.equal(approveCustom.data.provider.status, 'approved');
+    assert.equal(approveCustom.data.provider.specialty_approval_status, 'approved');
+  });
 });

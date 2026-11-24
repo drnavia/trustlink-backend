@@ -530,6 +530,24 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 019: Catálogo estándar auto-aprobado vs. especialidades personalizadas moderadas (`providers`)
+  // Agrega `is_custom_specialty`, `custom_specialty_description` y `specialty_approval_status`
+  // a `providers` para diferenciar rubros oficiales del catálogo (auto-aprobados si la persona
+  // ya pasó compliance documental) de rubros personalizados que requieren revisión puntual de Ops.
+  // ---------------------------------------------------------------------------
+  {
+    id: '019_provider_specialty_catalog_and_custom_review',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.providers
+          ADD COLUMN IF NOT EXISTS is_custom_specialty BOOLEAN NOT NULL DEFAULT FALSE,
+          ADD COLUMN IF NOT EXISTS custom_specialty_description TEXT NULL,
+          ADD COLUMN IF NOT EXISTS specialty_approval_status VARCHAR(20) NOT NULL DEFAULT 'approved';
+      `);
+    },
+  },
 ];
 
 /**

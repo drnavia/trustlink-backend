@@ -20,6 +20,8 @@ const {
   computeProviderReputation,
   normalizeCommercialProfileInput,
   computeResponseTimeStats,
+  STANDARD_SPECIALTIES_CATALOG,
+  resolveSpecialtyCatalogMatch,
   REVIEW_MICRO_TAGS,
 } = require('../../utils/providerReputation');
 
@@ -150,21 +152,29 @@ const recordDocumentVersion = async ({
 };
 
 /**
- * Registra un nuevo perfil/especialidad para el prestador autenticado en estado `'pending'`
- * y guarda las versiones documentales asociadas (antecedentes y/o seguro ART) en el historial
- * sin sobrescribir cargas anteriores.
+ * Registra un nuevo perfil/especialidad para el prestador autenticado (Fase 5.3):
+ * - Si la especialidad pertenece al catálogo estándar (`STANDARD_SPECIALTIES_CATALOG`) y la persona
+ *   ya posee compliance personal aprobado (y no está reemplazando documentos por otros sin auditar),
+ *   se hereda su documentación vigente y se auto-aprueba al instante (`status = 'approved'`).
+ * - Si la especialidad es personalizada (`is_custom_specialty = TRUE` o fuera del catálogo),
+ *   exige una breve descripción cuando viene del flujo "Otra especialidad" y queda en revisión
+ *   puntual de Operaciones (`status = 'pending'`, `specialty_approval_status = 'pending'`).
  * POST /api/v1/providers/profile
  *
- * @param {import('express').Request} req - Solicitud HTTP con usuario autenticado y datos de especialidad/documentación.
- * @param {import('express').Response} res - Respuesta HTTP con el perfil creado (201).
+ * @param {import('express').Request} req - Solicitud HTTP con especialidad, descripción opcional y documentos.
+ * @param {import('express').Response} res - Respuesta HTTP `201` con el perfil creado y `auto_approved`.
  * @returns {Promise<import('express').Response>}
  */
 const updateProviderProfile = async (req, res) => {
   try {
-    // Etapa 1: Extracción y validación de la especialidad obligatoria
+    await ensureEvolutionSchema();
+
+    // Etapa 1: Extracción y validación de especialidad (catálogo estándar vs personalizada)
     const userId = req.user.userId;
     const {
       specialty,
+      is_custom_specialty,
+      custom_specialty_description,
       criminal_record_url,
       criminal_record_from,
       criminal_record_expiry,
@@ -177,7 +187,51 @@ const updateProviderProfile = async (req, res) => {
       return res.status(400).json({ error: 'La especialidad del prestador es obligatoria.' });
     }
 
-    // Etapa 2: Inserción del nuevo perfil en `providers` con estado inicial 'pending' para auditoría Ops
+    const catalogMatch = resolveSpecialtyCatalogMatch(specialty);
+    const isCustom = Boolean(is_custom_specialty) || !catalogMatch.isStandard;
+    const cleanSpecialty = catalogMatch.canonicalSpecialty;
+    const cleanDescription =
+      custom_specialty_description !== undefined && custom_specialty_description !== null
+        ? String(custom_specialty_description).trim().slice(0, 300)
+        : null;
+
+    if (Boolean(is_custom_specialty) && (!cleanDescription || cleanDescription.length < 5)) {
+      return res.status(400).json({
+        error: 'Para proponer una especialidad personalizada debés incluir una breve descripción (mínimo 5 caracteres).',
+      });
+    }
+
+    // Etapa 2: Verificar si el prestador ya tiene compliance personal aprobado para heredar docs / auto-aprobar catálogo estándar
+    const existingApprovedRes = await db.query(
+      `SELECT
+         criminal_record_url,
+         criminal_record_expiry,
+         insurance_policy_url,
+         insurance_expiry
+       FROM providers
+       WHERE user_id = $1 AND status = 'approved'::provider_status
+       ORDER BY id DESC
+       LIMIT 1`,
+      [userId]
+    );
+    const approvedBase = existingApprovedRes.rows[0] || null;
+    const hasNewDocuments = Boolean(
+      criminal_record_url || criminal_record_expiry || insurance_policy_url || insurance_expiry
+    );
+
+    const resolvedCriminalUrl = criminal_record_url || approvedBase?.criminal_record_url || null;
+    const resolvedCriminalExpiry =
+      criminal_record_expiry || approvedBase?.criminal_record_expiry || null;
+    const resolvedInsuranceUrl = insurance_policy_url || approvedBase?.insurance_policy_url || null;
+    const resolvedInsuranceExpiry =
+      insurance_expiry || approvedBase?.insurance_expiry || null;
+
+    // Auto-aprobación: solo si es rubro del catálogo estándar, la persona ya está aprobada y no sube docs nuevos sin auditar
+    const shouldAutoApprove = !isCustom && Boolean(approvedBase) && !hasNewDocuments;
+    const initialStatus = shouldAutoApprove ? 'approved' : 'pending';
+    const specialtyApprovalStatus = isCustom ? 'pending' : 'approved';
+
+    // Etapa 3: Inserción del nuevo perfil en `providers` con trazabilidad de catálogo/moderación
     const insertQuery = `
       INSERT INTO providers (
         user_id,
@@ -186,9 +240,12 @@ const updateProviderProfile = async (req, res) => {
         criminal_record_expiry,
         insurance_policy_url,
         insurance_expiry,
+        is_custom_specialty,
+        custom_specialty_description,
+        specialty_approval_status,
         status
       )
-      VALUES ($1, $2, $3, $4::date, $5, $6::date, 'pending')
+      VALUES ($1, $2, $3, $4::date, $5, $6::date, $7, $8, $9, $10::provider_status)
       RETURNING
         id,
         user_id,
@@ -197,6 +254,9 @@ const updateProviderProfile = async (req, res) => {
         criminal_record_expiry,
         insurance_policy_url,
         insurance_expiry,
+        is_custom_specialty,
+        custom_specialty_description,
+        specialty_approval_status,
         status,
         rating_avg,
         created_at;
@@ -204,17 +264,21 @@ const updateProviderProfile = async (req, res) => {
 
     const values = [
       userId,
-      String(specialty).trim(),
-      criminal_record_url || null,
-      criminal_record_expiry || null,
-      insurance_policy_url || null,
-      insurance_expiry || null
+      cleanSpecialty,
+      resolvedCriminalUrl,
+      resolvedCriminalExpiry,
+      resolvedInsuranceUrl,
+      resolvedInsuranceExpiry,
+      isCustom,
+      isCustom ? cleanDescription : null,
+      specialtyApprovalStatus,
+      initialStatus,
     ];
 
     const providerResult = await db.query(insertQuery, values);
     const createdProvider = providerResult.rows[0];
 
-    // Etapa 3: Registro append-only de versiones documentales (antecedentes y póliza ART) si fueron informadas
+    // Etapa 4: Registro append-only de versiones documentales si fueron informadas en esta carga
     if (criminal_record_url || criminal_record_expiry) {
       await recordDocumentVersion({
         userId,
@@ -223,7 +287,7 @@ const updateProviderProfile = async (req, res) => {
         documentUrl: criminal_record_url || 'Sin URL',
         validFrom: criminal_record_from || null,
         validTo: criminal_record_expiry || null,
-        status: 'pending'
+        status: initialStatus
       });
     }
 
@@ -235,12 +299,19 @@ const updateProviderProfile = async (req, res) => {
         documentUrl: insurance_policy_url || 'Sin URL',
         validFrom: insurance_from || null,
         validTo: insurance_expiry || null,
-        status: 'pending'
+        status: initialStatus
       });
     }
 
+    const responseMessage = shouldAutoApprove
+      ? `Especialidad "${cleanSpecialty}" activada automáticamente (tu compliance personal ya está aprobado).`
+      : isCustom
+      ? `Especialidad personalizada "${cleanSpecialty}" enviada a revisión de Operaciones TrustLink.`
+      : 'Perfil de compliance registrado y enviado a revisión con éxito.';
+
     return res.status(201).json({
-      message: 'Perfil de compliance registrado y enviado a revisión con éxito.',
+      message: responseMessage,
+      auto_approved: shouldAutoApprove,
       provider: createdProvider
     });
   } catch (error) {
@@ -779,6 +850,9 @@ const getMyProviderProfile = async (req, res) => {
           insurance_expiry,
           status,
           COALESCE(is_visible_in_directory, TRUE) AS is_visible_in_directory,
+          COALESCE(is_custom_specialty, FALSE) AS is_custom_specialty,
+          custom_specialty_description,
+          COALESCE(specialty_approval_status, 'approved') AS specialty_approval_status,
           COALESCE(accepts_emergencies, FALSE) AS accepts_emergencies,
           COALESCE(quote_visit_policy, 'consultar') AS quote_visit_policy,
           COALESCE(invoice_type, 'consultar') AS invoice_type,
@@ -991,6 +1065,7 @@ const getMyProviderProfile = async (req, res) => {
       response_stats: responseStats,
       commercial_profile: commercialProfile,
       public_questions: publicQuestionsRes.rows,
+      standard_specialties_catalog: STANDARD_SPECIALTIES_CATALOG,
     });
   } catch (error) {
     console.error('Error al obtener perfil del prestador:', error);
@@ -1002,7 +1077,9 @@ const getMyProviderProfile = async (req, res) => {
  * Lista todos los prestadores registrados (incluyendo cuentas habilitadas como prestador
  * que aún no completaron perfil, etiquetadas como `'sin_perfil'`) para el panel de
  * auditoría centralizada de Operaciones TrustLink.
- * GET /api/v1/providers/ops/all
+ * Incluye indicadores de catálogo estándar vs. especialidad personalizada (`is_custom_specialty`,
+ * `custom_specialty_description`, `specialty_approval_status`).
+ * GET /api/v1/providers/all
  *
  * @param {import('express').Request} req - Solicitud HTTP de usuario Ops/Superadmin.
  * @param {import('express').Response} res - Respuesta HTTP con la nómina priorizada de prestadores.
@@ -1010,6 +1087,7 @@ const getMyProviderProfile = async (req, res) => {
  */
 const listAllProvidersForOps = async (req, res) => {
   try {
+    await ensureEvolutionSchema();
     await ensureProviderSubscriptionsTable();
 
     /*
@@ -1032,6 +1110,9 @@ const listAllProvidersForOps = async (req, res) => {
         u.dni,
         u.email,
         COALESCE(p.specialty, 'Sin especificar (Perfil Incompleto)') AS specialty,
+        COALESCE(p.is_custom_specialty, FALSE) AS is_custom_specialty,
+        p.custom_specialty_description,
+        COALESCE(p.specialty_approval_status, 'approved') AS specialty_approval_status,
         p.criminal_record_url,
         p.criminal_record_expiry,
         p.insurance_policy_url,
@@ -1076,7 +1157,11 @@ const listAllProvidersForOps = async (req, res) => {
         u.id ASC;
     `;
     const result = await db.query(query);
-    return res.status(200).json({ count: result.rows.length, providers: result.rows });
+    return res.status(200).json({
+      count: result.rows.length,
+      standard_specialties_catalog: STANDARD_SPECIALTIES_CATALOG,
+      providers: result.rows,
+    });
   } catch (error) {
     console.error('Error al listar prestadores para Ops:', error);
     return res.status(500).json({ error: 'Error interno.' });
@@ -1084,9 +1169,9 @@ const listAllProvidersForOps = async (req, res) => {
 };
 
 /**
- * Actualiza el estado global de compliance (`approved`, `rejected` o `pending`) de un prestador
- * desde Operaciones TrustLink y sincroniza ese mismo estado en todas sus versiones documentales
- * registradas en `provider_document_versions`.
+ * Actualiza el estado de compliance (`approved`, `rejected` o `pending`) de una especialidad puntual
+ * (o de una especialidad personalizada en moderación) y sincroniza `specialty_approval_status`
+ * y las versiones documentales registradas en `provider_document_versions`.
  * PATCH /api/v1/providers/compliance
  *
  * @param {import('express').Request} req - Solicitud HTTP con `provider_id` o `user_id` y el nuevo `status`.
@@ -1095,7 +1180,8 @@ const listAllProvidersForOps = async (req, res) => {
  */
 const updateComplianceStatus = async (req, res) => {
   try {
-    // Etapa 1: Asegurar tabla de historial documental y validar que el estado solicitado sea permitido
+    // Etapa 1: Asegurar esquema/tabla de historial documental y validar que el estado solicitado sea permitido
+    await ensureEvolutionSchema();
     await ensureDocumentVersionsTable();
 
     const { provider_id, user_id, status } = req.body;
@@ -1116,7 +1202,7 @@ const updateComplianceStatus = async (req, res) => {
         const newProv = await db.query(
           `
             INSERT INTO providers (user_id, specialty, status)
-            VALUES ($1, 'Servicios Generales', $2)
+            VALUES ($1, 'Mantenimiento General', $2)
             RETURNING id
           `,
           [user_id, status]
@@ -1125,15 +1211,19 @@ const updateComplianceStatus = async (req, res) => {
       }
     }
 
-    // Etapa 3: Actualizar el estado en `providers` y propagarlo a `provider_document_versions`
+    // Etapa 3: Actualizar estado y estado de moderación de especialidad en `providers`
     const updateQuery = `
       UPDATE providers
-      SET status = $1
-      WHERE id = $2
-      RETURNING id, user_id, specialty, status;
+      SET status = $1::provider_status,
+          specialty_approval_status = CASE
+            WHEN COALESCE(is_custom_specialty, FALSE) = TRUE THEN $2::varchar
+            ELSE COALESCE(specialty_approval_status, 'approved')
+          END
+      WHERE id = $3
+      RETURNING id, user_id, specialty, is_custom_specialty, specialty_approval_status, status;
     `;
 
-    const result = await db.query(updateQuery, [status, targetProviderId]);
+    const result = await db.query(updateQuery, [status, status, targetProviderId]);
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Prestador no encontrado en la base de datos.' });
     }
@@ -1155,6 +1245,100 @@ const updateComplianceStatus = async (req, res) => {
   } catch (error) {
     console.error('Error al actualizar compliance:', error);
     return res.status(500).json({ error: 'Error interno del servidor al procesar la solicitud.' });
+  }
+};
+
+/**
+ * Aprueba, rechaza o vuelve a pendiente el compliance personal consolidado de una persona (`user_id`)
+ * en una sola operación (Fase 5.3):
+ * - Al aprobar (`'approved'`): aprueba todas las especialidades del catálogo estándar (`is_custom_specialty = FALSE`)
+ *   y las personalizadas ya moderadas, dejando en revisión puntual cualquier especialidad personalizada nueva
+ *   (`is_custom_specialty = TRUE AND specialty_approval_status = 'pending'`).
+ * - Al rechazar o volver a pendiente: aplica el estado a todos los perfiles de esa persona y sincroniza
+ *   `provider_document_versions`.
+ * PATCH /api/v1/providers/compliance/user
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `{ user_id, status }`.
+ * @param {import('express').Response} res - Respuesta HTTP con el resumen de perfiles actualizados.
+ * @returns {Promise<import('express').Response>}
+ */
+const updateUserComplianceStatus = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    await ensureDocumentVersionsTable();
+
+    const targetUserId = parseInt(req.body?.user_id, 10);
+    const status = String(req.body?.status || '').trim().toLowerCase();
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: 'Debe indicar un user_id válido.' });
+    }
+    if (!['approved', 'rejected', 'pending'].includes(status)) {
+      return res.status(400).json({ error: 'Estado de compliance inválido.' });
+    }
+
+    const existingRes = await db.query(
+      `SELECT id, is_custom_specialty, COALESCE(specialty_approval_status, 'approved') AS specialty_approval_status
+       FROM providers
+       WHERE user_id = $1`,
+      [targetUserId]
+    );
+    if (existingRes.rows.length === 0) {
+      return res.status(404).json({ error: 'El usuario aún no tiene perfiles de prestador cargados.' });
+    }
+
+    let updatedRows = [];
+    if (status === 'approved') {
+      const updRes = await db.query(
+        `UPDATE providers
+         SET status = 'approved'::provider_status
+         WHERE user_id = $1
+           AND (
+             COALESCE(is_custom_specialty, FALSE) = FALSE
+             OR COALESCE(specialty_approval_status, 'approved') = 'approved'
+           )
+         RETURNING id, user_id, specialty, status`,
+        [targetUserId]
+      );
+      updatedRows = updRes.rows;
+    } else {
+      const updRes = await db.query(
+        `UPDATE providers
+         SET status = $1::provider_status
+         WHERE user_id = $2
+         RETURNING id, user_id, specialty, status`,
+        [status, targetUserId]
+      );
+      updatedRows = updRes.rows;
+    }
+
+    await db.query(
+      `UPDATE public.provider_document_versions
+       SET status = $1
+       WHERE user_id = $2`,
+      [status, targetUserId]
+    );
+
+    const pendingCustomCount = existingRes.rows.filter(
+      (r) => Boolean(r.is_custom_specialty) && r.specialty_approval_status === 'pending'
+    ).length;
+
+    return res.status(200).json({
+      message:
+        status === 'approved'
+          ? pendingCustomCount > 0
+            ? `Compliance personal aprobado (${updatedRows.length} rubro(s) estándar activados). Queda(n) ${pendingCustomCount} especialidad(es) personalizada(s) para revisión puntual.`
+            : `Compliance personal aprobado correctamente (${updatedRows.length} especialidad(es) activas).`
+          : `Compliance personal actualizado a "${status}" (${updatedRows.length} registro(s)).`,
+      user_id: targetUserId,
+      status,
+      updated_count: updatedRows.length,
+      pending_custom_specialties: pendingCustomCount,
+      providers: updatedRows,
+    });
+  } catch (error) {
+    console.error('Error al actualizar compliance personal del prestador:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar el compliance personal.' });
   }
 };
 
@@ -1267,6 +1451,7 @@ const listVerifiedProviders = async (req, res) => {
         FROM providers p
         JOIN users u ON p.user_id = u.id
         WHERE p.status = 'approved'::provider_status
+          AND COALESCE(p.specialty_approval_status, 'approved') = 'approved'
           AND COALESCE(p.is_visible_in_directory, TRUE) = TRUE
           AND COALESCE(u.is_active, TRUE) = TRUE
           AND COALESCE(u.can_use_provider, FALSE) = TRUE
@@ -2383,6 +2568,7 @@ module.exports = {
   getMyProviderProfile,
   listAllProvidersForOps,
   updateComplianceStatus,
+  updateUserComplianceStatus,
   listVerifiedProviders,
   listFavoriteProviders,
   addFavoriteProvider,

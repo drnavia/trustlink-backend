@@ -1,7 +1,7 @@
 # TrustLink — Pendientes Guardados (Backlog Diferido)
 
 > Última actualización: 2026-11-24
-> Estado base: **Fases 1–5.2 del Roadmap Técnico + 5 Mejoras Evolutivas + documentación completa de scripts + script SQL consolidado de Supabase completados y verificados.**
+> Estado base: **Fases 1–5.3 del Roadmap Técnico + 5 Mejoras Evolutivas + documentación completa de scripts + script SQL consolidado de Supabase completados y verificados.**
 
 Estos ítems quedan registrados como **pendientes diferidos** (para retomar en la validación en la nube y al avanzar hacia el lanzamiento comercial / piloto con servicios externos):
 

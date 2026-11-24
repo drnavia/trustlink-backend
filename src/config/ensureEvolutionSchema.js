@@ -242,6 +242,14 @@ async function ensureEvolutionSchema() {
         ON public.provider_public_questions (provider_user_id, created_at DESC)
       `);
 
+      // 11. Asegurar columnas de catálogo estándar vs especialidad personalizada moderada (Fase 5.3)
+      await db.query(`
+        ALTER TABLE public.providers
+        ADD COLUMN IF NOT EXISTS is_custom_specialty BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS custom_specialty_description TEXT NULL,
+        ADD COLUMN IF NOT EXISTS specialty_approval_status VARCHAR(20) NOT NULL DEFAULT 'approved'
+      `);
+
       schemaInitialized = true;
     } catch (err) {
       schemaPromise = null;

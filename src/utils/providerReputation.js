@@ -31,6 +31,66 @@ const ALLOWED_INVOICE_TYPES = ['factura_a', 'factura_c', 'ambas', 'sin_factura',
 /** Medios de pago habilitados para mostrar en la ficha comercial del prestador. */
 const ALLOWED_PAYMENT_METHODS = ['efectivo', 'transferencia', 'mercadopago', 'tarjeta'];
 
+/**
+ * Catálogo oficial normalizado de especialidades estándar de TrustLink (Fase 5.3).
+ * Si el prestador ya tiene compliance personal aprobado y elige un rubro de este catálogo,
+ * se auto-aprueba al instante sin generar cuello de botella en Operaciones.
+ */
+const STANDARD_SPECIALTIES_CATALOG = [
+  'Electricista',
+  'Plomero',
+  'Gasista',
+  'Climatización',
+  'Piletero',
+  'Jardinero / Parquero',
+  'Pintor',
+  'Albañil',
+  'Carpintero',
+  'Herrero',
+  'Cerrajero',
+  'Limpieza',
+  'Fumigación',
+  'Durlock / Yesero',
+  'Techista / Impermeabilización',
+  'Riego Automático',
+  'Mantenimiento General',
+  'Técnico en Electrodomésticos',
+];
+
+// Mapa en minúsculas sin tildes para emparejar nombres estándar ignorando variaciones tipográficas
+const STANDARD_SPECIALTY_LOOKUP = new Map(
+  STANDARD_SPECIALTIES_CATALOG.map((spec) => [
+    spec
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, ''),
+    spec,
+  ])
+);
+
+/**
+ * Determina si una especialidad ingresada pertenece al catálogo estándar oficial o si debe
+ * tratarse como especialidad personalizada sujeta a moderación de Operaciones.
+ *
+ * @param {string} rawSpecialty - Nombre del rubro enviado por el prestador.
+ * @returns {{ isStandard: boolean, canonicalSpecialty: string }} Resultado de la resolución.
+ */
+function resolveSpecialtyCatalogMatch(rawSpecialty) {
+  const trimmed = String(rawSpecialty || '').trim();
+  if (!trimmed) {
+    return { isStandard: false, canonicalSpecialty: '' };
+  }
+  const key = trimmed
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+  const canonical = STANDARD_SPECIALTY_LOOKUP.get(key);
+  if (canonical) {
+    return { isStandard: true, canonicalSpecialty: canonical };
+  }
+  return { isStandard: false, canonicalSpecialty: trimmed };
+}
+
 // Mapa auxiliar en minúsculas para normalizar variantes de capitalización o acentos básicos
 const REVIEW_TAG_LOOKUP = new Map(
   REVIEW_MICRO_TAGS.map((tag) => [
@@ -367,6 +427,8 @@ module.exports = {
   ALLOWED_QUOTE_POLICIES,
   ALLOWED_INVOICE_TYPES,
   ALLOWED_PAYMENT_METHODS,
+  STANDARD_SPECIALTIES_CATALOG,
+  resolveSpecialtyCatalogMatch,
   normalizeReviewTags,
   normalizeCommercialProfileInput,
   formatResponseTimeLabel,

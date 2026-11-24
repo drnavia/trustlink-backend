@@ -15,6 +15,7 @@ Este documento traduce las brechas identificadas entre la tesis comercial ([TRUS
 | **Evolutivas** | **P2** | Visibilidad por especialidad DB, ingresos prestador, filtros directorio, CSV y PWA | **✅ Completadas** (Migración `016`, `/contracts/provider`, `csvExport.js`, `manifest.webmanifest`) |
 | **Fase 5** | **P2** | **Marketplace & Conversión:** Termómetro/Scoring, "En tu barrio", Favoritos, Recontratar, Micro-tags, Disponible Hoy y Hogar Protegido | **✅ Completada** (Migración `017`, `providerReputation.js`, `/providers/favorites`, `HomeProtectedBadge.jsx`, E2E) |
 | **Fase 5.2** | **P2** | **Ficha Comercial & Búsqueda Inteligente:** Urgencias 24h, tiempo de respuesta, Q&A público, buscador por síntomas y filtros de reseñas | **✅ Completada** (Migración `018`, `/commercial-profile`, `/:id/questions`, `serviceSearchMatcher.js`, E2E) |
+| **Fase 5.3** | **P2** | **Compliance por Persona & Catálogo Oficial:** Catálogo estándar auto-aprobado vs. especialidad personalizada con descripción moderada por Ops | **✅ Completada** (Migración `019`, `PATCH /compliance/user`, combo oficial en `ProviderDashboard`, `AdminComplianceView` agrupado, E2E) |
 | **Externos** | **Diferido** | Credenciales MP Live/Suscripciones, Supabase Storage (PDFs) y Email transaccional (Resend/SMTP) | *Pendiente (habilitadores para primer piloto comercial con servicios externos)* |
 
 ---
@@ -134,7 +135,15 @@ Para respaldar la promesa de "garantía post-servicio y trazabilidad" frente a l
 
 ---
 
+## Fase 5.3 (P2): Compliance por Persona y Catálogo Oficial de Especialidades (Completada)
+
+- **Migración `019_provider_specialty_catalog_and_custom_review`:** agrega `is_custom_specialty`, `custom_specialty_description` y `specialty_approval_status` a `providers`.
+- **Backend:** catálogo normalizado `STANDARD_SPECIALTIES_CATALOG` (`providerReputation.js`), auto-aprobación instantánea de rubros estándar para prestadores con compliance personal vigente, moderación obligatoria con descripción para especialidades personalizadas y nuevo endpoint `PATCH /api/v1/providers/compliance/user` para aprobar/rechazar a la persona de una sola vez.
+- **Frontend:** selector de catálogo oficial + opción *"Otra especialidad (con descripción)"* en `ProviderDashboard.jsx`, y consola `AdminComplianceView.jsx` agrupada por persona (tarjetas o tabla compacta, semáforo de vigencia documental, acción única de compliance personal y bloque dedicado para moderar rubros personalizados).
+
+---
+
 ## Estado de Ejecución y Siguiente Etapa
 
-1. **Sprints 1–4 (Completados):** Fases 1, 2, 3 (modo dual), 4, 5 mejoras evolutivas, Fase 5 (Marketplace/Scoring) y Fase 5.2 (Ficha Comercial, Q&A y Buscador Inteligente), con **18/18 tests E2E**, **15/15 unitarios backend** y **6/6 unitarios frontend**.
+1. **Sprints 1–5 (Completados):** Fases 1, 2, 3 (modo dual), 4, 5 mejoras evolutivas, Fase 5, Fase 5.2 y Fase 5.3, con **19/19 tests E2E**, **16/16 unitarios backend** y **6/6 unitarios frontend**.
 2. **Siguiente Etapa (Salida Comercial — Externos):** ver checklist vivo en [PENDIENTES.md](./PENDIENTES.md) (Smoke Test en nube, credenciales reales Mercado Pago, Supabase Storage para documentos + galería *Antes y después*, y Resend/SMTP para emails transaccionales).

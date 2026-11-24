@@ -21,6 +21,7 @@ const {
   getMyProviderProfile,
   listAllProvidersForOps,
   updateComplianceStatus,
+  updateUserComplianceStatus,
   listVerifiedProviders,
   listFavoriteProviders,
   addFavoriteProvider,
@@ -77,8 +78,11 @@ router.delete('/employees/:id', verifyToken, verifyRoleOrPortal(['provider', 'su
 // Listar todos los prestadores registrados con su documentación y estados de validación
 router.get('/all', verifyToken, verifyRole(['superadmin']), listAllProvidersForOps);
 
-// Aprobar, rechazar o pasar a pendiente el estado de compliance global de un prestador
+// Aprobar, rechazar o pasar a pendiente el compliance de una especialidad puntual (o rubro personalizado)
 router.patch('/compliance', verifyToken, verifyRole(['superadmin']), updateComplianceStatus);
+
+// Aprobar o rechazar el compliance personal consolidado de un prestador (`user_id`) de una sola vez
+router.patch('/compliance/user', verifyToken, verifyRole(['superadmin']), updateUserComplianceStatus);
 
 // ============================================================================
 // 3. DIRECTORIO UNIFICADO DE PRESTADORES VERIFICADOS (Portal Residente / Admin)
