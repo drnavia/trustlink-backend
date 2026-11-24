@@ -43,6 +43,30 @@ const ensureVehicleInsuranceColumns = async () => {
 };
 
 /**
+ * Asegura que provider_employees cuente con columnas para ayudantes/cuadrilla directa.
+ */
+const ensureProviderEmployeesColumns = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS public.provider_employees (
+      id SERIAL PRIMARY KEY,
+      provider_id INTEGER REFERENCES public.providers(id) ON DELETE CASCADE,
+      employee_user_id INTEGER NULL REFERENCES public.users(id) ON DELETE CASCADE,
+      created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+    );
+  `);
+  await db.query(`
+    ALTER TABLE public.provider_employees
+    ADD COLUMN IF NOT EXISTS full_name VARCHAR(160) NULL,
+    ADD COLUMN IF NOT EXISTS dni VARCHAR(30) NULL,
+    ADD COLUMN IF NOT EXISTS phone VARCHAR(50) NULL,
+    ADD COLUMN IF NOT EXISTS role_label VARCHAR(80) DEFAULT 'Ayudante',
+    ADD COLUMN IF NOT EXISTS insurance_policy_url TEXT NULL,
+    ADD COLUMN IF NOT EXISTS insurance_expiry DATE NULL,
+    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+  `);
+};
+
+/**
  * Inserta una versión documental en el historial sin eliminar versiones previas.
  */
 const recordDocumentVersion = async ({
@@ -449,6 +473,7 @@ const getMyProviderProfile = async (req, res) => {
   try {
     await ensureDocumentVersionsTable();
     await ensureVehicleInsuranceColumns();
+    await ensureProviderEmployeesColumns();
 
     const userId = req.user.userId;
     const providersRes = await db.query(
@@ -489,35 +514,61 @@ const getMyProviderProfile = async (req, res) => {
     );
 
     let vehicles = [];
+    let employees = [];
     if (providersRes.rows.length > 0) {
       const providerIds = providersRes.rows.map((p) => p.id);
-      const vehiclesRes = await db.query(
-        `
-          SELECT
-            id,
-            provider_id,
-            vehicle_type,
-            brand,
-            model,
-            color,
-            plate,
-            vehicle_insurance_url,
-            vehicle_insurance_from,
-            vehicle_insurance_expiry,
-            created_at
-          FROM provider_vehicles
-          WHERE provider_id = ANY($1::int[])
-          ORDER BY id DESC
-        `,
-        [providerIds]
-      );
+      const [vehiclesRes, employeesRes] = await Promise.all([
+        db.query(
+          `
+            SELECT
+              id,
+              provider_id,
+              vehicle_type,
+              brand,
+              model,
+              color,
+              plate,
+              vehicle_insurance_url,
+              vehicle_insurance_from,
+              vehicle_insurance_expiry,
+              created_at
+            FROM provider_vehicles
+            WHERE provider_id = ANY($1::int[])
+            ORDER BY id DESC
+          `,
+          [providerIds]
+        ),
+        db.query(
+          `
+            SELECT
+              pe.id,
+              pe.provider_id,
+              pe.employee_user_id,
+              COALESCE(pe.full_name, TRIM(CONCAT(COALESCE(u.first_name, ''), ' ', COALESCE(u.last_name, '')))) AS full_name,
+              COALESCE(pe.dni, u.dni) AS dni,
+              COALESCE(pe.phone, u.phone) AS phone,
+              COALESCE(pe.role_label, 'Ayudante') AS role_label,
+              pe.insurance_policy_url,
+              pe.insurance_expiry,
+              pe.is_active,
+              pe.created_at
+            FROM public.provider_employees pe
+            LEFT JOIN public.users u ON u.id = pe.employee_user_id
+            WHERE pe.provider_id = ANY($1::int[])
+            ORDER BY pe.id DESC
+          `,
+          [providerIds]
+        ),
+      ]);
       vehicles = vehiclesRes.rows;
+      employees = employeesRes.rows;
     }
 
     return res.status(200).json({
       providers: providersRes.rows,
       document_history: versionsRes.rows,
-      vehicles
+      vehicles,
+      employees,
     });
   } catch (error) {
     console.error('Error al obtener perfil del prestador:', error);
@@ -889,11 +940,226 @@ const liftLocalSuspension = async (req, res) => {
   }
 };
 
+/**
+ * Lista los ayudantes / integrantes de cuadrilla del prestador autenticado.
+ * GET /api/v1/providers/employees
+ */
+const listProviderEmployees = async (req, res) => {
+  try {
+    await ensureProviderEmployeesColumns();
+    const userId = req.user.userId;
+    const provRes = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
+    const providerIds = provRes.rows.map((r) => r.id);
+    if (providerIds.length === 0) {
+      return res.status(200).json({ count: 0, employees: [] });
+    }
+
+    const empRes = await db.query(
+      `SELECT
+         pe.id,
+         pe.provider_id,
+         pe.employee_user_id,
+         COALESCE(pe.full_name, TRIM(CONCAT(COALESCE(u.first_name, ''), ' ', COALESCE(u.last_name, '')))) AS full_name,
+         COALESCE(pe.dni, u.dni) AS dni,
+         COALESCE(pe.phone, u.phone) AS phone,
+         COALESCE(pe.role_label, 'Ayudante') AS role_label,
+         pe.insurance_policy_url,
+         pe.insurance_expiry,
+         pe.is_active,
+         pe.created_at
+       FROM public.provider_employees pe
+       LEFT JOIN public.users u ON u.id = pe.employee_user_id
+       WHERE pe.provider_id = ANY($1::int[])
+       ORDER BY pe.id DESC`,
+      [providerIds]
+    );
+
+    return res.status(200).json({ count: empRes.rows.length, employees: empRes.rows });
+  } catch (error) {
+    console.error('Error al listar ayudantes del prestador:', error);
+    return res.status(500).json({ error: 'Error interno al consultar ayudantes.' });
+  }
+};
+
+/**
+ * Registra un ayudante / integrante de cuadrilla para el prestador autenticado.
+ * POST /api/v1/providers/employees
+ */
+const addProviderEmployee = async (req, res) => {
+  try {
+    await ensureProviderEmployeesColumns();
+    const userId = req.user.userId;
+    const {
+      full_name,
+      dni,
+      phone,
+      role_label,
+      insurance_policy_url,
+      insurance_expiry,
+    } = req.body || {};
+
+    if (!full_name || !String(full_name).trim() || !dni || !String(dni).trim()) {
+      return res.status(400).json({ error: 'Nombre completo y DNI del ayudante son obligatorios.' });
+    }
+
+    const provRes = await db.query(
+      'SELECT id FROM providers WHERE user_id = $1 ORDER BY id DESC LIMIT 1',
+      [userId]
+    );
+
+    let providerId;
+    if (provRes.rows.length === 0) {
+      const created = await db.query(
+        `INSERT INTO providers (user_id, specialty, status)
+         VALUES ($1, 'Servicios Generales', 'pending')
+         RETURNING id`,
+        [userId]
+      );
+      providerId = created.rows[0].id;
+    } else {
+      providerId = provRes.rows[0].id;
+    }
+
+    const insertRes = await db.query(
+      `INSERT INTO public.provider_employees (
+         provider_id, full_name, dni, phone, role_label,
+         insurance_policy_url, insurance_expiry, is_active
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7::date, TRUE)
+       RETURNING id, provider_id, full_name, dni, phone, role_label,
+                 insurance_policy_url, insurance_expiry, is_active, created_at`,
+      [
+        providerId,
+        String(full_name).trim(),
+        String(dni).trim(),
+        phone ? String(phone).trim() : null,
+        role_label ? String(role_label).trim() : 'Ayudante',
+        insurance_policy_url ? String(insurance_policy_url).trim() : null,
+        insurance_expiry || null,
+      ]
+    );
+
+    return res.status(201).json({
+      message: 'Ayudante registrado en tu cuadrilla correctamente.',
+      employee: insertRes.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al registrar ayudante:', error);
+    return res.status(500).json({ error: 'Error interno al registrar ayudante.' });
+  }
+};
+
+/**
+ * Actualiza datos o estado de un ayudante del prestador autenticado.
+ * PATCH /api/v1/providers/employees/:id
+ */
+const updateProviderEmployee = async (req, res) => {
+  try {
+    await ensureProviderEmployeesColumns();
+    const userId = req.user.userId;
+    const empId = Number(req.params.id);
+    if (!Number.isInteger(empId) || empId <= 0) {
+      return res.status(400).json({ error: 'ID de ayudante inválido.' });
+    }
+
+    const provRes = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
+    const providerIds = provRes.rows.map((r) => r.id);
+    if (providerIds.length === 0) {
+      return res.status(404).json({ error: 'Prestador no encontrado.' });
+    }
+
+    const {
+      full_name,
+      dni,
+      phone,
+      role_label,
+      insurance_policy_url,
+      insurance_expiry,
+      is_active,
+    } = req.body || {};
+
+    const updated = await db.query(
+      `UPDATE public.provider_employees
+       SET full_name = COALESCE($1, full_name),
+           dni = COALESCE($2, dni),
+           phone = COALESCE($3, phone),
+           role_label = COALESCE($4, role_label),
+           insurance_policy_url = $5,
+           insurance_expiry = $6::date,
+           is_active = COALESCE($7, is_active)
+       WHERE id = $8 AND provider_id = ANY($9::int[])
+       RETURNING id, provider_id, full_name, dni, phone, role_label,
+                 insurance_policy_url, insurance_expiry, is_active, created_at`,
+      [
+        full_name !== undefined ? String(full_name).trim() || null : null,
+        dni !== undefined ? String(dni).trim() || null : null,
+        phone !== undefined ? String(phone).trim() || null : null,
+        role_label !== undefined ? String(role_label).trim() || null : null,
+        insurance_policy_url !== undefined ? String(insurance_policy_url).trim() || null : null,
+        insurance_expiry || null,
+        typeof is_active === 'boolean' ? is_active : null,
+        empId,
+        providerIds,
+      ]
+    );
+
+    if (updated.rows.length === 0) {
+      return res.status(404).json({ error: 'Ayudante no encontrado o sin permisos.' });
+    }
+
+    return res.status(200).json({
+      message: 'Datos del ayudante actualizados correctamente.',
+      employee: updated.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al actualizar ayudante:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar ayudante.' });
+  }
+};
+
+/**
+ * Elimina un ayudante de la cuadrilla del prestador autenticado.
+ * DELETE /api/v1/providers/employees/:id
+ */
+const deleteProviderEmployee = async (req, res) => {
+  try {
+    await ensureProviderEmployeesColumns();
+    const userId = req.user.userId;
+    const empId = Number(req.params.id);
+    if (!Number.isInteger(empId) || empId <= 0) {
+      return res.status(400).json({ error: 'ID de ayudante inválido.' });
+    }
+
+    const provRes = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
+    const providerIds = provRes.rows.map((r) => r.id);
+
+    const deleted = await db.query(
+      `DELETE FROM public.provider_employees
+       WHERE id = $1 AND provider_id = ANY($2::int[])
+       RETURNING id`,
+      [empId, providerIds]
+    );
+
+    if (deleted.rows.length === 0) {
+      return res.status(404).json({ error: 'Ayudante no encontrado o sin permisos.' });
+    }
+
+    return res.status(200).json({ message: 'Ayudante eliminado de tu cuadrilla.' });
+  } catch (error) {
+    console.error('Error al eliminar ayudante:', error);
+    return res.status(500).json({ error: 'Error interno al eliminar ayudante.' });
+  }
+};
+
 module.exports = {
   updateProviderProfile,
   editProviderProfile,
   addVehicle,
   editVehicle,
+  listProviderEmployees,
+  addProviderEmployee,
+  updateProviderEmployee,
+  deleteProviderEmployee,
   getMyProviderProfile,
   listAllProvidersForOps,
   updateComplianceStatus,

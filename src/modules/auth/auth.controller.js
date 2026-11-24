@@ -3,6 +3,7 @@
  * @description Lógica de negocio para autenticación, registro, listado y actualización de cuentas privilegiadas (Ops Master).
  * @location /trustlink-backend/src/modules/auth/auth.controller.js
  */
+const crypto = require('crypto');
 const db = require('../../config/db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -14,6 +15,19 @@ const {
 
 const PUBLIC_ALLOWED_ROLES = ['owner', 'family', 'provider'];
 const PRIVILEGED_ALLOWED_ROLES = ['admin', 'superadmin', 'security'];
+
+const ensurePasswordResetTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash VARCHAR(128) NOT NULL UNIQUE,
+      expires_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+      used_at TIMESTAMP WITHOUT TIME ZONE NULL,
+      created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+    );
+  `);
+};
 
 const listPublicCountries = async (_req, res) => {
   try {
@@ -341,10 +355,118 @@ const updatePrivilegedUser = async (req, res) => {
   }
 };
 
+/**
+ * Solicita recuperación de contraseña generando un token temporal (30 min) almacenado como hash SHA-256.
+ * Nunca revela si el correo existe en la base (evita enumeración de cuentas).
+ * POST /api/v1/auth/forgot-password
+ */
+const forgotPassword = async (req, res) => {
+  try {
+    await ensurePasswordResetTable();
+    const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
+
+    if (!cleanEmail) {
+      return res.status(400).json({ error: 'Ingresá tu correo electrónico para recuperar la cuenta.' });
+    }
+
+    const genericResponse = {
+      message:
+        'Si el correo corresponde a una cuenta activa, se generó un código de recuperación válido por 30 minutos.',
+    };
+
+    const userRes = await db.query(
+      'SELECT id, email, is_active FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1',
+      [cleanEmail]
+    );
+
+    if (userRes.rows.length === 0 || !userRes.rows[0].is_active) {
+      return res.status(200).json(genericResponse);
+    }
+
+    const userId = userRes.rows[0].id;
+    const rawToken = crypto.randomBytes(24).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    await db.query(
+      'UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL',
+      [userId]
+    );
+
+    await db.query(
+      `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+       VALUES ($1, $2, NOW() + INTERVAL '30 minutes')`,
+      [userId, tokenHash]
+    );
+
+    if (process.env.NODE_ENV !== 'production') {
+      return res.status(200).json({
+        ...genericResponse,
+        dev_reset_token: rawToken,
+      });
+    }
+
+    return res.status(200).json(genericResponse);
+  } catch (error) {
+    console.error('Error en forgotPassword:', error);
+    return res.status(500).json({ error: 'Error interno al solicitar recuperación de contraseña.' });
+  }
+};
+
+/**
+ * Restablece la contraseña validando un token temporal vigente y no consumido.
+ * POST /api/v1/auth/reset-password
+ */
+const resetPassword = async (req, res) => {
+  try {
+    await ensurePasswordResetTable();
+    const rawToken = String(req.body?.token || '').trim();
+    const newPassword = String(req.body?.new_password || '');
+
+    if (!rawToken || newPassword.length < 6) {
+      return res.status(400).json({
+        error: 'Debe ingresar el código de recuperación y una nueva contraseña de al menos 6 caracteres.',
+      });
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const tokenRes = await db.query(
+      `SELECT id, user_id, expires_at, used_at
+       FROM password_reset_tokens
+       WHERE token_hash = $1
+       LIMIT 1`,
+      [tokenHash]
+    );
+
+    if (tokenRes.rows.length === 0) {
+      return res.status(400).json({ error: 'El código de recuperación es inválido o expiró.' });
+    }
+
+    const record = tokenRes.rows[0];
+    if (record.used_at || new Date(record.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ error: 'El código de recuperación ya fue utilizado o expiró.' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(newPassword, salt);
+
+    await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, record.user_id]);
+    await db.query('UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1', [record.id]);
+
+    return res.status(200).json({
+      message: 'Contraseña actualizada correctamente. Ya podés iniciar sesión.',
+    });
+  } catch (error) {
+    console.error('Error en resetPassword:', error);
+    return res.status(500).json({ error: 'Error interno al restablecer la contraseña.' });
+  }
+};
+
 module.exports = {
   listPublicCountries,
   register,
   login,
+  forgotPassword,
+  resetPassword,
   createPrivilegedUser,
   getPrivilegedUsers,
   updatePrivilegedUser

@@ -19,9 +19,12 @@ const reviewsRoutes = require('./modules/reviews/reviews.routes');
 const brandingRoutes = require('./modules/branding/branding.routes');
 const accountRoutes = require('./modules/auth/account.routes');
 const { ensureEvolutionSchema } = require('./config/ensureEvolutionSchema');
+const { securityHeaders } = require('./middlewares/security.middleware');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
 
 // CONFIGURACIÓN DE CORS (LOCAL + EXTERNO)
 // Si se define CORS_ORIGINS (ej: "https://tu-app.vercel.app,http://localhost:5173"),
@@ -46,6 +49,7 @@ const corsOptions = {
 };
 
 // MIDDLEWARES GLOBALES
+app.use(securityHeaders);
 app.use(cors(corsOptions));
 app.use(
   express.json({

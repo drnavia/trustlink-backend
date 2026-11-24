@@ -511,4 +511,69 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(dualRev.status, 200);
     assert.equal(dualRev.data.portal, 'resident');
   });
+
+  it('envía cabeceras defensivas, permite recuperación de contraseña y CRUD de ayudantes/cuadrilla', async () => {
+    const healthRes = await fetch(`${BASE}/health`);
+    assert.equal(healthRes.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(healthRes.headers.get('x-frame-options'), 'DENY');
+    assert.equal(healthRes.headers.get('x-powered-by'), null);
+
+    // Flujo forgot-password -> reset-password -> login con nueva contraseña
+    const ownerEmail = `e2e.owner.${ts}@test.local`;
+    const forgot = await req('POST', '/api/v1/auth/forgot-password', { email: ownerEmail });
+    assert.equal(forgot.status, 200);
+    assert.ok(forgot.data.dev_reset_token, 'Debe devolver dev_reset_token en entorno no productivo');
+
+    const reset = await req('POST', '/api/v1/auth/reset-password', {
+      token: forgot.data.dev_reset_token,
+      new_password: 'NewPassword456!',
+    });
+    assert.equal(reset.status, 200);
+
+    const loginNew = await req('POST', '/api/v1/auth/login', {
+      email: ownerEmail,
+      password: 'NewPassword456!',
+    });
+    assert.equal(loginNew.status, 200);
+
+    // Reutilizar el token de reset debe fallar
+    const reuseReset = await req('POST', '/api/v1/auth/reset-password', {
+      token: forgot.data.dev_reset_token,
+      new_password: 'AnotherPassword789!',
+    });
+    assert.equal(reuseReset.status, 400);
+
+    // CRUD de ayudantes / cuadrilla del prestador
+    const addEmp = await req(
+      'POST',
+      '/api/v1/providers/employees',
+      {
+        full_name: 'Pedro Ayudante',
+        dni: `77${String(ts).slice(-6)}`,
+        phone: '+5491155551234',
+        role_label: 'Oficial Eléctrico',
+        insurance_policy_url: 'https://example.com/art-pedro.pdf',
+        insurance_expiry: '2027-06-01',
+      },
+      provToken
+    );
+    assert.equal(addEmp.status, 201);
+    const empId = addEmp.data.employee.id;
+
+    const listEmp = await req('GET', '/api/v1/providers/employees', undefined, provToken);
+    assert.equal(listEmp.status, 200);
+    assert.equal(listEmp.data.employees.some((e) => e.id === empId), true);
+
+    const editEmp = await req(
+      'PATCH',
+      `/api/v1/providers/employees/${empId}`,
+      { role_label: 'Oficial Senior' },
+      provToken
+    );
+    assert.equal(editEmp.status, 200);
+    assert.equal(editEmp.data.employee.role_label, 'Oficial Senior');
+
+    const delEmp = await req('DELETE', `/api/v1/providers/employees/${empId}`, undefined, provToken);
+    assert.equal(delEmp.status, 200);
+  });
 });

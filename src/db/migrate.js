@@ -172,6 +172,40 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    id: '008_password_reset_tokens',
+    run: async () => {
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          token_hash VARCHAR(128) NOT NULL UNIQUE,
+          expires_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+          used_at TIMESTAMP WITHOUT TIME ZONE NULL,
+          created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+        );
+      `);
+    },
+  },
+  {
+    id: '009_provider_employees_crew_columns',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.provider_employees
+          ALTER COLUMN employee_user_id DROP NOT NULL;
+      `).catch(() => {});
+      await db.query(`
+        ALTER TABLE public.provider_employees
+          ADD COLUMN IF NOT EXISTS full_name VARCHAR(160) NULL,
+          ADD COLUMN IF NOT EXISTS dni VARCHAR(30) NULL,
+          ADD COLUMN IF NOT EXISTS phone VARCHAR(50) NULL,
+          ADD COLUMN IF NOT EXISTS role_label VARCHAR(80) DEFAULT 'Ayudante',
+          ADD COLUMN IF NOT EXISTS insurance_policy_url TEXT NULL,
+          ADD COLUMN IF NOT EXISTS insurance_expiry DATE NULL,
+          ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+      `);
+    },
+  },
 ];
 
 async function runMigrations() {

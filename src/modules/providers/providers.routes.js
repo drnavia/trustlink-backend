@@ -12,6 +12,10 @@ const {
   editProviderProfile,
   addVehicle,
   editVehicle,
+  listProviderEmployees,
+  addProviderEmployee,
+  updateProviderEmployee,
+  deleteProviderEmployee,
   getMyProviderProfile,
   listAllProvidersForOps,
   updateComplianceStatus,
@@ -38,6 +42,12 @@ router.post('/vehicle', verifyToken, verifyRoleOrPortal(['provider', 'superadmin
 
 // Editar un vehículo existente por ID
 router.patch('/vehicle/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), editVehicle);
+
+// Gestión de ayudantes / cuadrilla del prestador
+router.get('/employees', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), listProviderEmployees);
+router.post('/employees', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), addProviderEmployee);
+router.patch('/employees/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), updateProviderEmployee);
+router.delete('/employees/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), deleteProviderEmployee);
 
 // Listar todos los prestadores registrados para auditoría centralizada en Ops TrustLink
 router.get('/all', verifyToken, verifyRole(['superadmin']), listAllProvidersForOps);
