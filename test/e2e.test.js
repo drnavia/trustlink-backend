@@ -1133,4 +1133,98 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     // Limpieza
     await db.query('DELETE FROM service_contracts WHERE id = $1', [mpContractId]);
   });
+
+  it('registra conformidad final (con liberación escrow), genera Comprobante del Hogar y gestiona reclamos/garantía (Fase 4)', async () => {
+    // 1. Crear contrato y pagarlo en modo mock -> queda 'in_progress' con transacción 'approved'
+    const cRes = await req(
+      'POST',
+      '/api/v1/contracts',
+      {
+        provider_id: providerId,
+        description: 'Instalación bomba de pileta con garantía',
+        agreed_amount: 45000,
+      },
+      ownerToken
+    );
+    assert.equal(cRes.status, 201);
+    const f4ContractId = cRes.data.contract.id;
+
+    const payRes = await req(
+      'POST',
+      `/api/v1/contracts/${f4ContractId}/pay`,
+      {},
+      ownerToken
+    );
+    assert.equal(payRes.status, 200);
+    assert.equal(payRes.data.contract.status, 'in_progress');
+    assert.equal(payRes.data.transaction.status, 'approved');
+
+    // 2. Residente registra conformidad final -> contrato 'completed' y transacción liberada ('released')
+    const completeRes = await req(
+      'PATCH',
+      `/api/v1/contracts/${f4ContractId}/complete`,
+      { completion_notes: 'Trabajo probado y conforme.' },
+      ownerToken
+    );
+    assert.equal(completeRes.status, 200);
+    assert.equal(completeRes.data.contract.status, 'completed');
+    assert.ok(completeRes.data.contract.completed_at);
+    assert.equal(completeRes.data.released_transactions_count, 1);
+
+    // 3. Consultar Comprobante del Hogar (GET /api/v1/contracts/:id/receipt)
+    const receiptRes = await req(
+      'GET',
+      `/api/v1/contracts/${f4ContractId}/receipt`,
+      undefined,
+      ownerToken
+    );
+    assert.equal(receiptRes.status, 200);
+    assert.ok(receiptRes.data.receipt.receipt_code.startsWith('TLK-REC-'));
+    assert.equal(receiptRes.data.receipt.contract.status, 'completed');
+    assert.equal(receiptRes.data.receipt.payment.status, 'released');
+    assert.equal(receiptRes.data.receipt.payment.total_amount, 45000);
+
+    // 4. Abrir reclamo post-servicio y bloquear duplicado abierto (409)
+    const disputeRes = await req(
+      'POST',
+      `/api/v1/contracts/${f4ContractId}/dispute`,
+      {
+        reason: 'Garantía post-servicio sin respuesta',
+        details: 'La bomba pierde presión a las 48hs de instalada.',
+      },
+      ownerToken
+    );
+    assert.equal(disputeRes.status, 201);
+    const disputeId = disputeRes.data.dispute.id;
+    assert.equal(disputeRes.data.dispute.status, 'open');
+
+    const dupDispute = await req(
+      'POST',
+      `/api/v1/contracts/${f4ContractId}/dispute`,
+      { reason: 'Duplicado', details: 'Intento duplicado' },
+      ownerToken
+    );
+    assert.equal(dupDispute.status, 409);
+
+    // 5. Superadmin consulta listado de reclamos y lo resuelve con nota
+    const listDisputes = await req('GET', '/api/v1/contracts/disputes?status=open', undefined, superToken);
+    assert.equal(listDisputes.status, 200);
+    assert.equal(listDisputes.data.disputes.some((d) => d.id === disputeId), true);
+
+    const resolveRes = await req(
+      'PATCH',
+      `/api/v1/contracts/disputes/${disputeId}/resolve`,
+      {
+        status: 'resolved',
+        resolution_notes: 'El prestador realizó visita de garantía y reemplazó el sello mecánico.',
+      },
+      superToken
+    );
+    assert.equal(resolveRes.status, 200);
+    assert.equal(resolveRes.data.dispute.status, 'resolved');
+    assert.ok(resolveRes.data.dispute.resolved_at);
+
+    // Limpieza
+    await db.query('DELETE FROM service_contracts WHERE id = $1', [f4ContractId]);
+  });
 });

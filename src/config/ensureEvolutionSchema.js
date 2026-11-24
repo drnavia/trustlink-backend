@@ -155,6 +155,32 @@ async function ensureEvolutionSchema() {
         ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
       `);
 
+      // 7. Asegurar conformidad final y tabla `service_disputes` (garantía y reclamos)
+      await db.query(`
+        ALTER TABLE public.service_contracts
+        ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP WITHOUT TIME ZONE NULL,
+        ADD COLUMN IF NOT EXISTS completion_notes TEXT NULL
+      `);
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS public.service_disputes (
+          id SERIAL PRIMARY KEY,
+          contract_id INTEGER NOT NULL REFERENCES public.service_contracts(id) ON DELETE CASCADE,
+          opened_by_user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+          reason VARCHAR(120) NOT NULL,
+          details TEXT NOT NULL,
+          evidence_urls JSONB NOT NULL DEFAULT '[]'::jsonb,
+          status VARCHAR(30) NOT NULL DEFAULT 'open',
+          resolution_notes TEXT NULL,
+          resolved_by INTEGER NULL REFERENCES public.users(id) ON DELETE SET NULL,
+          created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+          resolved_at TIMESTAMP WITHOUT TIME ZONE NULL
+        )
+      `);
+      await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_service_disputes_contract
+        ON public.service_disputes (contract_id, status)
+      `);
+
       schemaInitialized = true;
     } catch (err) {
       schemaPromise = null;
