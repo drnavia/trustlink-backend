@@ -743,5 +743,22 @@ describe('TrustLink Backend — E2E Core Suite', () => {
       true,
       'Al reactivar Portal Prestador debe reaparecer en el directorio con su compliance intacto'
     );
+
+    // 6. Cambio autenticado de contraseña desde Mi Cuenta (PATCH /api/v1/account/password)
+    const badPwd = await req(
+      'PATCH',
+      '/api/v1/account/password',
+      { current_password: 'WrongPassword!', new_password: 'UpdatedPassword999!' },
+      setProvPrimary.data.token
+    );
+    assert.equal(badPwd.status, 401);
+
+    const okPwd = await req(
+      'PATCH',
+      '/api/v1/account/password',
+      { current_password: 'Password123!', new_password: 'UpdatedPassword999!' },
+      setProvPrimary.data.token
+    );
+    assert.equal(okPwd.status, 200);
   });
 });

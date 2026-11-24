@@ -11,6 +11,7 @@ const {
   getMyAccount,
   updateMyProfile,
   updatePrimaryPortal,
+  changeMyPassword,
 } = require('./account.controller');
 
 const router = Router();
@@ -18,5 +19,6 @@ const router = Router();
 router.get('/me', verifyToken, getMyAccount);
 router.patch('/profile', verifyToken, updateMyProfile);
 router.patch('/primary-portal', verifyToken, updatePrimaryPortal);
+router.patch('/password', verifyToken, changeMyPassword);
 
 module.exports = router;

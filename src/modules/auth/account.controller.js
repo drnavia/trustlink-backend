@@ -6,6 +6,7 @@
  * @location /trustlink-backend/src/modules/auth/account.controller.js
  */
 
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('../../config/db');
 const { ensureEvolutionSchema } = require('../../config/ensureEvolutionSchema');
@@ -389,9 +390,70 @@ async function updatePrimaryPortal(req, res) {
   }
 }
 
+/**
+ * Permite al usuario autenticado cambiar su contraseña validando su contraseña actual.
+ * PATCH /api/v1/account/password
+ */
+async function changeMyPassword(req, res) {
+  try {
+    const userId = req.user?.id || req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Usuario no autenticado.' });
+    }
+
+    const { current_password, new_password } = req.body || {};
+    if (!current_password || !new_password) {
+      return res.status(400).json({
+        error: 'Debe ingresar su contraseña actual y la nueva contraseña.',
+      });
+    }
+
+    if (String(new_password).length < 6) {
+      return res.status(400).json({
+        error: 'La nueva contraseña debe tener al menos 6 caracteres.',
+      });
+    }
+
+    if (String(current_password) === String(new_password)) {
+      return res.status(400).json({
+        error: 'La nueva contraseña debe ser diferente a la actual.',
+      });
+    }
+
+    const userRes = await db.query(
+      'SELECT id, password_hash FROM users WHERE id = $1 AND is_active = TRUE LIMIT 1',
+      [userId]
+    );
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Cuenta de usuario no encontrada.' });
+    }
+
+    const validCurrent = await bcrypt.compare(
+      String(current_password),
+      userRes.rows[0].password_hash
+    );
+    if (!validCurrent) {
+      return res.status(401).json({ error: 'La contraseña actual ingresada es incorrecta.' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const nextHash = await bcrypt.hash(String(new_password), salt);
+
+    await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [nextHash, userId]);
+
+    return res.status(200).json({
+      message: 'Contraseña actualizada correctamente.',
+    });
+  } catch (err) {
+    console.error('[account.controller] Error en changeMyPassword:', err);
+    return res.status(500).json({ error: 'No se pudo actualizar la contraseña.' });
+  }
+}
+
 module.exports = {
   normalizeLocationInput,
   getMyAccount,
   updateMyProfile,
   updatePrimaryPortal,
+  changeMyPassword,
 };
