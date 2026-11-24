@@ -22,6 +22,9 @@ const {
   listAllProvidersForOps,
   updateComplianceStatus,
   listVerifiedProviders,
+  listFavoriteProviders,
+  addFavoriteProvider,
+  removeFavoriteProvider,
   listLocalSuspensions,
   createLocalSuspension,
   liftLocalSuspension,
@@ -70,12 +73,32 @@ router.patch('/compliance', verifyToken, verifyRole(['superadmin']), updateCompl
 // ============================================================================
 // 3. DIRECTORIO UNIFICADO DE PRESTADORES VERIFICADOS (Portal Residente / Admin)
 // ============================================================================
-// Devuelve prestadores aprobados, visibles y sin suspensión activa en la comunidad del solicitante
+// Devuelve prestadores aprobados, visibles, con reputación, disponibilidad hoy y favoritos
 router.get(
   '/directory',
   verifyToken,
   verifyRoleOrPortal(['owner', 'family', 'admin', 'superadmin'], 'resident'),
   listVerifiedProviders
+);
+
+// Gestión de "Mis prestadores de confianza" (favoritos del residente autenticado)
+router.get(
+  '/favorites',
+  verifyToken,
+  verifyRoleOrPortal(['owner', 'family', 'admin', 'superadmin'], 'resident'),
+  listFavoriteProviders
+);
+router.post(
+  '/favorites/:providerUserId',
+  verifyToken,
+  verifyRoleOrPortal(['owner', 'family', 'admin', 'superadmin'], 'resident'),
+  addFavoriteProvider
+);
+router.delete(
+  '/favorites/:providerUserId',
+  verifyToken,
+  verifyRoleOrPortal(['owner', 'family', 'admin', 'superadmin'], 'resident'),
+  removeFavoriteProvider
 );
 
 // ============================================================================

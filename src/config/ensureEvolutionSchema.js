@@ -197,6 +197,25 @@ async function ensureEvolutionSchema() {
         ADD COLUMN IF NOT EXISTS is_visible_in_directory BOOLEAN NOT NULL DEFAULT TRUE
       `);
 
+      // 9. Asegurar tabla de favoritos del residente y micro-tags en reseñas (Fase 5 Marketplace)
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS public.resident_favorite_providers (
+          id SERIAL PRIMARY KEY,
+          resident_user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+          provider_user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+          created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+          UNIQUE (resident_user_id, provider_user_id)
+        )
+      `);
+      await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_resident_favorite_providers_resident
+        ON public.resident_favorite_providers (resident_user_id)
+      `);
+      await db.query(`
+        ALTER TABLE public.provider_reviews
+        ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb
+      `);
+
       schemaInitialized = true;
     } catch (err) {
       schemaPromise = null;

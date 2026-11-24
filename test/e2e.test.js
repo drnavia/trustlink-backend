@@ -1434,4 +1434,98 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(typeof earnRes.data.summary.total_net_payout, 'number');
     assert.ok(earnRes.data.summary.total_contracts >= 1);
   });
+
+  // =========================================================================
+  // FASE 8: Marketplace Fase 5 — Scoring/Termómetro, Favoritos, Disponible Hoy y Micro-tags
+  // =========================================================================
+  it('calcula reputación/termómetro, actividad en tu barrio, favoritos, disponible hoy y micro-tags en reseñas (Fase 5)', async () => {
+    // 0. Resolver `user_id` del prestador autenticado mediante /api/v1/account/me
+    const provAccount = await req('GET', '/api/v1/account/me', undefined, provToken);
+    assert.equal(provAccount.status, 200);
+    const provUserId = Number(provAccount.data.account?.id || provAccount.data.user?.id);
+
+    // 1. Marcar al prestador como favorito y verificar persistencia en /favorites y /directory
+    const addFav = await req('POST', `/api/v1/providers/favorites/${provUserId}`, {}, ownerToken);
+    assert.equal(addFav.status, 201);
+    assert.equal(addFav.data.is_favorite, true);
+
+    const listFav = await req('GET', '/api/v1/providers/favorites', undefined, ownerToken);
+    assert.equal(listFav.status, 200);
+    assert.ok(listFav.data.favorite_provider_user_ids.includes(Number(provUserId)));
+
+    // 2. Crear un nuevo contrato y reseñarlo con micro-tags (incluyendo un tag inválido que debe descartarse)
+    const contractRes = await req(
+      'POST',
+      '/api/v1/contracts',
+      {
+        provider_id: providerId,
+        description: 'Service preventivo Fase 5',
+        agreed_amount: 45000,
+      },
+      ownerToken
+    );
+    assert.equal(contractRes.status, 201);
+    const f5ContractId = contractRes.data.contract.id;
+
+    const revRes = await req(
+      'POST',
+      '/api/v1/reviews/provider',
+      {
+        contract_id: f5ContractId,
+        rating: 5,
+        comment: 'Excelente atención y puntualidad',
+        tags: ['Puntual', 'Prolijo', 'TagInvalidoIgnorado'],
+      },
+      ownerToken
+    );
+    assert.equal(revRes.status, 201);
+    assert.deepEqual(revRes.data.review.tags, ['Puntual', 'Prolijo']);
+
+    // 3. Verificar que GET /providers/directory devuelva reputación, actividad local, favorito, available_today y top_tags
+    const dirRes = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dirRes.status, 200);
+    const entry = dirRes.data.providers.find((p) => Number(p.user_id) === Number(provUserId));
+    assert.ok(entry, 'El prestador debe figurar en el directorio enriquecido');
+    assert.equal(entry.is_favorite, true);
+    assert.equal(entry.available_today, true);
+    assert.ok(entry.community_activity_count >= 1, 'Debe reflejar actividad en la comunidad del residente');
+    assert.ok(entry.reputation && typeof entry.reputation.score === 'number');
+    assert.ok(entry.reputation.thermometer >= 1 && entry.reputation.thermometer <= 5);
+    assert.ok(Array.isArray(entry.top_tags) && entry.top_tags.some((t) => t.tag === 'Puntual'));
+
+    // 4. Crear un bloqueo "unavailable" hoy -> available_today debe pasar a false -> eliminar bloqueo -> vuelve a true
+    const now = new Date();
+    const blockStart = new Date(now.getTime() - 10 * 60 * 1000).toISOString();
+    const blockEnd = new Date(now.getTime() + 2 * 60 * 60 * 1000).toISOString();
+    const blkCreate = await req(
+      'POST',
+      '/api/v1/passes/schedule/blocks',
+      {
+        block_type: 'unavailable',
+        title: 'Bloqueo de prueba hoy',
+        start_at: blockStart,
+        end_at: blockEnd,
+      },
+      provToken
+    );
+    assert.equal(blkCreate.status, 201);
+    const blockId = blkCreate.data.block.id;
+
+    const dirBlocked = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    const blockedEntry = dirBlocked.data.providers.find((p) => Number(p.user_id) === Number(provUserId));
+    assert.equal(blockedEntry.available_today, false);
+
+    const blkDel = await req('DELETE', `/api/v1/passes/schedule/blocks/${blockId}`, undefined, provToken);
+    assert.equal(blkDel.status, 200);
+
+    // 5. Verificar reputación en el portal del prestador (GET /api/v1/providers/me) y quitar favorito
+    const meRes = await req('GET', '/api/v1/providers/me', undefined, provToken);
+    assert.equal(meRes.status, 200);
+    assert.ok(meRes.data.reputation && typeof meRes.data.reputation.score === 'number');
+    assert.ok(Array.isArray(meRes.data.reputation.top_tags));
+
+    const delFav = await req('DELETE', `/api/v1/providers/favorites/${provUserId}`, undefined, ownerToken);
+    assert.equal(delFav.status, 200);
+    assert.equal(delFav.data.is_favorite, false);
+  });
 });

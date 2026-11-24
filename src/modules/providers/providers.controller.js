@@ -16,6 +16,10 @@ const {
   ensureProviderSubscriptionsTable,
   getActiveMembershipForUser,
 } = require('../billing/billing.controller');
+const {
+  computeProviderReputation,
+  REVIEW_MICRO_TAGS,
+} = require('../../utils/providerReputation');
 
 /**
  * Asegura de forma idempotente la existencia de la tabla `provider_document_versions`.
@@ -853,8 +857,8 @@ const getMyProviderProfile = async (req, res) => {
       employees = employeesRes.rows;
     }
 
-    // Etapa 4: Calcular alertas de vencimiento (ventana 30 días) y consultar membresía activa en paralelo
-    const [expiryAlerts, membership] = await Promise.all([
+    // Etapa 4: Calcular alertas de vencimiento (30 días), membresía activa y métricas de reputación en paralelo
+    const [expiryAlerts, membership, repMetricsRes, topTagsRes] = await Promise.all([
       Promise.resolve(
         buildProviderExpiryAlerts({
           providers: providersRes.rows,
@@ -864,7 +868,53 @@ const getMyProviderProfile = async (req, res) => {
         })
       ),
       getActiveMembershipForUser(userId),
+      db.query(
+        `
+          SELECT
+            (SELECT COUNT(*)::int FROM service_contracts sc JOIN providers p ON p.id = sc.provider_id WHERE p.user_id = $1) AS total_jobs,
+            (SELECT COUNT(*)::int FROM service_contracts sc JOIN providers p ON p.id = sc.provider_id WHERE p.user_id = $1 AND sc.status = 'completed'::contract_status) AS completed_jobs,
+            (SELECT COUNT(*)::int FROM provider_reviews pr JOIN providers p ON p.id = pr.provider_id WHERE p.user_id = $1) AS reviews_count,
+            (SELECT COALESCE(AVG(pr.rating), 0)::numeric(4,2) FROM provider_reviews pr JOIN providers p ON p.id = pr.provider_id WHERE p.user_id = $1) AS rating_avg,
+            (SELECT COUNT(*)::int FROM public.service_disputes sd JOIN service_contracts sc ON sc.id = sd.contract_id JOIN providers p ON p.id = sc.provider_id WHERE p.user_id = $1) AS disputes_count
+        `,
+        [userId]
+      ),
+      db.query(
+        `
+          SELECT tag, COUNT(*)::int AS count
+          FROM provider_reviews pr
+          JOIN providers p ON p.id = pr.provider_id
+          CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(pr.tags, '[]'::jsonb)) AS tag
+          WHERE p.user_id = $1
+          GROUP BY tag
+          ORDER BY count DESC, tag ASC
+          LIMIT 5
+        `,
+        [userId]
+      ),
     ]);
+
+    const repRow = repMetricsRes.rows[0] || {};
+    const hasExpiredPersonalDocs = expiryAlerts.some(
+      (a) => a.severity === 'expired' && (a.category === 'criminal_record' || a.category === 'art_insurance')
+    );
+    const reputation = {
+      ...computeProviderReputation({
+        ratingAvg: Number(repRow.rating_avg || providersRes.rows[0]?.rating_avg || 0),
+        reviewsCount: Number(repRow.reviews_count || 0),
+        completedJobs: Number(repRow.completed_jobs || 0),
+        totalJobs: Number(repRow.total_jobs || 0),
+        disputesCount: Number(repRow.disputes_count || 0),
+        hasExpiredDocs: hasExpiredPersonalDocs,
+        isVerifiedMember: Boolean(membership?.is_verified_member),
+      }),
+      rating_avg: Number(repRow.rating_avg || 0),
+      reviews_count: Number(repRow.reviews_count || 0),
+      completed_jobs: Number(repRow.completed_jobs || 0),
+      total_jobs: Number(repRow.total_jobs || 0),
+      disputes_count: Number(repRow.disputes_count || 0),
+      top_tags: topTagsRes.rows,
+    };
 
     return res.status(200).json({
       providers: providersRes.rows,
@@ -874,6 +924,7 @@ const getMyProviderProfile = async (req, res) => {
       expiry_alerts: expiryAlerts,
       membership,
       membership_plans: MEMBERSHIP_PLANS,
+      reputation,
     });
   } catch (error) {
     console.error('Error al obtener perfil del prestador:', error);
@@ -1059,21 +1110,35 @@ const listVerifiedProviders = async (req, res) => {
     await ensureProviderSubscriptionsTable();
     await ensureVehicleInsuranceColumns();
     await ensureProviderEmployeesColumns();
+    await ensureLocalSuspensionsTable();
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS provider_schedule_blocks (
+        id SERIAL PRIMARY KEY,
+        provider_id INTEGER NOT NULL,
+        block_type VARCHAR(30) NOT NULL DEFAULT 'unavailable',
+        title VARCHAR(160) NOT NULL,
+        start_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+        end_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+        source_ref VARCHAR(80) NULL,
+        created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    const viewerUserId = req.user?.userId ? Number(req.user.userId) : null;
+    const viewerCountryId = req.user?.countryId ? Number(req.user.countryId) : null;
 
     /*
-     * Etapa 2: Consulta consolidada del directorio público con ranking Socio Verificado:
-     * 1) CTE `approved_profiles`: selecciona únicamente perfiles con compliance aprobado (`approved`),
-     *    visibles en directorio (`is_visible_in_directory = TRUE`), usuario activo (`is_active = TRUE`)
-     *    y permiso de prestador habilitado (`can_use_provider = TRUE`); además cuenta los contratos
-     *    (`service_contracts`) ejecutados por cada perfil.
-     * 2) Agregación principal (`GROUP BY ap.user_id`): unifica las distintas especialidades de una misma
-     *    persona en `specialties` / `specialties_label`, promedia su `rating_avg`, suma `total_jobs`
-     *    y calcula `has_expired_docs` si alguna credencial personal ya venció respecto a `CURRENT_DATE`.
-     * 3) Subconsultas `JSON_AGG`: embebe toda la flota vehicular (`vehicles`) y la cuadrilla activa
-     *    (`employees`, resolviendo nombre/DNI desde `users` si aplica) para selección al generar QR.
-     * 4) `LEFT JOIN LATERAL` sobre `provider_subscriptions`: detecta membresía activa o en prueba
-     *    (`status IN ('active', 'trialing') AND ends_at > NOW()`), priorizando el plan `verified_pro`.
-     * 5) Ranking `ORDER BY`: 1° Socio Verificado activo, 2° plan `verified_pro`, 3° mayor rating promedio,
+     * Etapa 2: Consulta consolidada del directorio público enriquecido (Fase 5 — Marketplace & Scoring):
+     * 1) CTE `approved_profiles`: filtra perfiles con compliance aprobado (`approved`), visibles en
+     *    directorio (`is_visible_in_directory = TRUE`), cuenta activa y portal prestador habilitado;
+     *    calcula trabajos totales/completados, reseñas, reclamos y actividad hiper-local en el barrio
+     *    del residente autenticado (`community_jobs_count` y `community_visits_count`).
+     * 2) Agregación principal (`GROUP BY ap.user_id`): unifica las especialidades de la persona,
+     *    promedia `rating_avg`, calcula `has_expired_docs`, `has_active_local_suspension`,
+     *    favoritos (`is_favorite`), disponibilidad hoy (`has_open_schedule_today`) y `top_tags`.
+     * 3) Subconsultas `JSON_AGG`: embebe flota vehicular (`vehicles`) y cuadrilla activa (`employees`).
+     * 4) `LEFT JOIN LATERAL` sobre `provider_subscriptions`: detecta membresía Socio Verificado activa.
+     * 5) Ranking `ORDER BY`: 1° Socio Verificado activo, 2° `verified_pro`, 3° mayor rating promedio,
      *    4° `user_id` ascendente como desempate determinista.
      */
     const query = `
@@ -1094,7 +1159,40 @@ const listVerifiedProviders = async (req, res) => {
             SELECT COUNT(*)::int
             FROM service_contracts sc
             WHERE sc.provider_id = p.id
-          ) AS profile_jobs
+          ) AS profile_jobs,
+          (
+            SELECT COUNT(*)::int
+            FROM service_contracts sc
+            WHERE sc.provider_id = p.id
+              AND sc.status = 'completed'::contract_status
+          ) AS profile_completed_jobs,
+          (
+            SELECT COUNT(*)::int
+            FROM provider_reviews pr
+            WHERE pr.provider_id = p.id
+          ) AS profile_reviews_count,
+          (
+            SELECT COUNT(*)::int
+            FROM public.service_disputes sd
+            JOIN service_contracts sc ON sc.id = sd.contract_id
+            WHERE sc.provider_id = p.id
+          ) AS profile_disputes_count,
+          (
+            SELECT COUNT(*)::int
+            FROM service_contracts sc
+            WHERE sc.provider_id = p.id
+              AND $2::int IS NOT NULL
+              AND sc.country_id = $2::int
+              AND sc.status IN ('in_progress'::contract_status, 'completed'::contract_status)
+          ) AS profile_community_jobs,
+          (
+            SELECT COUNT(*)::int
+            FROM access_passes ap_pass
+            WHERE ap_pass.provider_id = p.id
+              AND $2::int IS NOT NULL
+              AND ap_pass.country_id = $2::int
+              AND ap_pass.status = 'used'::pass_status
+          ) AS profile_community_visits
         FROM providers p
         JOIN users u ON p.user_id = u.id
         WHERE p.status = 'approved'::provider_status
@@ -1115,6 +1213,11 @@ const listVerifiedProviders = async (req, res) => {
         (ARRAY_AGG(ap.specialty ORDER BY ap.ordered_id ASC))[1] AS specialty,
         ROUND(AVG(ap.rating_avg)::numeric, 2) AS rating_avg,
         COALESCE(SUM(ap.profile_jobs), 0)::int AS total_jobs,
+        COALESCE(SUM(ap.profile_completed_jobs), 0)::int AS completed_jobs,
+        COALESCE(SUM(ap.profile_reviews_count), 0)::int AS reviews_count,
+        COALESCE(SUM(ap.profile_disputes_count), 0)::int AS disputes_count,
+        COALESCE(SUM(ap.profile_community_jobs), 0)::int AS community_jobs_count,
+        COALESCE(SUM(ap.profile_community_visits), 0)::int AS community_visits_count,
         COALESCE(sub.is_verified_member, FALSE) AS is_verified_member,
         sub.plan_code AS membership_tier,
         sub.ends_at AS membership_ends_at,
@@ -1122,6 +1225,49 @@ const listVerifiedProviders = async (req, res) => {
           BOOL_OR(ap.criminal_record_expiry IS NOT NULL AND ap.criminal_record_expiry < CURRENT_DATE)
           OR BOOL_OR(ap.insurance_expiry IS NOT NULL AND ap.insurance_expiry < CURRENT_DATE)
         ) AS has_expired_docs,
+        EXISTS (
+          SELECT 1
+          FROM public.provider_local_suspensions pls
+          JOIN providers p_sus ON p_sus.id = pls.provider_id
+          WHERE p_sus.user_id = ap.user_id
+            AND pls.active = TRUE
+            AND $2::int IS NOT NULL
+            AND pls.country_id = $2::int
+        ) AS has_active_local_suspension,
+        EXISTS (
+          SELECT 1
+          FROM public.resident_favorite_providers rfp
+          WHERE rfp.resident_user_id = $1::int
+            AND rfp.provider_user_id = ap.user_id
+        ) AS is_favorite,
+        NOT EXISTS (
+          SELECT 1
+          FROM provider_schedule_blocks psb
+          JOIN providers p_blk ON p_blk.id = psb.provider_id
+          WHERE p_blk.user_id = ap.user_id
+            AND psb.block_type = 'unavailable'
+            AND psb.start_at < (CURRENT_DATE + INTERVAL '1 day')
+            AND psb.end_at > NOW()
+        ) AS has_open_schedule_today,
+        COALESCE(
+          (
+            SELECT JSON_AGG(
+              JSON_BUILD_OBJECT('tag', t.tag, 'count', t.cnt)
+              ORDER BY t.cnt DESC, t.tag ASC
+            )
+            FROM (
+              SELECT tag, COUNT(*)::int AS cnt
+              FROM provider_reviews pr
+              JOIN providers p4 ON p4.id = pr.provider_id
+              CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(pr.tags, '[]'::jsonb)) AS tag
+              WHERE p4.user_id = ap.user_id
+              GROUP BY tag
+              ORDER BY cnt DESC, tag ASC
+              LIMIT 3
+            ) t
+          ),
+          '[]'::json
+        ) AS top_tags,
         COALESCE(
           (
             SELECT JSON_AGG(
@@ -1193,17 +1339,160 @@ const listVerifiedProviders = async (req, res) => {
         ap.user_id ASC;
     `;
 
-    const result = await db.query(query);
+    const result = await db.query(query, [viewerUserId, viewerCountryId]);
+
+    // Etapa 3: Calcular termómetro de reputación, disponibilidad efectiva hoy y actividad hiper-local
+    const enrichedProviders = result.rows.map((row) => {
+      const hasExpiredDocs = Boolean(row.has_expired_docs);
+      const hasActiveLocalSuspension = Boolean(row.has_active_local_suspension);
+      const availableToday =
+        Boolean(row.has_open_schedule_today) && !hasExpiredDocs && !hasActiveLocalSuspension;
+      const communityJobsCount = Number(row.community_jobs_count || 0);
+      const communityVisitsCount = Number(row.community_visits_count || 0);
+      const communityActivityCount = Math.max(communityJobsCount, communityVisitsCount);
+
+      const reputation = computeProviderReputation({
+        ratingAvg: Number(row.rating_avg || 0),
+        reviewsCount: Number(row.reviews_count || 0),
+        completedJobs: Number(row.completed_jobs || 0),
+        totalJobs: Number(row.total_jobs || 0),
+        disputesCount: Number(row.disputes_count || 0),
+        hasExpiredDocs,
+        hasActiveLocalSuspension,
+        isVerifiedMember: Boolean(row.is_verified_member),
+      });
+
+      return {
+        ...row,
+        available_today: availableToday,
+        community_jobs_count: communityJobsCount,
+        community_visits_count: communityVisitsCount,
+        community_activity_count: communityActivityCount,
+        reputation,
+      };
+    });
 
     return res.status(200).json({
-      count: result.rows.length,
-      providers: result.rows
+      count: enrichedProviders.length,
+      available_review_tags: REVIEW_MICRO_TAGS,
+      providers: enrichedProviders,
     });
   } catch (error) {
     console.error('Error al listar prestadores verificados:', error);
     return res.status(500).json({
       error: 'Error interno del servidor al obtener el directorio.'
     });
+  }
+};
+
+/**
+ * Lista los `provider_user_id` guardados como favoritos por el residente autenticado.
+ * GET /api/v1/providers/favorites
+ *
+ * @param {import('express').Request} req - Solicitud HTTP del residente autenticado.
+ * @param {import('express').Response} res - Respuesta HTTP con los IDs favoritos del residente.
+ * @returns {Promise<import('express').Response>}
+ */
+const listFavoriteProviders = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const residentUserId = Number(req.user.userId);
+    const favRes = await db.query(
+      `SELECT provider_user_id, created_at
+       FROM public.resident_favorite_providers
+       WHERE resident_user_id = $1
+       ORDER BY created_at DESC`,
+      [residentUserId]
+    );
+    return res.status(200).json({
+      count: favRes.rows.length,
+      favorite_provider_user_ids: favRes.rows.map((r) => Number(r.provider_user_id)),
+      favorites: favRes.rows,
+    });
+  } catch (error) {
+    console.error('Error al listar prestadores favoritos:', error);
+    return res.status(500).json({ error: 'Error interno al consultar tus favoritos.' });
+  }
+};
+
+/**
+ * Agrega un prestador (`providerUserId`) a la lista de "Mis prestadores de confianza"
+ * del residente autenticado de forma idempotente (`ON CONFLICT DO NOTHING`).
+ * POST /api/v1/providers/favorites/:providerUserId
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `:providerUserId` en params.
+ * @param {import('express').Response} res - Respuesta HTTP `201` confirmando el favorito.
+ * @returns {Promise<import('express').Response>}
+ */
+const addFavoriteProvider = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const residentUserId = Number(req.user.userId);
+    const providerUserId = parseInt(req.params.providerUserId, 10);
+
+    if (!Number.isInteger(providerUserId) || providerUserId <= 0) {
+      return res.status(400).json({ error: 'Debe indicar un identificador de prestador válido.' });
+    }
+
+    // Verificar que el usuario objetivo posea al menos un perfil registrado en `providers`
+    const targetRes = await db.query(
+      `SELECT id FROM providers WHERE user_id = $1 LIMIT 1`,
+      [providerUserId]
+    );
+    if (targetRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Prestador no encontrado.' });
+    }
+
+    await db.query(
+      `INSERT INTO public.resident_favorite_providers (resident_user_id, provider_user_id)
+       VALUES ($1, $2)
+       ON CONFLICT (resident_user_id, provider_user_id) DO NOTHING`,
+      [residentUserId, providerUserId]
+    );
+
+    return res.status(201).json({
+      message: 'Prestador guardado en tus favoritos de confianza.',
+      provider_user_id: providerUserId,
+      is_favorite: true,
+    });
+  } catch (error) {
+    console.error('Error al guardar prestador favorito:', error);
+    return res.status(500).json({ error: 'Error interno al guardar el prestador en favoritos.' });
+  }
+};
+
+/**
+ * Quita un prestador (`providerUserId`) de los favoritos del residente autenticado.
+ * DELETE /api/v1/providers/favorites/:providerUserId
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `:providerUserId` en params.
+ * @param {import('express').Response} res - Respuesta HTTP `200` confirmando la eliminación.
+ * @returns {Promise<import('express').Response>}
+ */
+const removeFavoriteProvider = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const residentUserId = Number(req.user.userId);
+    const providerUserId = parseInt(req.params.providerUserId, 10);
+
+    if (!Number.isInteger(providerUserId) || providerUserId <= 0) {
+      return res.status(400).json({ error: 'Debe indicar un identificador de prestador válido.' });
+    }
+
+    await db.query(
+      `DELETE FROM public.resident_favorite_providers
+       WHERE resident_user_id = $1 AND provider_user_id = $2`,
+      [residentUserId, providerUserId]
+    );
+
+    return res.status(200).json({
+      message: 'Prestador quitado de tus favoritos.',
+      provider_user_id: providerUserId,
+      is_favorite: false,
+    });
+  } catch (error) {
+    console.error('Error al quitar prestador favorito:', error);
+    return res.status(500).json({ error: 'Error interno al quitar el prestador de favoritos.' });
   }
 };
 
@@ -1773,6 +2062,9 @@ module.exports = {
   listAllProvidersForOps,
   updateComplianceStatus,
   listVerifiedProviders,
+  listFavoriteProviders,
+  addFavoriteProvider,
+  removeFavoriteProvider,
   listLocalSuspensions,
   createLocalSuspension,
   liftLocalSuspension,

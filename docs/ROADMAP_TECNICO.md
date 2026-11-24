@@ -13,6 +13,7 @@ Este documento traduce las brechas identificadas entre la tesis comercial ([TRUS
 | **Fase 3** | **P1** | Integración real de **Mercado Pago** (Checkout Pro + firma `x-signature`, modo dual) | **✅ Completada** (Migración `014`, `mercadopago.service.js`, `/payments/config`, retorno UI) |
 | **Fase 4** | **P2** | **Conformidad final, garantía/reclamos y Comprobante del Hogar** | **✅ Completada** (Migración `015`, `/contracts/:id/complete`, `/receipt`, `/dispute`, panel Ops) |
 | **Evolutivas** | **P2** | Visibilidad por especialidad DB, ingresos prestador, filtros directorio, CSV y PWA | **✅ Completadas** (Migración `016`, `/contracts/provider`, `csvExport.js`, `manifest.webmanifest`) |
+| **Fase 5** | **P2** | **Marketplace & Conversión:** Termómetro/Scoring, "En tu barrio", Favoritos, Recontratar, Micro-tags, Disponible Hoy y Hogar Protegido | **✅ Completada** (Migración `017`, `providerReputation.js`, `/providers/favorites`, `HomeProtectedBadge.jsx`, E2E) |
 | **Externos** | **Diferido** | Credenciales MP Live/Suscripciones, Supabase Storage (PDFs) y Email transaccional (Resend/SMTP) | *Pendiente (habilitadores para primer piloto comercial con servicios externos)* |
 
 ---

@@ -6,6 +6,11 @@
  */
 
 const db = require('../../config/db');
+const { ensureEvolutionSchema } = require('../../config/ensureEvolutionSchema');
+const {
+  REVIEW_MICRO_TAGS,
+  normalizeReviewTags,
+} = require('../../utils/providerReputation');
 
 /**
  * Asegura la existencia de la tabla `owner_reviews` de forma idempotente para registrar
@@ -40,7 +45,8 @@ const ensureOwnerReviewsTable = async () => {
  */
 const getContractsForReviews = async (req, res) => {
   try {
-    // 1. Asegurar tabla de reseñas a propietarios y determinar si la vista corresponde a Prestador o Residente
+    // 1. Asegurar esquema evolutivo (incluye `provider_reviews.tags`) y tabla de reseñas a propietarios
+    await ensureEvolutionSchema();
     await ensureOwnerReviewsTable();
 
     const userId = req.user.userId;
@@ -76,6 +82,7 @@ const getContractsForReviews = async (req, res) => {
           t.provider_payout,
           pr.rating AS provider_review_rating,
           pr.comment AS provider_review_comment,
+          COALESCE(pr.tags, '[]'::jsonb) AS provider_review_tags,
           pr.created_at AS provider_review_created_at,
           orr.id AS owner_review_id,
           orr.rating AS owner_review_rating,
@@ -133,6 +140,7 @@ const getContractsForReviews = async (req, res) => {
         pr.id AS provider_review_id,
         pr.rating AS provider_review_rating,
         pr.comment AS provider_review_comment,
+        COALESCE(pr.tags, '[]'::jsonb) AS provider_review_tags,
         pr.created_at AS provider_review_created_at,
         orr.rating AS owner_review_rating,
         orr.comment AS owner_review_comment,
@@ -159,6 +167,7 @@ const getContractsForReviews = async (req, res) => {
     return res.status(200).json({
       portal: 'resident',
       role: requestedPortal === 'resident' ? 'owner' : role || 'owner',
+      available_tags: REVIEW_MICRO_TAGS,
       contracts: result.rows
     });
   } catch (error) {
@@ -181,13 +190,15 @@ const getContractsForReviews = async (req, res) => {
  */
 const createProviderReview = async (req, res) => {
   try {
-    // 1. Parsear y validar identificador del contrato, puntaje entero (1..5) y comentario opcional
+    // 1. Asegurar columna `tags` y validar contrato, puntaje entero (1..5), micro-tags y comentario opcional
+    await ensureEvolutionSchema();
     const ownerId = req.user.userId;
     const contractId = parseInt(req.body.contract_id, 10);
     const rating = parseInt(req.body.rating, 10);
     const comment = req.body.comment !== undefined && req.body.comment !== null
       ? String(req.body.comment).trim()
       : null;
+    const normalizedTags = normalizeReviewTags(req.body.tags);
 
     if (!Number.isInteger(contractId) || contractId <= 0) {
       return res.status(400).json({ error: 'Debe indicar un contract_id válido.' });
@@ -213,12 +224,12 @@ const createProviderReview = async (req, res) => {
       return res.status(403).json({ error: 'No tiene permisos para calificar este contrato.' });
     }
 
-    // 3. Persistir la calificación en `provider_reviews` (la restricción UNIQUE previene reseñas duplicadas)
+    // 3. Persistir la calificación y sus micro-tags en `provider_reviews` (UNIQUE previene duplicados)
     const insertRes = await db.query(
-      `INSERT INTO provider_reviews (contract_id, provider_id, owner_id, rating, comment)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, contract_id, provider_id, owner_id, rating, comment, created_at`,
-      [contractId, contract.provider_id, ownerId, rating, comment || null]
+      `INSERT INTO provider_reviews (contract_id, provider_id, owner_id, rating, comment, tags)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+       RETURNING id, contract_id, provider_id, owner_id, rating, comment, COALESCE(tags, '[]'::jsonb) AS tags, created_at`,
+      [contractId, contract.provider_id, ownerId, rating, comment || null, JSON.stringify(normalizedTags)]
     );
 
     // 4. Transicionar el contrato a estado `'completed'` si aún figuraba pendiente/en curso
@@ -339,19 +350,21 @@ const createOwnerReview = async (req, res) => {
  */
 const getProviderReviewsById = async (req, res) => {
   try {
-    // 1. Validar que `providerId` sea un entero positivo
+    // 1. Asegurar columna `tags` y validar que `providerId` sea un entero positivo
+    await ensureEvolutionSchema();
     const providerId = parseInt(req.params.providerId, 10);
     if (!Number.isInteger(providerId) || providerId <= 0) {
       return res.status(400).json({ error: 'ID de prestador inválido.' });
     }
 
-    // 2. Consultar reseñas del prestador uniendo datos básicos del residente autor
+    // 2. Consultar reseñas del prestador (incluyendo micro-tags) uniendo datos básicos del residente
     const reviewsRes = await db.query(
       `SELECT
         pr.id,
         pr.contract_id,
         pr.rating,
         pr.comment,
+        COALESCE(pr.tags, '[]'::jsonb) AS tags,
         pr.created_at,
         u.first_name AS owner_first_name,
         u.last_name AS owner_last_name
