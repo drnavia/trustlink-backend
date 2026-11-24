@@ -1,0 +1,411 @@
+/**
+ * @file billing.controller.js
+ * @description Gestión de la membresía "Socio Verificado" (suscripción B2C para prestadores).
+ * Permite consultar el estado y catálogo de planes, activar/renovar suscripción desde Portal Prestador
+ * y administrar altas, extensiones o bajas desde Operaciones / Superadmin.
+ * @location /trustlink-backend/src/modules/billing/billing.controller.js
+ */
+
+const db = require('../../config/db');
+const { ensureEvolutionSchema } = require('../../config/ensureEvolutionSchema');
+
+const MEMBERSHIP_PLANS = [
+  {
+    code: 'verified_monthly',
+    name: 'Socio Verificado Mensual',
+    duration_days: 30,
+    price_ars: 14900,
+    badge_label: 'Socio Verificado',
+    features: [
+      'Insignia distintiva "Socio Verificado" en el directorio',
+      'Posicionamiento prioritario sobre perfiles estándar',
+      'Pases QR ilimitados y reputación acumulable en toda la red',
+    ],
+  },
+  {
+    code: 'verified_quarterly',
+    name: 'Socio Verificado Trimestral',
+    duration_days: 90,
+    price_ars: 39900,
+    badge_label: 'Socio Verificado',
+    features: [
+      '90 días continuos de visibilidad prioritaria (ahorro 11%)',
+      'Insignia distintiva "Socio Verificado" en el directorio',
+      'Soporte prioritario en validación documental Ops',
+    ],
+  },
+  {
+    code: 'verified_pro',
+    name: 'Socio Verificado Pro (Cuadrillas)',
+    duration_days: 30,
+    price_ars: 24900,
+    badge_label: 'Socio Verificado Pro',
+    features: [
+      'Prioridad destacada superior en búsquedas del directorio',
+      'Gestión ampliada de cuadrillas/ayudantes y flota vehicular',
+      'Alertas proactivas de vencimiento documental',
+    ],
+  },
+];
+
+const PLANS_BY_CODE = Object.fromEntries(MEMBERSHIP_PLANS.map((p) => [p.code, p]));
+
+const ensureProviderSubscriptionsTable = async () => {
+  await ensureEvolutionSchema();
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS public.provider_subscriptions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+      plan_code VARCHAR(40) NOT NULL DEFAULT 'verified_monthly',
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
+      starts_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+      ends_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+      external_subscription_id VARCHAR(160) NULL,
+      auto_renew BOOLEAN NOT NULL DEFAULT TRUE,
+      notes TEXT NULL,
+      created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+    );
+  `);
+};
+
+/**
+ * Formatea una fila de `provider_subscriptions` en un objeto de membresía consistente.
+ */
+function formatMembershipSnapshot(row) {
+  if (!row) {
+    return {
+      is_verified_member: false,
+      plan_code: null,
+      plan_name: null,
+      badge_label: null,
+      status: 'none',
+      starts_at: null,
+      ends_at: null,
+      days_remaining: 0,
+      auto_renew: false,
+      notes: null,
+    };
+  }
+
+  const nowMs = Date.now();
+  const endsAtMs = row.ends_at ? new Date(row.ends_at).getTime() : 0;
+  const rawStatus = String(row.status || '').toLowerCase();
+  const isCurrentlyActive =
+    (rawStatus === 'active' || rawStatus === 'trialing') && endsAtMs > nowMs;
+  const effectiveStatus =
+    (rawStatus === 'active' || rawStatus === 'trialing') && endsAtMs <= nowMs
+      ? 'expired'
+      : rawStatus || 'none';
+  const daysRemaining = isCurrentlyActive
+    ? Math.max(0, Math.ceil((endsAtMs - nowMs) / (1000 * 60 * 60 * 24)))
+    : 0;
+  const planMeta = PLANS_BY_CODE[row.plan_code] || null;
+
+  return {
+    id: row.id,
+    is_verified_member: isCurrentlyActive,
+    plan_code: row.plan_code || null,
+    plan_name: planMeta?.name || row.plan_code || 'Socio Verificado',
+    badge_label: isCurrentlyActive
+      ? planMeta?.badge_label || 'Socio Verificado'
+      : null,
+    status: effectiveStatus,
+    starts_at: row.starts_at || null,
+    ends_at: row.ends_at || null,
+    days_remaining: daysRemaining,
+    auto_renew: Boolean(row.auto_renew),
+    notes: row.notes || null,
+  };
+}
+
+/**
+ * Devuelve la membresía vigente (o la más reciente) de un usuario prestador.
+ */
+const getActiveMembershipForUser = async (userId) => {
+  await ensureProviderSubscriptionsTable();
+  const res = await db.query(
+    `SELECT
+       id, user_id, plan_code, status, starts_at, ends_at,
+       external_subscription_id, auto_renew, notes, created_at, updated_at
+     FROM public.provider_subscriptions
+     WHERE user_id = $1
+     ORDER BY
+       CASE WHEN status IN ('active', 'trialing') AND ends_at > NOW() THEN 0 ELSE 1 END ASC,
+       ends_at DESC,
+       id DESC
+     LIMIT 1`,
+    [Number(userId)]
+  );
+  return formatMembershipSnapshot(res.rows[0] || null);
+};
+
+/**
+ * GET /api/v1/billing/provider/me
+ * Consulta el estado actual de la membresía "Socio Verificado" y los planes disponibles.
+ */
+const getMyProviderMembership = async (req, res) => {
+  try {
+    await ensureProviderSubscriptionsTable();
+    const userId = Number(req.user.userId);
+
+    const [membership, historyRes] = await Promise.all([
+      getActiveMembershipForUser(userId),
+      db.query(
+        `SELECT id, plan_code, status, starts_at, ends_at, auto_renew, notes, created_at
+         FROM public.provider_subscriptions
+         WHERE user_id = $1
+         ORDER BY id DESC
+         LIMIT 10`,
+        [userId]
+      ),
+    ]);
+
+    return res.status(200).json({
+      membership,
+      plans: MEMBERSHIP_PLANS,
+      history: historyRes.rows,
+    });
+  } catch (error) {
+    console.error('Error al consultar membresía del prestador:', error);
+    return res.status(500).json({ error: 'Error interno al consultar la membresía.' });
+  }
+};
+
+/**
+ * POST /api/v1/billing/provider/subscribe
+ * Activa o renueva una membresía "Socio Verificado" para el prestador autenticado.
+ * (En piloto/MVP acredita el período inmediatamente y queda listo para conectar Mercado Pago Suscripciones).
+ */
+const subscribeProviderMembership = async (req, res) => {
+  try {
+    await ensureProviderSubscriptionsTable();
+    const userId = Number(req.user.userId);
+    const planCode = String(req.body?.plan_code || 'verified_monthly').trim();
+    const autoRenew = req.body?.auto_renew !== undefined ? Boolean(req.body.auto_renew) : true;
+
+    const plan = PLANS_BY_CODE[planCode];
+    if (!plan) {
+      return res.status(400).json({
+        error: `Plan de membresía inválido. Planes válidos: ${Object.keys(PLANS_BY_CODE).join(', ')}.`,
+      });
+    }
+
+    const currentRes = await db.query(
+      `SELECT id, ends_at
+       FROM public.provider_subscriptions
+       WHERE user_id = $1
+         AND status IN ('active', 'trialing')
+         AND ends_at > NOW()
+       ORDER BY ends_at DESC
+       LIMIT 1`,
+      [userId]
+    );
+
+    const now = new Date();
+    const baseStart =
+      currentRes.rows.length > 0 && new Date(currentRes.rows[0].ends_at) > now
+        ? new Date(currentRes.rows[0].ends_at)
+        : now;
+    const nextEndsAt = new Date(baseStart.getTime() + plan.duration_days * 24 * 60 * 60 * 1000);
+
+    // Marcamos suscripciones activas previas como reemplazadas para conservar historial limpio
+    await db.query(
+      `UPDATE public.provider_subscriptions
+       SET status = 'superseded', updated_at = NOW()
+       WHERE user_id = $1 AND status IN ('active', 'trialing')`,
+      [userId]
+    );
+
+    const externalSubId = `TLK-SUB-${userId}-${Date.now()}`;
+    const insertRes = await db.query(
+      `INSERT INTO public.provider_subscriptions (
+         user_id, plan_code, status, starts_at, ends_at,
+         external_subscription_id, auto_renew, notes
+       )
+       VALUES ($1, $2, 'active', $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [
+        userId,
+        plan.code,
+        now.toISOString(),
+        nextEndsAt.toISOString(),
+        externalSubId,
+        autoRenew,
+        'Activación autogestionada desde Portal Prestador',
+      ]
+    );
+
+    const membership = formatMembershipSnapshot(insertRes.rows[0]);
+
+    return res.status(201).json({
+      message: `Membresía "${plan.name}" activada correctamente hasta el ${nextEndsAt.toISOString().slice(0, 10)}.`,
+      membership,
+      subscription: insertRes.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al suscribir membresía de prestador:', error);
+    return res.status(500).json({ error: 'Error interno al activar la membresía.' });
+  }
+};
+
+/**
+ * PATCH /api/v1/billing/provider/:userId
+ * Administración centralizada por Superadmin: activar, extender o cancelar la membresía de un prestador.
+ */
+const adminManageProviderMembership = async (req, res) => {
+  try {
+    await ensureProviderSubscriptionsTable();
+    const targetUserId = Number(req.params.userId);
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: 'ID de usuario prestador inválido.' });
+    }
+
+    const userCheck = await db.query('SELECT id, first_name, last_name FROM users WHERE id = $1 LIMIT 1', [
+      targetUserId,
+    ]);
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario prestador no encontrado.' });
+    }
+
+    const action = String(req.body?.action || 'activate').trim().toLowerCase();
+    const planCode = String(req.body?.plan_code || 'verified_monthly').trim();
+    const requestedStatus = String(req.body?.status || 'active').trim().toLowerCase();
+    const rawDays = Number(req.body?.days);
+    const notes = req.body?.notes ? String(req.body.notes).trim() : null;
+
+    if (action === 'cancel' || action === 'revoke') {
+      await db.query(
+        `UPDATE public.provider_subscriptions
+         SET status = 'cancelled',
+             auto_renew = FALSE,
+             ends_at = LEAST(ends_at, NOW()),
+             notes = COALESCE($2, notes),
+             updated_at = NOW()
+         WHERE user_id = $1 AND status IN ('active', 'trialing')`,
+        [targetUserId, notes || 'Membresía revocada por Superadmin']
+      );
+
+      const membership = await getActiveMembershipForUser(targetUserId);
+      return res.status(200).json({
+        message: 'Membresía Socio Verificado cancelada correctamente.',
+        membership,
+      });
+    }
+
+    const plan = PLANS_BY_CODE[planCode] || PLANS_BY_CODE.verified_monthly;
+    const durationDays =
+      Number.isInteger(rawDays) && rawDays >= 1 && rawDays <= 730
+        ? rawDays
+        : plan.duration_days;
+    const validStatus = ['active', 'trialing'].includes(requestedStatus)
+      ? requestedStatus
+      : 'active';
+
+    const currentRes = await db.query(
+      `SELECT id, ends_at
+       FROM public.provider_subscriptions
+       WHERE user_id = $1
+         AND status IN ('active', 'trialing')
+         AND ends_at > NOW()
+       ORDER BY ends_at DESC
+       LIMIT 1`,
+      [targetUserId]
+    );
+
+    const now = new Date();
+    const baseDate =
+      action === 'extend' && currentRes.rows.length > 0 && new Date(currentRes.rows[0].ends_at) > now
+        ? new Date(currentRes.rows[0].ends_at)
+        : now;
+    const endsAt = new Date(baseDate.getTime() + durationDays * 24 * 60 * 60 * 1000);
+
+    await db.query(
+      `UPDATE public.provider_subscriptions
+       SET status = 'superseded', updated_at = NOW()
+       WHERE user_id = $1 AND status IN ('active', 'trialing')`,
+      [targetUserId]
+    );
+
+    const insertRes = await db.query(
+      `INSERT INTO public.provider_subscriptions (
+         user_id, plan_code, status, starts_at, ends_at,
+         external_subscription_id, auto_renew, notes
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7)
+       RETURNING *`,
+      [
+        targetUserId,
+        plan.code,
+        validStatus,
+        now.toISOString(),
+        endsAt.toISOString(),
+        `TLK-OPS-${targetUserId}-${Date.now()}`,
+        notes || `Gestión Ops Superadmin (${durationDays} días)`,
+      ]
+    );
+
+    const membership = formatMembershipSnapshot(insertRes.rows[0]);
+    return res.status(200).json({
+      message: `Membresía Socio Verificado (${plan.name}) actualizada hasta el ${endsAt.toISOString().slice(0, 10)}.`,
+      membership,
+      subscription: insertRes.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al administrar membresía desde Superadmin:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar la membresía del prestador.' });
+  }
+};
+
+/**
+ * GET /api/v1/billing/providers
+ * Resumen global de suscripciones "Socio Verificado" para Superadmin.
+ */
+const listProviderMembershipsForOps = async (req, res) => {
+  try {
+    await ensureProviderSubscriptionsTable();
+    const result = await db.query(`
+      SELECT
+        ps.id,
+        ps.user_id,
+        u.first_name,
+        u.last_name,
+        u.email,
+        ps.plan_code,
+        ps.status,
+        ps.starts_at,
+        ps.ends_at,
+        ps.auto_renew,
+        ps.notes,
+        (ps.status IN ('active', 'trialing') AND ps.ends_at > NOW()) AS is_verified_member
+      FROM public.provider_subscriptions ps
+      JOIN public.users u ON u.id = ps.user_id
+      ORDER BY is_verified_member DESC, ps.ends_at DESC, ps.id DESC
+      LIMIT 200
+    `);
+
+    const activeCount = result.rows.filter((r) => r.is_verified_member).length;
+    return res.status(200).json({
+      summary: {
+        total_records: result.rows.length,
+        active_members: activeCount,
+      },
+      plans: MEMBERSHIP_PLANS,
+      subscriptions: result.rows,
+    });
+  } catch (error) {
+    console.error('Error al listar membresías de prestadores:', error);
+    return res.status(500).json({ error: 'Error interno al consultar membresías.' });
+  }
+};
+
+module.exports = {
+  MEMBERSHIP_PLANS,
+  ensureProviderSubscriptionsTable,
+  formatMembershipSnapshot,
+  getActiveMembershipForUser,
+  getMyProviderMembership,
+  subscribeProviderMembership,
+  adminManageProviderMembership,
+  listProviderMembershipsForOps,
+};

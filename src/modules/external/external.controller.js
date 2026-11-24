@@ -9,6 +9,10 @@
 
 const crypto = require('crypto');
 const db = require('../../config/db');
+const {
+  findComplianceExpiryViolation,
+  hydrateAuthorizedEmployeesExpiry,
+} = require('../../utils/complianceExpiry');
 
 /**
  * Asegura de forma idempotente que la tabla `countries` cuente con las columnas
@@ -1229,6 +1233,8 @@ const verifyExternalPassByQR = async (req, res) => {
           u_prov.dni AS provider_dni,
           p.specialty,
           p.status AS compliance_status,
+          p.criminal_record_expiry,
+          p.insurance_expiry,
           ap.fraction_number,
           ap.lot_number,
           COALESCE(ap.authorized_employees, '[]'::jsonb) AS authorized_employees,
@@ -1454,6 +1460,36 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    const rawExternalCrew = Array.isArray(record.authorized_employees)
+      ? record.authorized_employees
+      : [];
+    const hydratedExternalCrew = await hydrateAuthorizedEmployeesExpiry(db, rawExternalCrew);
+    const externalExpiryViolation = findComplianceExpiryViolation({
+      criminalRecordExpiry: record.criminal_record_expiry,
+      insuranceExpiry: record.insurance_expiry,
+      authorizedEmployees: hydratedExternalCrew,
+      context: 'gate'
+    });
+    if (externalExpiryViolation) {
+      await recordGateAccessLog({
+        qrToken,
+        passId: record.id,
+        countryId: record.country_id,
+        integrationLabel: auth.integrationLabel,
+        authMode: auth.authMode,
+        authorized: false,
+        reasonCode: externalExpiryViolation.code,
+        message: externalExpiryViolation.message,
+        httpStatus: 403
+      });
+      return res.status(403).json({
+        authorized: false,
+        code: externalExpiryViolation.code,
+        expiry_date: externalExpiryViolation.expiry_date,
+        error: externalExpiryViolation.message
+      });
+    }
+
     // Verificar suspensión operativa local activa en la comunidad
     const suspensionCountryId = record.country_id || effectiveCountryId;
     if (suspensionCountryId && record.provider_id) {
@@ -1567,9 +1603,7 @@ const verifyExternalPassByQR = async (req, res) => {
         compliance_status: record.compliance_status,
         fraction_number: record.fraction_number,
         lot_number: record.lot_number,
-        authorized_employees: Array.isArray(record.authorized_employees)
-          ? record.authorized_employees
-          : [],
+        authorized_employees: hydratedExternalCrew,
         start_time: record.start_time,
         end_time: record.end_time,
         start_utc_ms: record.start_utc_ms,

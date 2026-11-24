@@ -761,4 +761,176 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     );
     assert.equal(okPwd.status, 200);
   });
+
+  it('bloquea emisión y validación QR ante ART/antecedentes/cuadrilla vencidos (Fase 1.1)', async () => {
+    const pastDate = '2020-01-15';
+    const futureDate = '2028-06-01';
+    const now = Date.now();
+
+    // 1. Vencer ART del prestador directamente en DB y verificar que createPass bloquea con INSURANCE_EXPIRED
+    await db.query(
+      'UPDATE providers SET criminal_record_expiry = $1, insurance_expiry = $2 WHERE id = $3',
+      [futureDate, pastDate, providerId]
+    );
+
+    const blockedCreate = await req(
+      'POST',
+      '/api/v1/passes/create',
+      {
+        provider_id: providerId,
+        start_time: new Date(now - 5 * 60 * 1000).toISOString(),
+        end_time: new Date(now + 2 * 60 * 60 * 1000).toISOString(),
+      },
+      ownerToken
+    );
+    assert.equal(blockedCreate.status, 403);
+    assert.equal(blockedCreate.data.code, 'INSURANCE_EXPIRED');
+
+    // 2. Restaurar fechas vigentes, emitir un pase QR y luego vencer antecedentes para probar bloqueo en Consola Garita y API Externa
+    await db.query(
+      'UPDATE providers SET criminal_record_expiry = $1, insurance_expiry = $2 WHERE id = $3',
+      [futureDate, futureDate, providerId]
+    );
+
+    const validPass = await req(
+      'POST',
+      '/api/v1/passes/create',
+      {
+        provider_id: providerId,
+        start_time: new Date(now - 5 * 60 * 1000).toISOString(),
+        end_time: new Date(now + 2 * 60 * 60 * 1000).toISOString(),
+      },
+      ownerToken
+    );
+    assert.equal(validPass.status, 201);
+    const expiryTestPassId = validPass.data.pass.id;
+    const expiryTestQr = validPass.data.pass.qr_token;
+
+    await db.query(
+      'UPDATE providers SET criminal_record_expiry = $1 WHERE id = $2',
+      [pastDate, providerId]
+    );
+
+    const gateBlocked = await req(
+      'POST',
+      '/api/v1/passes/verify',
+      { qr_token: expiryTestQr },
+      secToken
+    );
+    assert.equal(gateBlocked.status, 403);
+    assert.equal(gateBlocked.data.authorized, false);
+    assert.equal(gateBlocked.data.code, 'CRIMINAL_RECORD_EXPIRED');
+
+    const extBlocked = await req(
+      'POST',
+      '/api/v1/external/passes/verify',
+      { qr_token: expiryTestQr },
+      superToken
+    );
+    assert.equal(extBlocked.status, 403);
+    assert.equal(extBlocked.data.authorized, false);
+    assert.equal(extBlocked.data.code, 'CRIMINAL_RECORD_EXPIRED');
+
+    // 3. Restaurar compliance vigente del prestador y probar bloqueo por ayudante con ART vencida
+    await db.query(
+      'UPDATE providers SET criminal_record_expiry = $1, insurance_expiry = $2 WHERE id = $3',
+      [futureDate, futureDate, providerId]
+    );
+    const expEmpRes = await req(
+      'POST',
+      '/api/v1/providers/employees',
+      {
+        full_name: 'Ramiro Vencido',
+        dni: `79${String(ts).slice(-6)}`,
+        role_label: 'Ayudante',
+        insurance_expiry: pastDate,
+      },
+      provToken
+    );
+    assert.equal(expEmpRes.status, 201);
+    const expEmpId = expEmpRes.data.employee.id;
+
+    const crewBlockedCreate = await req(
+      'POST',
+      '/api/v1/passes/create',
+      {
+        provider_id: providerId,
+        employee_ids: [expEmpId],
+        start_time: new Date(now - 5 * 60 * 1000).toISOString(),
+        end_time: new Date(now + 2 * 60 * 60 * 1000).toISOString(),
+      },
+      ownerToken
+    );
+    assert.equal(crewBlockedCreate.status, 403);
+    assert.equal(crewBlockedCreate.data.code, 'CREW_INSURANCE_EXPIRED');
+
+    // Limpieza
+    await db.query('DELETE FROM access_passes WHERE id = $1', [expiryTestPassId]);
+    await req('DELETE', `/api/v1/providers/employees/${expEmpId}`, undefined, provToken);
+  });
+
+  it('gestiona membresía Socio Verificado (alta, directorio prioritario y control Superadmin) (Fase 1.2)', async () => {
+    // 1. Consulta inicial de membresía propia
+    const initialBilling = await req('GET', '/api/v1/billing/provider/me', undefined, provToken);
+    assert.equal(initialBilling.status, 200);
+    assert.equal(initialBilling.data.membership.is_verified_member, false);
+    assert.ok(Array.isArray(initialBilling.data.plans) && initialBilling.data.plans.length >= 2);
+
+    // 2. El prestador activa membresía Socio Verificado Mensual
+    const subRes = await req(
+      'POST',
+      '/api/v1/billing/provider/subscribe',
+      { plan_code: 'verified_monthly', auto_renew: true },
+      provToken
+    );
+    assert.equal(subRes.status, 201);
+    assert.equal(subRes.data.membership.is_verified_member, true);
+    assert.equal(subRes.data.membership.plan_code, 'verified_monthly');
+    assert.ok(subRes.data.membership.days_remaining >= 29);
+
+    // 3. Aparece como Socio Verificado en /providers/me y en el directorio del residente (con prioridad)
+    const meWithMember = await req('GET', '/api/v1/providers/me', undefined, provToken);
+    assert.equal(meWithMember.status, 200);
+    assert.equal(meWithMember.data.membership.is_verified_member, true);
+
+    const dirRes = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dirRes.status, 200);
+    const dirProv = dirRes.data.providers.find((p) => Number(p.provider_id) === Number(providerId));
+    assert.ok(dirProv);
+    assert.equal(dirProv.is_verified_member, true);
+    assert.equal(dirProv.membership_tier, 'verified_monthly');
+
+    // 4. Superadmin consulta y revoca la membresía del prestador
+    const provUserId = dirProv.user_id;
+    const opsList = await req('GET', '/api/v1/billing/providers', undefined, superToken);
+    assert.equal(opsList.status, 200);
+    assert.ok(opsList.data.summary.active_members >= 1);
+
+    const revokeRes = await req(
+      'PATCH',
+      `/api/v1/billing/provider/${provUserId}`,
+      { action: 'cancel', notes: 'Fin de prueba E2E' },
+      superToken
+    );
+    assert.equal(revokeRes.status, 200);
+    assert.equal(revokeRes.data.membership.is_verified_member, false);
+
+    // 5. Superadmin reactiva por 60 días y verifica reflejo en Ops Compliance (/providers/all)
+    const grantRes = await req(
+      'PATCH',
+      `/api/v1/billing/provider/${provUserId}`,
+      { action: 'activate', plan_code: 'verified_pro', days: 60 },
+      superToken
+    );
+    assert.equal(grantRes.status, 200);
+    assert.equal(grantRes.data.membership.is_verified_member, true);
+    assert.equal(grantRes.data.membership.plan_code, 'verified_pro');
+
+    const allOps = await req('GET', '/api/v1/providers/all', undefined, superToken);
+    assert.equal(allOps.status, 200);
+    const opsRow = allOps.data.providers.find((p) => Number(p.user_id) === Number(provUserId));
+    assert.ok(opsRow);
+    assert.equal(opsRow.is_verified_member, true);
+    assert.equal(opsRow.membership_tier, 'verified_pro');
+  });
 });

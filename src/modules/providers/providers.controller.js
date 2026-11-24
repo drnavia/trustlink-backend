@@ -10,6 +10,11 @@
 
 const db = require('../../config/db');
 const { ensureEvolutionSchema } = require('../../config/ensureEvolutionSchema');
+const {
+  MEMBERSHIP_PLANS,
+  ensureProviderSubscriptionsTable,
+  getActiveMembershipForUser,
+} = require('../billing/billing.controller');
 
 /**
  * Asegura la existencia de la tabla provider_document_versions de forma idempotente
@@ -686,12 +691,17 @@ const getMyProviderProfile = async (req, res) => {
       employees = employeesRes.rows;
     }
 
-    const expiryAlerts = buildProviderExpiryAlerts({
-      providers: providersRes.rows,
-      vehicles,
-      employees,
-      windowDays: 30,
-    });
+    const [expiryAlerts, membership] = await Promise.all([
+      Promise.resolve(
+        buildProviderExpiryAlerts({
+          providers: providersRes.rows,
+          vehicles,
+          employees,
+          windowDays: 30,
+        })
+      ),
+      getActiveMembershipForUser(userId),
+    ]);
 
     return res.status(200).json({
       providers: providersRes.rows,
@@ -699,6 +709,8 @@ const getMyProviderProfile = async (req, res) => {
       vehicles,
       employees,
       expiry_alerts: expiryAlerts,
+      membership,
+      membership_plans: MEMBERSHIP_PLANS,
     });
   } catch (error) {
     console.error('Error al obtener perfil del prestador:', error);
@@ -711,6 +723,7 @@ const getMyProviderProfile = async (req, res) => {
  */
 const listAllProvidersForOps = async (req, res) => {
   try {
+    await ensureProviderSubscriptionsTable();
     const query = `
       SELECT
         u.id AS user_id,
@@ -726,9 +739,27 @@ const listAllProvidersForOps = async (req, res) => {
         p.insurance_expiry,
         COALESCE(p.status::text, 'sin_perfil') AS status,
         COALESCE(p.rating_avg, 0.00) AS rating_avg,
-        COALESCE(p.created_at, u.created_at) AS created_at
+        COALESCE(p.created_at, u.created_at) AS created_at,
+        COALESCE(sub.is_verified_member, FALSE) AS is_verified_member,
+        sub.plan_code AS membership_tier,
+        sub.status AS membership_status,
+        sub.ends_at AS membership_ends_at
       FROM users u
       LEFT JOIN providers p ON u.id = p.user_id
+      LEFT JOIN LATERAL (
+        SELECT
+          ps.plan_code,
+          ps.status,
+          ps.ends_at,
+          (ps.status IN ('active', 'trialing') AND ps.ends_at > NOW()) AS is_verified_member
+        FROM public.provider_subscriptions ps
+        WHERE ps.user_id = u.id
+        ORDER BY
+          CASE WHEN ps.status IN ('active', 'trialing') AND ps.ends_at > NOW() THEN 0 ELSE 1 END ASC,
+          ps.ends_at DESC,
+          ps.id DESC
+        LIMIT 1
+      ) sub ON TRUE
       WHERE p.id IS NOT NULL
          OR (
            LOWER(COALESCE(u.role::text, '')) NOT IN ('superadmin', 'admin', 'security')
@@ -741,6 +772,7 @@ const listAllProvidersForOps = async (req, res) => {
           WHEN 'rejected' THEN 2
           ELSE 3
         END ASC,
+        COALESCE(sub.is_verified_member, FALSE) DESC,
         COALESCE(p.rating_avg, 0.00) DESC,
         u.id ASC;
     `;
@@ -824,6 +856,7 @@ const updateComplianceStatus = async (req, res) => {
 const listVerifiedProviders = async (req, res) => {
   try {
     await ensureEvolutionSchema();
+    await ensureProviderSubscriptionsTable();
     await ensureVehicleInsuranceColumns();
     await ensureProviderEmployeesColumns();
 
@@ -837,6 +870,8 @@ const listVerifiedProviders = async (req, res) => {
           u.phone,
           u.email,
           p.specialty,
+          p.criminal_record_expiry,
+          p.insurance_expiry,
           COALESCE(p.rating_avg, 0.00)::numeric(4,2) AS rating_avg,
           p.id AS ordered_id,
           (
@@ -863,6 +898,13 @@ const listVerifiedProviders = async (req, res) => {
         (ARRAY_AGG(ap.specialty ORDER BY ap.ordered_id ASC))[1] AS specialty,
         ROUND(AVG(ap.rating_avg)::numeric, 2) AS rating_avg,
         COALESCE(SUM(ap.profile_jobs), 0)::int AS total_jobs,
+        COALESCE(sub.is_verified_member, FALSE) AS is_verified_member,
+        sub.plan_code AS membership_tier,
+        sub.ends_at AS membership_ends_at,
+        (
+          BOOL_OR(ap.criminal_record_expiry IS NOT NULL AND ap.criminal_record_expiry < CURRENT_DATE)
+          OR BOOL_OR(ap.insurance_expiry IS NOT NULL AND ap.insurance_expiry < CURRENT_DATE)
+        ) AS has_expired_docs,
         COALESCE(
           (
             SELECT JSON_AGG(
@@ -903,8 +945,35 @@ const listVerifiedProviders = async (req, res) => {
           '[]'::json
         ) AS employees
       FROM approved_profiles ap
-      GROUP BY ap.user_id, ap.first_name, ap.last_name, ap.phone, ap.email
-      ORDER BY AVG(ap.rating_avg) DESC, ap.user_id ASC;
+      LEFT JOIN LATERAL (
+        SELECT
+          ps.plan_code,
+          ps.ends_at,
+          TRUE AS is_verified_member
+        FROM public.provider_subscriptions ps
+        WHERE ps.user_id = ap.user_id
+          AND ps.status IN ('active', 'trialing')
+          AND ps.ends_at > NOW()
+        ORDER BY
+          CASE WHEN ps.plan_code = 'verified_pro' THEN 0 ELSE 1 END ASC,
+          ps.ends_at DESC,
+          ps.id DESC
+        LIMIT 1
+      ) sub ON TRUE
+      GROUP BY
+        ap.user_id,
+        ap.first_name,
+        ap.last_name,
+        ap.phone,
+        ap.email,
+        sub.is_verified_member,
+        sub.plan_code,
+        sub.ends_at
+      ORDER BY
+        COALESCE(sub.is_verified_member, FALSE) DESC,
+        CASE WHEN sub.plan_code = 'verified_pro' THEN 0 ELSE 1 END ASC,
+        AVG(ap.rating_avg) DESC,
+        ap.user_id ASC;
     `;
 
     const result = await db.query(query);

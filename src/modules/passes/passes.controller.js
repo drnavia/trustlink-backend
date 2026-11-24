@@ -10,6 +10,10 @@
 const crypto = require('crypto');
 const db = require('../../config/db');
 const { ensureEvolutionSchema } = require('../../config/ensureEvolutionSchema');
+const {
+  findComplianceExpiryViolation,
+  hydrateAuthorizedEmployeesExpiry,
+} = require('../../utils/complianceExpiry');
 
 /**
  * Asegura la existencia de la tabla gate_access_logs para auditar validaciones de Consola Garita.
@@ -933,7 +937,7 @@ const createPass = async (req, res) => {
     }
 
     const providerCheck = await db.query(
-      `SELECT p.id, u.country_id
+      `SELECT p.id, p.criminal_record_expiry, p.insurance_expiry, u.country_id
        FROM providers p
        LEFT JOIN users u ON u.id = p.user_id
        WHERE p.id = $1
@@ -954,6 +958,20 @@ const createPass = async (req, res) => {
       Number(provider_id),
       employee_ids
     );
+
+    const expiryViolation = findComplianceExpiryViolation({
+      criminalRecordExpiry: providerCheck.rows[0].criminal_record_expiry,
+      insuranceExpiry: providerCheck.rows[0].insurance_expiry,
+      authorizedEmployees,
+      context: 'create',
+    });
+    if (expiryViolation) {
+      return res.status(403).json({
+        code: expiryViolation.code,
+        expiry_date: expiryViolation.expiry_date,
+        error: expiryViolation.message,
+      });
+    }
 
     const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
     const qrToken = crypto.randomBytes(32).toString('hex');
@@ -1198,6 +1216,20 @@ const updatePass = async (req, res) => {
       ? await resolveAuthorizedEmployeesSnapshot(Number(currentPass.provider_id), employee_ids)
       : parseAuthorizedEmployeesArray(currentPass.authorized_employees);
 
+    if (Array.isArray(employee_ids) && nextAuthorizedEmployees.length > 0) {
+      const crewViolation = findComplianceExpiryViolation({
+        authorizedEmployees: nextAuthorizedEmployees,
+        context: 'create',
+      });
+      if (crewViolation) {
+        return res.status(403).json({
+          code: crewViolation.code,
+          expiry_date: crewViolation.expiry_date,
+          error: crewViolation.message,
+        });
+      }
+    }
+
     const supportsPlate = await hasVehiclePlateColumn();
 
     const updateSql = supportsPlate
@@ -1379,6 +1411,8 @@ const verifyPassByQR = async (req, res) => {
         u_prov.phone AS provider_phone,
         p.specialty AS provider_specialty,
         p.status AS compliance_status,
+        p.criminal_record_expiry,
+        p.insurance_expiry,
         u_owner.first_name AS owner_first_name,
         u_owner.last_name AS owner_last_name,
         u_owner.phone AS owner_phone,
@@ -1438,6 +1472,34 @@ const verifyPassByQR = async (req, res) => {
         code: 'COMPLIANCE_NOT_APPROVED',
         error: msg,
         message: msg,
+      });
+    }
+
+    const parsedCrew = parseAuthorizedEmployeesArray(passInfo.authorized_employees);
+    const hydratedCrew = await hydrateAuthorizedEmployeesExpiry(db, parsedCrew);
+    const expiryViolation = findComplianceExpiryViolation({
+      criminalRecordExpiry: passInfo.criminal_record_expiry,
+      insuranceExpiry: passInfo.insurance_expiry,
+      authorizedEmployees: hydratedCrew,
+      context: 'gate',
+    });
+    if (expiryViolation) {
+      await recordGateAccessLog({
+        qrToken: qr_token,
+        passId: passInfo.pass_id,
+        countryId: passInfo.country_id,
+        integrationLabel,
+        authorized: false,
+        reasonCode: expiryViolation.code,
+        message: expiryViolation.message,
+        httpStatus: 403,
+      });
+      return res.status(403).json({
+        authorized: false,
+        code: expiryViolation.code,
+        expiry_date: expiryViolation.expiry_date,
+        error: expiryViolation.message,
+        message: expiryViolation.message,
       });
     }
 
@@ -1570,7 +1632,7 @@ const verifyPassByQR = async (req, res) => {
       httpStatus: 200,
     });
 
-    const authorizedEmployees = parseAuthorizedEmployeesArray(passInfo.authorized_employees);
+    const authorizedEmployees = hydratedCrew;
     const effectivePlate = passInfo.vehicle_plate || passInfo.plate || null;
 
     return res.status(200).json({

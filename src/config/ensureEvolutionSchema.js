@@ -115,6 +115,27 @@ async function ensureEvolutionSchema() {
         )
       `);
 
+      // 4. Asegurar tabla provider_subscriptions para membresía "Socio Verificado"
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS public.provider_subscriptions (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+          plan_code VARCHAR(40) NOT NULL DEFAULT 'verified_monthly',
+          status VARCHAR(20) NOT NULL DEFAULT 'active',
+          starts_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+          ends_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+          external_subscription_id VARCHAR(160) NULL,
+          auto_renew BOOLEAN NOT NULL DEFAULT TRUE,
+          notes TEXT NULL,
+          created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+        )
+      `);
+      await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_provider_subscriptions_user_status
+        ON public.provider_subscriptions (user_id, status, ends_at DESC)
+      `);
+
       schemaInitialized = true;
     } catch (err) {
       schemaPromise = null;

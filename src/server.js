@@ -18,6 +18,7 @@ const externalRoutes = require('./modules/external/external.routes');
 const reviewsRoutes = require('./modules/reviews/reviews.routes');
 const brandingRoutes = require('./modules/branding/branding.routes');
 const accountRoutes = require('./modules/auth/account.routes');
+const billingRoutes = require('./modules/billing/billing.routes');
 const { ensureEvolutionSchema } = require('./config/ensureEvolutionSchema');
 const { securityHeaders } = require('./middlewares/security.middleware');
 
@@ -70,6 +71,7 @@ app.use('/api/v1/external', externalRoutes);
 app.use('/api/v1/reviews', reviewsRoutes);
 app.use('/api/v1/branding', brandingRoutes);
 app.use('/api/v1/account', accountRoutes);
+app.use('/api/v1/billing', billingRoutes);
 
 // ENDPOINT DE SALUD DEL SERVIDOR
 app.get('/health', (req, res) => {
