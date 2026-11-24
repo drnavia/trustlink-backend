@@ -729,8 +729,20 @@ const listAllProvidersForOps = async (req, res) => {
         COALESCE(p.created_at, u.created_at) AS created_at
       FROM users u
       LEFT JOIN providers p ON u.id = p.user_id
-      WHERE u.role = 'provider' OR COALESCE(u.can_use_provider, FALSE) = TRUE OR p.id IS NOT NULL
-      ORDER BY COALESCE(p.rating_avg, 0.00) DESC, u.id ASC;
+      WHERE p.id IS NOT NULL
+         OR (
+           LOWER(COALESCE(u.role::text, '')) NOT IN ('superadmin', 'admin', 'security')
+           AND (LOWER(COALESCE(u.role::text, '')) = 'provider' OR COALESCE(u.can_use_provider, FALSE) = TRUE)
+         )
+      ORDER BY
+        CASE COALESCE(p.status::text, 'sin_perfil')
+          WHEN 'pending' THEN 0
+          WHEN 'approved' THEN 1
+          WHEN 'rejected' THEN 2
+          ELSE 3
+        END ASC,
+        COALESCE(p.rating_avg, 0.00) DESC,
+        u.id ASC;
     `;
     const result = await db.query(query);
     return res.status(200).json({ count: result.rows.length, providers: result.rows });
