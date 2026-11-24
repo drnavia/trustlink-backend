@@ -65,16 +65,16 @@ Los ingresos se estructuran en tres capas complementarias, desacoplando la soste
 ## 5. Estado Real de la Plataforma (Alineado al Código Actual)
 
 ### Capacidades Ya Implementadas (Fases 1–4 + Mejoras Evolutivas Completadas)
-- **Arquitectura, Seguridad y PWA:** Backend modular en Node.js/Express + PostgreSQL (Supabase/local) y Frontend en React + Vite + Tailwind CSS con **PWA instalable** (`manifest.webmanifest` + ícono dedicado).
+- **Arquitectura, Seguridad y PWA:** Backend modular en Node.js/Express + PostgreSQL (Supabase/local) y Frontend en React + Vite + Tailwind CSS con **PWA instalable** (`manifest.webmanifest`, ícono dedicado y Service Worker `sw.js` sin caché de `/api/*`).
 - **Identidad Dual y Cuentas:** Una misma persona puede operar como residente y/o prestador (`can_use_resident`, `can_use_provider`, `primary_portal`), con recuperación y cambio de contraseña autenticado, hardening HTTP y rate limiting.
 - **Compliance Estricto con Bloqueo Automático (Fase 1.1):** Bloqueo automático de emisión de pases y acceso en garita (`CRIMINAL_RECORD_EXPIRED`, `INSURANCE_EXPIRED`, `CREW_INSURANCE_EXPIRED`) con auditoría en `gate_access_logs`.
 - **Membresía "Socio Verificado" (Fase 1.2):** Planes mensual/trimestral/Pro, insignia distintiva, orden prioritario en directorio, autogestión en Portal Prestador y control en Operaciones.
 - **Portal Prestador Completo:** Credenciales versionadas, **visibilidad persistente por especialidad** en directorio (`is_visible_in_directory`), flota vehicular, cuadrilla/ayudantes, agenda online, visitas, pases QR, **resumen de ingresos netos (93%)**, comprobantes imprimibles y reseñas cruzadas.
 - **Portal Residente y Pagos (Fases 3–4):** Directorio con filtro *Solo Socios Verificados*, ordenamiento y vista de reseñas verificadas; pasarela dual `mock | mercadopago` (Checkout Pro + webhook `x-signature`); **conformidad final** (digital o efectivo) con liberación escrow, **Comprobante del Hogar** imprimible (`TLK-REC-...`) y canal de **reclamos/garantía**.
-- **Gobernanza Central (Superadmin) y Admin Local (Fase 2):** Auditoría de compliance y mediación de reclamos, licenciamiento B2B por comunidad con consumo mensual de QR, rotación de API Keys, suspensiones locales, alertas proactivas y **exportación CSV** para administraciones.
+- **Gobernanza Central (Superadmin) y Admin Local (Fase 2):** Auditoría de compliance y mediación de reclamos, licenciamiento B2B por comunidad con consumo mensual de QR, rotación de API Keys, suspensiones locales, alertas proactivas y **exportación CSV** (comunidades B2B, auditoría de garita, transacciones, vencimientos y suspensiones locales).
 
 ### Backlog Diferido (Dependencias Externas para Salida a Producción Comercial)
-Ver detalle en [ROADMAP_TECNICO.md](./ROADMAP_TECNICO.md):
+Ver lista viva en [PENDIENTES.md](./PENDIENTES.md) y detalle técnico en [ROADMAP_TECNICO.md](./ROADMAP_TECNICO.md):
 1. Activación de credenciales reales de **Mercado Pago** en Railway (Sandbox → Producción) y cobro automatizado de suscripciones.
 2. **Subida directa de archivos** (PDF/fotos de ART y antecedentes) vía **Supabase Storage** con enlaces firmados.
 3. **Notificaciones transaccionales reales** por email (**Resend** / SMTP) para recuperación de contraseña y vencimientos.
