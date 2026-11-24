@@ -11,18 +11,18 @@ const {
   createOwnerReview,
   getProviderReviewsById
 } = require('./reviews.controller');
-const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
+const { verifyToken, verifyRoleOrPortal } = require('../../middlewares/auth.middleware');
 
 const router = Router();
 
 // Listar contratos del residente o prestador con estado de reseñas cruzadas
-router.get('/contracts', verifyToken, verifyRole(['owner', 'family', 'provider', 'superadmin']), getContractsForReviews);
+router.get('/contracts', verifyToken, verifyRoleOrPortal(['owner', 'family', 'provider', 'superadmin'], 'resident'), getContractsForReviews);
 
 // Residente califica al prestador (y recalcula rating_avg en providers)
-router.post('/provider', verifyToken, verifyRole(['owner', 'family', 'superadmin']), createProviderReview);
+router.post('/provider', verifyToken, verifyRoleOrPortal(['owner', 'family', 'superadmin'], 'resident'), createProviderReview);
 
 // Prestador califica al residente/propietario
-router.post('/owner', verifyToken, verifyRole(['provider']), createOwnerReview);
+router.post('/owner', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), createOwnerReview);
 
 // Consultar reseñas públicas/verificadas de un prestador
 router.get('/provider/:providerId', verifyToken, getProviderReviewsById);

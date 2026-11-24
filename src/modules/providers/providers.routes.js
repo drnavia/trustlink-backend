@@ -20,24 +20,24 @@ const {
   createLocalSuspension,
   liftLocalSuspension
 } = require('./providers.controller');
-const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
+const { verifyToken, verifyRole, verifyRoleOrPortal } = require('../../middlewares/auth.middleware');
 
 const router = Router();
 
 // Obtener credenciales/perfiles y flota vehicular del prestador autenticado
-router.get('/me', verifyToken, verifyRole(['provider', 'superadmin']), getMyProviderProfile);
+router.get('/me', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), getMyProviderProfile);
 
 // Registrar una nueva especialidad y documentación de compliance
-router.post('/profile', verifyToken, verifyRole(['provider']), updateProviderProfile);
+router.post('/profile', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), updateProviderProfile);
 
 // Editar una credencial de compliance existente por ID
-router.patch('/profile/:id', verifyToken, verifyRole(['provider']), editProviderProfile);
+router.patch('/profile/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), editProviderProfile);
 
 // Asociar un nuevo vehículo a la flota del prestador
-router.post('/vehicle', verifyToken, verifyRole(['provider']), addVehicle);
+router.post('/vehicle', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), addVehicle);
 
 // Editar un vehículo existente por ID
-router.patch('/vehicle/:id', verifyToken, verifyRole(['provider']), editVehicle);
+router.patch('/vehicle/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), editVehicle);
 
 // Listar todos los prestadores registrados para auditoría centralizada en Ops TrustLink
 router.get('/all', verifyToken, verifyRole(['superadmin']), listAllProvidersForOps);
@@ -49,7 +49,7 @@ router.patch('/compliance', verifyToken, verifyRole(['superadmin']), updateCompl
 router.get(
   '/directory',
   verifyToken,
-  verifyRole(['owner', 'family', 'admin', 'superadmin']),
+  verifyRoleOrPortal(['owner', 'family', 'admin', 'superadmin'], 'resident'),
   listVerifiedProviders
 );
 

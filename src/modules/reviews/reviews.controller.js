@@ -35,8 +35,11 @@ const getContractsForReviews = async (req, res) => {
 
     const userId = req.user.userId;
     const role = req.user.role;
+    const requestedPortal = String(req.query?.portal || '').trim().toLowerCase();
+    const useProviderView =
+      requestedPortal === 'provider' || (requestedPortal !== 'resident' && role === 'provider');
 
-    if (role === 'provider') {
+    if (useProviderView) {
       const result = await db.query(
         `SELECT
           sc.id AS contract_id,
@@ -86,6 +89,7 @@ const getContractsForReviews = async (req, res) => {
       );
 
       return res.status(200).json({
+        portal: 'provider',
         role: 'provider',
         contracts: result.rows
       });
@@ -139,7 +143,8 @@ const getContractsForReviews = async (req, res) => {
     );
 
     return res.status(200).json({
-      role: role || 'owner',
+      portal: 'resident',
+      role: requestedPortal === 'resident' ? 'owner' : role || 'owner',
       contracts: result.rows
     });
   } catch (error) {

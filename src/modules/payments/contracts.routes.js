@@ -10,12 +10,12 @@ const {
   createContract,
   checkoutContractPayment,
 } = require('./payments.controller');
-const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
+const { verifyToken, verifyRoleOrPortal } = require('../../middlewares/auth.middleware');
 
 const router = Router();
 
-router.get('/', verifyToken, verifyRole(['owner', 'family', 'superadmin']), listMyContracts);
-router.post('/', verifyToken, verifyRole(['owner', 'family', 'superadmin']), createContract);
-router.post('/:id/pay', verifyToken, verifyRole(['owner', 'family', 'superadmin']), checkoutContractPayment);
+router.get('/', verifyToken, verifyRoleOrPortal(['owner', 'family', 'superadmin'], 'resident'), listMyContracts);
+router.post('/', verifyToken, verifyRoleOrPortal(['owner', 'family', 'superadmin'], 'resident'), createContract);
+router.post('/:id/pay', verifyToken, verifyRoleOrPortal(['owner', 'family', 'superadmin'], 'resident'), checkoutContractPayment);
 
 module.exports = router;

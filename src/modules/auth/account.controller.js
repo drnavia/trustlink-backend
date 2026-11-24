@@ -114,7 +114,17 @@ async function getMyAccount(req, res) {
       return res.status(404).json({ error: 'Cuenta de usuario no encontrada.' });
     }
 
-    return res.json({ account: result.rows[0] });
+    const countriesRes = await db.query(
+      `SELECT id, name
+       FROM countries
+       WHERE is_active = TRUE
+       ORDER BY id ASC`
+    );
+
+    return res.json({
+      account: result.rows[0],
+      countries: countriesRes.rows,
+    });
   } catch (err) {
     console.error('[account.controller] Error en getMyAccount:', err);
     return res.status(500).json({ error: 'Error al obtener los datos de la cuenta.' });
@@ -233,9 +243,21 @@ async function updateMyProfile(req, res) {
       ]
     );
 
+    const updatedRow = updated.rows[0];
+    let countryName = null;
+    if (updatedRow.country_id) {
+      const cRes = await db.query('SELECT name FROM countries WHERE id = $1 LIMIT 1', [
+        updatedRow.country_id,
+      ]);
+      countryName = cRes.rows[0]?.name || null;
+    }
+
     return res.json({
       message: 'Perfil y ubicación actualizados correctamente.',
-      account: updated.rows[0],
+      account: {
+        ...updatedRow,
+        country_name: countryName,
+      },
     });
   } catch (err) {
     console.error('[account.controller] Error en updateMyProfile:', err);
