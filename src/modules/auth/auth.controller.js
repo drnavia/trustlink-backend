@@ -12,7 +12,7 @@ const {
   getDefaultPrimaryPortal,
 } = require('../../config/ensureEvolutionSchema');
 
-const PUBLIC_ALLOWED_ROLES = ['owner', 'family', 'provider', 'security'];
+const PUBLIC_ALLOWED_ROLES = ['owner', 'family', 'provider'];
 const PRIVILEGED_ALLOWED_ROLES = ['admin', 'superadmin', 'security'];
 
 const register = async (req, res) => {
@@ -246,10 +246,12 @@ const login = async (req, res) => {
 const getPrivilegedUsers = async (req, res) => {
   try {
     const query = `
-      SELECT id, first_name, last_name, email, dni, role, is_active, created_at
-      FROM users
-      WHERE role IN ('superadmin', 'admin')
-      ORDER BY created_at DESC;
+      SELECT u.id, u.first_name, u.last_name, u.email, u.dni, u.role, u.country_id,
+             c.name AS country_name, u.is_active, u.created_at
+      FROM users u
+      LEFT JOIN countries c ON c.id = u.country_id
+      WHERE u.role IN ('superadmin', 'admin', 'security')
+      ORDER BY u.created_at DESC;
     `;
     const result = await db.query(query);
 
@@ -266,16 +268,33 @@ const getPrivilegedUsers = async (req, res) => {
 const updatePrivilegedUser = async (req, res) => {
   try {
     const { id } = req.params;
-    const { first_name, last_name, email, dni, password, role, is_active } = req.body;
+    const { first_name, last_name, email, dni, password, role, country_id, is_active } = req.body;
 
-    let passwordHashQuery = '';
-    let values = [first_name, last_name, email, dni, role, is_active, id];
+    if (role !== undefined && !PRIVILEGED_ALLOWED_ROLES.includes(String(role).toLowerCase())) {
+      return res.status(400).json({ error: 'Rol inválido (admin, superadmin o security).' });
+    }
+
+    const normalizedRole = role !== undefined ? String(role).toLowerCase() : null;
+    const resolvedCountryId =
+      normalizedRole === 'superadmin'
+        ? null
+        : country_id !== undefined && country_id !== ''
+        ? Number(country_id)
+        : undefined;
+
+    let extraSet = '';
+    const values = [first_name, last_name, email, dni, normalizedRole, is_active, id];
+
+    if (resolvedCountryId !== undefined) {
+      values.push(resolvedCountryId);
+      extraSet += `, country_id = $${values.length}`;
+    }
 
     if (password && password.trim() !== '') {
       const salt = await bcrypt.genSalt(10);
       const hashedPassword = await bcrypt.hash(password, salt);
-      passwordHashQuery = ', password_hash = $8';
       values.push(hashedPassword);
+      extraSet += `, password_hash = $${values.length}`;
     }
 
     const query = `
@@ -286,9 +305,9 @@ const updatePrivilegedUser = async (req, res) => {
           dni = COALESCE($4, dni),
           role = COALESCE($5, role),
           is_active = COALESCE($6, is_active)
-          ${passwordHashQuery}
-      WHERE id = $7 AND role IN ('superadmin', 'admin')
-      RETURNING id, first_name, last_name, email, dni, role, is_active, created_at;
+          ${extraSet}
+      WHERE id = $7 AND role IN ('superadmin', 'admin', 'security')
+      RETURNING id, first_name, last_name, email, dni, role, country_id, is_active, created_at;
     `;
 
     const result = await db.query(query, values);

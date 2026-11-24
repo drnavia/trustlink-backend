@@ -5,7 +5,66 @@
  * @location /trustlink-backend/src/modules/payments/payments.controller.js
  */
 
+const crypto = require('crypto');
 const db = require('../../config/db');
+
+const ALLOWED_PAYMENT_STATUSES = ['pending', 'approved', 'released', 'refunded'];
+
+const safeTimingEqual = (a, b) => {
+  const bufA = Buffer.from(String(a || ''), 'utf8');
+  const bufB = Buffer.from(String(b || ''), 'utf8');
+  if (bufA.length !== bufB.length || bufA.length === 0) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+};
+
+/**
+ * Valida la autenticidad del webhook de pagos mediante secreto compartido (`x-webhook-secret`)
+ * o firma HMAC-SHA256 (`x-webhook-signature`, con o sin prefijo `sha256=`) contra PAYMENT_WEBHOOK_SECRET.
+ */
+const verifyWebhookAuth = (req) => {
+  const expectedSecret = String(
+    process.env.PAYMENT_WEBHOOK_SECRET || process.env.MP_WEBHOOK_SECRET || ''
+  ).trim();
+
+  if (!expectedSecret) {
+    return {
+      ok: false,
+      status: 503,
+      error: 'Webhook de pagos no configurado en el servidor (defina PAYMENT_WEBHOOK_SECRET).',
+    };
+  }
+
+  const providedSecret = String(req.headers['x-webhook-secret'] || '').trim();
+  if (providedSecret && safeTimingEqual(providedSecret, expectedSecret)) {
+    return { ok: true, mode: 'shared_secret' };
+  }
+
+  const rawSignatureHeader = String(
+    req.headers['x-webhook-signature'] || req.headers['x-signature'] || ''
+  ).trim();
+
+  if (rawSignatureHeader) {
+    const cleanSig = rawSignatureHeader.replace(/^sha256=/i, '').trim().toLowerCase();
+    const rawPayload = req.rawBody
+      ? req.rawBody
+      : Buffer.from(JSON.stringify(req.body || {}), 'utf8');
+    const expectedHmac = crypto
+      .createHmac('sha256', expectedSecret)
+      .update(rawPayload)
+      .digest('hex')
+      .toLowerCase();
+
+    if (safeTimingEqual(cleanSig, expectedHmac)) {
+      return { ok: true, mode: 'hmac_sha256' };
+    }
+  }
+
+  return {
+    ok: false,
+    status: 401,
+    error: 'Firma o secreto de webhook de pagos inválido o ausente.',
+  };
+};
 
 /**
  * Obtiene todos los contratos de servicio del residente autenticado.
@@ -332,41 +391,85 @@ const createOrUpdateQuote = async (req, res) => {
 };
 
 /**
- * Simula la confirmación de pago por webhook de pasarela.
+ * Procesa confirmación de pago por webhook de pasarela con validación HMAC-SHA256 / secreto
+ * y control de transiciones válidas de estado.
  */
 const confirmPayment = async (req, res) => {
   try {
-    const { gateway_payment_id, status } = req.body;
+    const authCheck = verifyWebhookAuth(req);
+    if (!authCheck.ok) {
+      return res.status(authCheck.status).json({ error: authCheck.error });
+    }
 
-    if (!gateway_payment_id || !status) {
+    const { gateway_payment_id, status } = req.body || {};
+    const normalizedStatus = String(status || '').trim().toLowerCase();
+
+    if (!gateway_payment_id || !normalizedStatus) {
       return res.status(400).json({ error: 'Faltan datos de la pasarela de pagos.' });
+    }
+
+    if (!ALLOWED_PAYMENT_STATUSES.includes(normalizedStatus)) {
+      return res.status(400).json({
+        error: `Estado de pago inválido. Valores permitidos: ${ALLOWED_PAYMENT_STATUSES.join(', ')}.`,
+      });
+    }
+
+    const existingTxRes = await db.query(
+      'SELECT id, contract_id, status FROM transactions WHERE gateway_payment_id = $1 LIMIT 1',
+      [String(gateway_payment_id).trim()]
+    );
+
+    if (existingTxRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Transacción no encontrada.' });
+    }
+
+    const currentTx = existingTxRes.rows[0];
+    const currentStatus = String(currentTx.status || '').toLowerCase();
+
+    if (currentStatus === normalizedStatus) {
+      return res.status(200).json({
+        message: `Transacción ya registrada en estado: ${normalizedStatus}`,
+        transaction_id: currentTx.id,
+        idempotent: true,
+      });
+    }
+
+    if (['released', 'refunded'].includes(currentStatus) && normalizedStatus === 'pending') {
+      return res.status(409).json({
+        error: `No se puede revertir una transacción desde '${currentStatus}' a 'pending'.`,
+      });
     }
 
     const updateTx = `
       UPDATE transactions
-      SET status = $1
-      WHERE gateway_payment_id = $2
+      SET status = $1::payment_status
+      WHERE id = $2
       RETURNING id, contract_id, status;
     `;
 
-    const txResult = await db.query(updateTx, [status, gateway_payment_id]);
-
-    if (txResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Transacción no encontrada.' });
-    }
-
+    const txResult = await db.query(updateTx, [normalizedStatus, currentTx.id]);
     const transaction = txResult.rows[0];
 
-    if (status === 'approved') {
+    if (normalizedStatus === 'approved') {
       await db.query(
-        "UPDATE service_contracts SET status = 'in_progress' WHERE id = $1",
+        `UPDATE service_contracts
+         SET status = 'in_progress'::contract_status
+         WHERE id = $1 AND status = 'pending'::contract_status`,
+        [transaction.contract_id]
+      );
+    } else if (normalizedStatus === 'released') {
+      await db.query(
+        `UPDATE service_contracts
+         SET status = 'completed'::contract_status
+         WHERE id = $1 AND status IN ('pending'::contract_status, 'in_progress'::contract_status)`,
         [transaction.contract_id]
       );
     }
 
     return res.status(200).json({
-      message: `Transacción procesada con estado: ${status}`,
-      transaction_id: transaction.id
+      message: `Transacción procesada con estado: ${normalizedStatus}`,
+      transaction_id: transaction.id,
+      verification_mode: authCheck.mode,
     });
   } catch (error) {
     console.error('Error al confirmar pago:', error);

@@ -1345,6 +1345,26 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
+    if (passInfo.pass_status === 'used') {
+      const msg = 'El pase QR ya fue utilizado para un ingreso previo.';
+      await recordGateAccessLog({
+        qrToken: qr_token,
+        passId: passInfo.pass_id,
+        countryId: passInfo.country_id,
+        integrationLabel,
+        authorized: false,
+        reasonCode: 'PASS_ALREADY_USED',
+        message: msg,
+        httpStatus: 403,
+      });
+      return res.status(403).json({
+        authorized: false,
+        code: 'PASS_ALREADY_USED',
+        error: msg,
+        message: msg,
+      });
+    }
+
     if (passInfo.pass_status !== 'pending') {
       const msg = `El pase se encuentra en estado ${passInfo.pass_status}.`;
       await recordGateAccessLog({
@@ -1389,7 +1409,36 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
-    const grantedMsg = 'Acceso autorizado.';
+    // Consumo atómico de ingreso único: cambia de 'pending' a 'used'
+    const consumedRes = await db.query(
+      `UPDATE access_passes
+       SET status = 'used'::pass_status
+       WHERE id = $1 AND status = 'pending'::pass_status
+       RETURNING id, status`,
+      [passInfo.pass_id]
+    );
+
+    if (consumedRes.rows.length === 0) {
+      const msg = 'El pase QR ya fue utilizado para un ingreso previo.';
+      await recordGateAccessLog({
+        qrToken: qr_token,
+        passId: passInfo.pass_id,
+        countryId: passInfo.country_id,
+        integrationLabel,
+        authorized: false,
+        reasonCode: 'PASS_ALREADY_USED',
+        message: msg,
+        httpStatus: 403,
+      });
+      return res.status(403).json({
+        authorized: false,
+        code: 'PASS_ALREADY_USED',
+        error: msg,
+        message: msg,
+      });
+    }
+
+    const grantedMsg = 'Acceso autorizado. Pase QR marcado como utilizado (ingreso único).';
     await recordGateAccessLog({
       qrToken: qr_token,
       passId: passInfo.pass_id,
@@ -1407,6 +1456,7 @@ const verifyPassByQR = async (req, res) => {
       message: grantedMsg,
       details: {
         pass_id: passInfo.pass_id,
+        status: 'used',
         provider_name: `${passInfo.provider_first_name} ${passInfo.provider_last_name}`,
         provider_dni: passInfo.provider_dni,
         specialty: passInfo.provider_specialty,

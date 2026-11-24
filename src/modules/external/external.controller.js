@@ -1346,7 +1346,27 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
-    if (record.status !== 'pending' && record.status !== 'used') {
+    if (record.status === 'used') {
+      const msg = 'El pase QR ya fue utilizado para un ingreso previo.';
+      await recordGateAccessLog({
+        qrToken,
+        passId: record.id,
+        countryId: record.country_id,
+        integrationLabel: auth.integrationLabel,
+        authMode: auth.authMode,
+        authorized: false,
+        reasonCode: 'PASS_ALREADY_USED',
+        message: msg,
+        httpStatus: 403
+      });
+      return res.status(403).json({
+        authorized: false,
+        code: 'PASS_ALREADY_USED',
+        error: msg
+      });
+    }
+
+    if (record.status !== 'pending') {
       const msg = `El pase QR no se encuentra habilitado (estado actual: ${record.status}).`;
       await recordGateAccessLog({
         qrToken,
@@ -1427,6 +1447,74 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    // Verificar suspensión operativa local activa en la comunidad
+    const suspensionCountryId = record.country_id || effectiveCountryId;
+    if (suspensionCountryId && record.provider_id) {
+      const suspTable = await db.query(
+        `SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'provider_local_suspensions'
+         LIMIT 1`
+      );
+      if (suspTable.rows.length > 0) {
+        const suspRes = await db.query(
+          `SELECT id, reason
+           FROM public.provider_local_suspensions
+           WHERE country_id = $1 AND provider_id = $2 AND active = TRUE
+           ORDER BY id DESC
+           LIMIT 1`,
+          [Number(suspensionCountryId), Number(record.provider_id)]
+        );
+        if (suspRes.rows.length > 0) {
+          const msg = `Ingreso bloqueado por suspensión operativa local en la comunidad: ${suspRes.rows[0].reason}`;
+          await recordGateAccessLog({
+            qrToken,
+            passId: record.id,
+            countryId: suspensionCountryId,
+            integrationLabel: auth.integrationLabel,
+            authMode: auth.authMode,
+            authorized: false,
+            reasonCode: 'LOCAL_SUSPENSION_ACTIVE',
+            message: msg,
+            httpStatus: 403
+          });
+          return res.status(403).json({
+            authorized: false,
+            code: 'LOCAL_SUSPENSION_ACTIVE',
+            error: msg
+          });
+        }
+      }
+    }
+
+    // Consumo atómico de ingreso único: cambia de 'pending' a 'used'
+    const consumedRes = await db.query(
+      `UPDATE access_passes
+       SET status = 'used'::pass_status
+       WHERE id = $1 AND status = 'pending'::pass_status
+       RETURNING id, status`,
+      [record.id]
+    );
+
+    if (consumedRes.rows.length === 0) {
+      const msg = 'El pase QR ya fue utilizado para un ingreso previo.';
+      await recordGateAccessLog({
+        qrToken,
+        passId: record.id,
+        countryId: record.country_id,
+        integrationLabel: auth.integrationLabel,
+        authMode: auth.authMode,
+        authorized: false,
+        reasonCode: 'PASS_ALREADY_USED',
+        message: msg,
+        httpStatus: 403
+      });
+      return res.status(403).json({
+        authorized: false,
+        code: 'PASS_ALREADY_USED',
+        error: msg
+      });
+    }
+
     let vehicles = [];
     if (record.provider_id) {
       const vehRes = await db.query(
@@ -1441,7 +1529,7 @@ const verifyExternalPassByQR = async (req, res) => {
       vehicles = vehRes.rows;
     }
 
-    const grantedMsg = 'Acceso autorizado para ingreso perimetral.';
+    const grantedMsg = 'Acceso autorizado para ingreso perimetral. Pase marcado como utilizado (ingreso único).';
     await recordGateAccessLog({
       qrToken,
       passId: record.id,
@@ -1475,7 +1563,7 @@ const verifyExternalPassByQR = async (req, res) => {
         end_time: record.end_time,
         start_utc_ms: record.start_utc_ms,
         end_utc_ms: record.end_utc_ms,
-        status: record.status,
+        status: 'used',
         vehicles
       }
     });

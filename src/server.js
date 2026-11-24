@@ -47,7 +47,14 @@ const corsOptions = {
 
 // MIDDLEWARES GLOBALES
 app.use(cors(corsOptions));
-app.use(express.json({ limit: '10mb' }));
+app.use(
+  express.json({
+    limit: '10mb',
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 // RUTAS MODULARES DE LA API (v1)
 app.use('/api/v1/auth', authRoutes);
