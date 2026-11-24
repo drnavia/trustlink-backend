@@ -6,6 +6,7 @@
 
 const { Router } = require('express');
 const {
+  getPaymentGatewayPublicConfig,
   getPendingContracts,
   checkoutContractPayment,
   createOrUpdateQuote,
@@ -14,6 +15,9 @@ const {
 const { verifyToken, verifyRoleOrPortal } = require('../../middlewares/auth.middleware');
 
 const router = Router();
+
+// Consultar configuración pública de la pasarela (modo mock / mercadopago y Take Rate)
+router.get('/config', verifyToken, getPaymentGatewayPublicConfig);
 
 // Consultar contratos pendientes de pago del residente (o usuario con portal residente habilitado)
 router.get('/pending', verifyToken, verifyRoleOrPortal(['owner', 'family', 'superadmin'], 'resident'), getPendingContracts);

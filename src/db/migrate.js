@@ -291,6 +291,19 @@ const MIGRATIONS = [
       `).catch(() => {});
     },
   },
+  {
+    id: '014_transactions_mercadopago_columns',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.transactions
+          ADD COLUMN IF NOT EXISTS preference_id VARCHAR(255) NULL,
+          ADD COLUMN IF NOT EXISTS checkout_url TEXT NULL,
+          ADD COLUMN IF NOT EXISTS gateway_mode VARCHAR(30) NOT NULL DEFAULT 'mock',
+          ADD COLUMN IF NOT EXISTS gateway_raw_status VARCHAR(60) NULL,
+          ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW();
+      `);
+    },
+  },
 ];
 
 async function runMigrations() {

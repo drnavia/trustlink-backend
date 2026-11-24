@@ -1082,4 +1082,55 @@ describe('TrustLink Backend — E2E Core Suite', () => {
         .catch(() => {});
     }
   });
+
+  it('expone configuración de pasarela en /payments/config y valida firma oficial x-signature de Mercado Pago (Fase 3)', async () => {
+    const cfgRes = await req('GET', '/api/v1/payments/config', undefined, ownerToken);
+    assert.equal(cfgRes.status, 200);
+    assert.equal(cfgRes.data.gateway_mode, 'mock');
+    assert.equal(cfgRes.data.platform_fee_percent, 7);
+
+    // Creamos un contrato + cotización pendiente para probar firma oficial MP x-signature (ts + v1)
+    const cRes = await req(
+      'POST',
+      '/api/v1/contracts',
+      {
+        provider_id: providerId,
+        description: 'Trabajo prueba firma Mercado Pago',
+        agreed_amount: 12000,
+      },
+      ownerToken
+    );
+    assert.equal(cRes.status, 201);
+    const mpContractId = cRes.data.contract.id;
+
+    const qRes = await req(
+      'POST',
+      '/api/v1/payments/quote',
+      { contract_id: mpContractId, agreed_amount: 12000 },
+      ownerToken
+    );
+    assert.equal(qRes.status, 201);
+    const gwPaymentId = qRes.data.transaction.gateway_payment_id;
+
+    const tsHeader = String(Math.floor(Date.now() / 1000));
+    const reqId = `e2e-mp-req-${ts}`;
+    const manifest = `id:${gwPaymentId};request-id:${reqId};ts:${tsHeader};`;
+    const v1 = crypto.createHmac('sha256', WEBHOOK_SECRET).update(manifest).digest('hex');
+
+    const whRes = await req(
+      'POST',
+      '/api/v1/payments/webhook',
+      { gateway_payment_id: gwPaymentId, status: 'approved' },
+      null,
+      {
+        'x-signature': `ts=${tsHeader},v1=${v1}`,
+        'x-request-id': reqId,
+      }
+    );
+    assert.equal(whRes.status, 200);
+    assert.equal(whRes.data.verification_mode, 'mp_x_signature');
+
+    // Limpieza
+    await db.query('DELETE FROM service_contracts WHERE id = $1', [mpContractId]);
+  });
 });

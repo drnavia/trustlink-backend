@@ -7,19 +7,47 @@
 
 const crypto = require('crypto');
 const db = require('../../config/db');
+const {
+  safeTimingEqual,
+  getGatewayConfig,
+  calculateSplit,
+  verifyMercadoPagoXSignature,
+  createCheckoutPreference,
+  fetchMercadoPagoPayment,
+} = require('./mercadopago.service');
 
 const ALLOWED_PAYMENT_STATUSES = ['pending', 'approved', 'released', 'refunded'];
 
-const safeTimingEqual = (a, b) => {
-  const bufA = Buffer.from(String(a || ''), 'utf8');
-  const bufB = Buffer.from(String(b || ''), 'utf8');
-  if (bufA.length !== bufB.length || bufA.length === 0) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
+const ensureTransactionGatewayColumns = async () => {
+  await db.query(`
+    ALTER TABLE public.transactions
+      ADD COLUMN IF NOT EXISTS preference_id VARCHAR(255) NULL,
+      ADD COLUMN IF NOT EXISTS checkout_url TEXT NULL,
+      ADD COLUMN IF NOT EXISTS gateway_mode VARCHAR(30) NOT NULL DEFAULT 'mock',
+      ADD COLUMN IF NOT EXISTS gateway_raw_status VARCHAR(60) NULL,
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW();
+  `);
 };
 
 /**
- * Valida la autenticidad del webhook de pagos mediante secreto compartido (`x-webhook-secret`)
- * o firma HMAC-SHA256 (`x-webhook-signature`, con o sin prefijo `sha256=`) contra PAYMENT_WEBHOOK_SECRET.
+ * Devuelve la configuración pública de la pasarela activa (modo mock/mercadopago y Take Rate).
+ * GET /api/v1/payments/config
+ */
+const getPaymentGatewayPublicConfig = async (req, res) => {
+  const config = getGatewayConfig();
+  return res.status(200).json({
+    gateway_mode: config.mode,
+    mp_configured: config.mpConfigured,
+    sandbox: config.sandbox,
+    platform_fee_percent: config.platformFeePercent,
+  });
+};
+
+/**
+ * Valida la autenticidad del webhook de pagos mediante:
+ * 1) Secreto compartido (`x-webhook-secret`),
+ * 2) Firma oficial de Mercado Pago (`x-signature: ts=...,v1=...`), o
+ * 3) Firma HMAC-SHA256 del cuerpo crudo (`x-webhook-signature` / `x-signature`).
  */
 const verifyWebhookAuth = (req) => {
   const expectedSecret = String(
@@ -37,6 +65,27 @@ const verifyWebhookAuth = (req) => {
   const providedSecret = String(req.headers['x-webhook-secret'] || '').trim();
   if (providedSecret && safeTimingEqual(providedSecret, expectedSecret)) {
     return { ok: true, mode: 'shared_secret' };
+  }
+
+  // Firma oficial Mercado Pago: x-signature: ts=...,v1=...
+  const mpSignatureHeader = String(req.headers['x-signature'] || '').trim();
+  if (mpSignatureHeader && mpSignatureHeader.includes('v1=')) {
+    const dataId =
+      req.query?.['data.id'] ||
+      req.body?.data?.id ||
+      req.body?.gateway_payment_id ||
+      '';
+    const xRequestId = String(req.headers['x-request-id'] || '').trim();
+    if (
+      verifyMercadoPagoXSignature({
+        xSignatureHeader: mpSignatureHeader,
+        xRequestId,
+        dataId,
+        secret: expectedSecret,
+      })
+    ) {
+      return { ok: true, mode: 'mp_x_signature' };
+    }
   }
 
   const rawSignatureHeader = String(
@@ -243,15 +292,20 @@ const getPendingContracts = async (req, res) => {
 };
 
 /**
- * Procesa el pago simulado de un contrato pendiente con Take Rate 7% / Neto Prestador 93%.
+ * Procesa el pago de un contrato pendiente con Take Rate parametrizable (default 7% / Neto Prestador 93%).
+ * Soporta modo dual:
+ * - `mock`: acreditación instantánea para piloto/tests locales.
+ * - `mercadopago`: crea preferencia real de Checkout Pro y devuelve `checkout_url` para redirección.
  * Soporta POST /api/v1/payments/checkout y POST /api/v1/contracts/:id/pay.
  */
 const checkoutContractPayment = async (req, res) => {
   try {
+    await ensureTransactionGatewayColumns();
     const userId = Number(req.user.userId);
     const userRole = String(req.user.role || '').toLowerCase();
     const contractId = Number(req.params.id || req.body?.contract_id);
     const gatewayProvider = String(req.body?.payment_method || 'mercadopago').trim() || 'mercadopago';
+    const config = getGatewayConfig();
 
     if (!Number.isInteger(contractId) || contractId <= 0) {
       return res.status(400).json({ error: 'Debe indicar un contrato válido para abonar.' });
@@ -285,17 +339,64 @@ const checkoutContractPayment = async (req, res) => {
       return res.status(400).json({ error: 'El monto del contrato es inválido.' });
     }
 
-    const platformFee = Number((totalAmount * 0.07).toFixed(2));
-    const providerPayout = Number((totalAmount - platformFee).toFixed(2));
+    const { platformFee, providerPayout, feePercent } = calculateSplit(
+      totalAmount,
+      config.platformFeePercent
+    );
+
+    if (config.mode === 'mercadopago') {
+      const preference = await createCheckoutPreference(
+        {
+          contractId,
+          description: contract.description,
+          totalAmount,
+          platformFee,
+          payerEmail: req.user?.email || null,
+        },
+        { config }
+      );
+
+      const pendingGatewayId = `MP-PREF-${preference.preferenceId}`;
+      const txResult = await db.query(
+        `INSERT INTO transactions (
+           contract_id, gateway_provider, gateway_payment_id,
+           preference_id, checkout_url, gateway_mode, gateway_raw_status,
+           total_amount, platform_fee, provider_payout, status
+         )
+         VALUES ($1, 'mercadopago', $2, $3, $4, 'mercadopago', 'preference_created', $5, $6, $7, 'pending')
+         RETURNING id, contract_id, gateway_provider, gateway_payment_id, preference_id, checkout_url, gateway_mode, total_amount, platform_fee, provider_payout, status, created_at`,
+        [
+          contractId,
+          pendingGatewayId,
+          preference.preferenceId,
+          preference.checkoutUrl,
+          totalAmount,
+          platformFee,
+          providerPayout,
+        ]
+      );
+
+      return res.status(200).json({
+        message: 'Preferencia de Mercado Pago generada. Redirigiendo al checkout seguro...',
+        gateway_mode: 'mercadopago',
+        requires_redirect: true,
+        checkout_url: preference.checkoutUrl,
+        preference_id: preference.preferenceId,
+        contract,
+        transaction: txResult.rows[0],
+      });
+    }
+
     const mockGatewayId = `MP-PAY-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
     const txResult = await db.query(
       `INSERT INTO transactions (
          contract_id, gateway_provider, gateway_payment_id,
+         gateway_mode, gateway_raw_status,
          total_amount, platform_fee, provider_payout, status
        )
-       VALUES ($1, $2, $3, $4, $5, $6, 'approved')
-       RETURNING id, contract_id, gateway_provider, gateway_payment_id, total_amount, platform_fee, provider_payout, status, created_at`,
+       VALUES ($1, $2, $3, 'mock', 'approved_mock', $4, $5, $6, 'approved')
+       RETURNING id, contract_id, gateway_provider, gateway_payment_id, gateway_mode, total_amount, platform_fee, provider_payout, status, created_at`,
       [contractId, gatewayProvider, mockGatewayId, totalAmount, platformFee, providerPayout]
     );
 
@@ -308,25 +409,31 @@ const checkoutContractPayment = async (req, res) => {
     );
 
     return res.status(200).json({
-      message: 'Pago acreditado correctamente. Comisión de plataforma (7%) y liquidación (93%) registradas.',
+      message: `Pago acreditado correctamente. Comisión de plataforma (${feePercent}%) y liquidación (${100 - feePercent}%) registradas.`,
+      gateway_mode: 'mock',
+      requires_redirect: false,
       contract: updatedContract.rows[0],
       transaction: txResult.rows[0],
     });
   } catch (error) {
     console.error('Error al procesar checkout del contrato:', error);
-    return res.status(500).json({ error: 'Error interno al procesar el pago del contrato.' });
+    return res.status(500).json({
+      error: error.message || 'Error interno al procesar el pago del contrato.',
+    });
   }
 };
 
 /**
- * Registra o actualiza el monto acordado in situ y genera la orden de pago (Take Rate 7%).
+ * Registra o actualiza el monto acordado in situ y genera la orden de pago (Take Rate configurable).
  * Roles permitidos: 'provider', 'owner', 'family', 'superadmin'
  */
 const createOrUpdateQuote = async (req, res) => {
   try {
+    await ensureTransactionGatewayColumns();
     const userId = Number(req.user.userId);
     const userRole = String(req.user.role || '').toLowerCase();
     const { contract_id, agreed_amount } = req.body;
+    const config = getGatewayConfig();
 
     if (!contract_id || !agreed_amount || Number(agreed_amount) <= 0) {
       return res.status(400).json({ error: 'Datos inválidos. Especifique un contrato y un monto acordado válido.' });
@@ -365,46 +472,98 @@ const createOrUpdateQuote = async (req, res) => {
     const contractResult = await db.query(updateQuery, [agreed_amount, contract_id]);
 
     const contract = contractResult.rows[0];
-    const totalAmount = Number(contract.agreed_amount);
-    const platformFee = Number((totalAmount * 0.07).toFixed(2)); // 7% Take Rate institucional
-    const providerPayout = Number((totalAmount - platformFee).toFixed(2)); // 93% para el prestador
+    const { totalAmount, platformFee, providerPayout } = calculateSplit(
+      Number(contract.agreed_amount),
+      config.platformFeePercent
+    );
 
-    const mockGatewayId = `MP-TX-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    let gatewayPaymentId = `MP-TX-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    let preferenceId = null;
+    let checkoutUrl = `https://checkout.mercadopago.com/simulate/${gatewayPaymentId}`;
+
+    if (config.mode === 'mercadopago') {
+      const preference = await createCheckoutPreference(
+        {
+          contractId: contract.id,
+          description: contract.description,
+          totalAmount,
+          platformFee,
+          payerEmail: req.user?.email || null,
+        },
+        { config }
+      );
+      preferenceId = preference.preferenceId;
+      gatewayPaymentId = `MP-PREF-${preference.preferenceId}`;
+      checkoutUrl = preference.checkoutUrl;
+    }
 
     const insertTx = `
-      INSERT INTO transactions (contract_id, gateway_provider, gateway_payment_id, total_amount, platform_fee, provider_payout, status)
-      VALUES ($1, 'mercadopago', $2, $3, $4, $5, 'pending')
-      RETURNING id, gateway_payment_id, total_amount, platform_fee, provider_payout, status;
+      INSERT INTO transactions (
+        contract_id, gateway_provider, gateway_payment_id,
+        preference_id, checkout_url, gateway_mode,
+        total_amount, platform_fee, provider_payout, status
+      )
+      VALUES ($1, 'mercadopago', $2, $3, $4, $5, $6, $7, $8, 'pending')
+      RETURNING id, gateway_payment_id, preference_id, checkout_url, gateway_mode, total_amount, platform_fee, provider_payout, status;
     `;
 
-    const txResult = await db.query(insertTx, [contract_id, mockGatewayId, totalAmount, platformFee, providerPayout]);
+    const txResult = await db.query(insertTx, [
+      contract_id,
+      gatewayPaymentId,
+      preferenceId,
+      checkoutUrl,
+      config.mode,
+      totalAmount,
+      platformFee,
+      providerPayout,
+    ]);
 
     return res.status(201).json({
       message: 'Orden de pago generada con éxito.',
-      checkout_url: `https://checkout.mercadopago.com/simulate/${mockGatewayId}`,
+      gateway_mode: config.mode,
+      checkout_url: checkoutUrl,
+      preference_id: preferenceId,
       transaction: txResult.rows[0]
     });
   } catch (error) {
     console.error('Error al procesar la cotización:', error);
-    return res.status(500).json({ error: 'Error interno al procesar la cotización.' });
+    return res.status(500).json({ error: error.message || 'Error interno al procesar la cotización.' });
   }
 };
 
 /**
- * Procesa confirmación de pago por webhook de pasarela con validación HMAC-SHA256 / secreto
- * y control de transiciones válidas de estado.
+ * Procesa confirmación de pago por webhook de pasarela con validación HMAC-SHA256 / x-signature oficial de MP
+ * y soporte tanto para payloads directos (`{ gateway_payment_id, status }`)
+ * como para notificaciones reales de Mercado Pago (`{ type: 'payment', data: { id } }`).
  */
 const confirmPayment = async (req, res) => {
   try {
+    await ensureTransactionGatewayColumns();
     const authCheck = verifyWebhookAuth(req);
     if (!authCheck.ok) {
       return res.status(authCheck.status).json({ error: authCheck.error });
     }
 
-    const { gateway_payment_id, status } = req.body || {};
-    const normalizedStatus = String(status || '').trim().toLowerCase();
+    const eventType = String(req.body?.type || req.query?.type || '').trim().toLowerCase();
+    const mpDataId = req.body?.data?.id || req.query?.['data.id'] || null;
 
-    if (!gateway_payment_id || !normalizedStatus) {
+    let gatewayPaymentId = req.body?.gateway_payment_id
+      ? String(req.body.gateway_payment_id).trim()
+      : null;
+    let normalizedStatus = String(req.body?.status || '').trim().toLowerCase();
+    let gatewayRawStatus = normalizedStatus || null;
+    let resolvedContractId = null;
+
+    // Notificación oficial de Mercado Pago: { type: 'payment', data: { id: '123456' } }
+    if (!gatewayPaymentId && eventType === 'payment' && mpDataId) {
+      const mpPayment = await fetchMercadoPagoPayment(mpDataId);
+      gatewayPaymentId = mpPayment.paymentId;
+      normalizedStatus = mpPayment.mappedStatus;
+      gatewayRawStatus = mpPayment.rawStatus;
+      resolvedContractId = mpPayment.contractId;
+    }
+
+    if (!gatewayPaymentId || !normalizedStatus) {
       return res.status(400).json({ error: 'Faltan datos de la pasarela de pagos.' });
     }
 
@@ -414,10 +573,22 @@ const confirmPayment = async (req, res) => {
       });
     }
 
-    const existingTxRes = await db.query(
-      'SELECT id, contract_id, status FROM transactions WHERE gateway_payment_id = $1 LIMIT 1',
-      [String(gateway_payment_id).trim()]
+    let existingTxRes = await db.query(
+      'SELECT id, contract_id, status, gateway_payment_id FROM transactions WHERE gateway_payment_id = $1 LIMIT 1',
+      [gatewayPaymentId]
     );
+
+    // Si vino desde Mercado Pago por primera vez (la fila se creó con MP-PREF-<id>), buscamos por contract_id
+    if (existingTxRes.rows.length === 0 && resolvedContractId) {
+      existingTxRes = await db.query(
+        `SELECT id, contract_id, status, gateway_payment_id
+         FROM transactions
+         WHERE contract_id = $1
+         ORDER BY id DESC
+         LIMIT 1`,
+        [resolvedContractId]
+      );
+    }
 
     if (existingTxRes.rows.length === 0) {
       return res.status(404).json({ error: 'Transacción no encontrada.' });
@@ -426,11 +597,12 @@ const confirmPayment = async (req, res) => {
     const currentTx = existingTxRes.rows[0];
     const currentStatus = String(currentTx.status || '').toLowerCase();
 
-    if (currentStatus === normalizedStatus) {
+    if (currentStatus === normalizedStatus && currentTx.gateway_payment_id === gatewayPaymentId) {
       return res.status(200).json({
         message: `Transacción ya registrada en estado: ${normalizedStatus}`,
         transaction_id: currentTx.id,
         idempotent: true,
+        verification_mode: authCheck.mode,
       });
     }
 
@@ -442,12 +614,20 @@ const confirmPayment = async (req, res) => {
 
     const updateTx = `
       UPDATE transactions
-      SET status = $1::payment_status
-      WHERE id = $2
-      RETURNING id, contract_id, status;
+      SET status = $1::payment_status,
+          gateway_payment_id = $2,
+          gateway_raw_status = COALESCE($3, gateway_raw_status),
+          updated_at = NOW()
+      WHERE id = $4
+      RETURNING id, contract_id, gateway_payment_id, status;
     `;
 
-    const txResult = await db.query(updateTx, [normalizedStatus, currentTx.id]);
+    const txResult = await db.query(updateTx, [
+      normalizedStatus,
+      gatewayPaymentId,
+      gatewayRawStatus,
+      currentTx.id,
+    ]);
     const transaction = txResult.rows[0];
 
     if (normalizedStatus === 'approved') {
@@ -473,11 +653,12 @@ const confirmPayment = async (req, res) => {
     });
   } catch (error) {
     console.error('Error al confirmar pago:', error);
-    return res.status(500).json({ error: 'Error interno al confirmar el pago.' });
+    return res.status(500).json({ error: error.message || 'Error interno al confirmar el pago.' });
   }
 };
 
 module.exports = {
+  getPaymentGatewayPublicConfig,
   listMyContracts,
   createContract,
   getPendingContracts,

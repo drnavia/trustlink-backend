@@ -145,6 +145,16 @@ async function ensureEvolutionSchema() {
         ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL
       `);
 
+      // 6. Asegurar columnas de Mercado Pago Checkout Pro en `transactions`
+      await db.query(`
+        ALTER TABLE public.transactions
+        ADD COLUMN IF NOT EXISTS preference_id VARCHAR(255) NULL,
+        ADD COLUMN IF NOT EXISTS checkout_url TEXT NULL,
+        ADD COLUMN IF NOT EXISTS gateway_mode VARCHAR(30) NOT NULL DEFAULT 'mock',
+        ADD COLUMN IF NOT EXISTS gateway_raw_status VARCHAR(60) NULL,
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+      `);
+
       schemaInitialized = true;
     } catch (err) {
       schemaPromise = null;
