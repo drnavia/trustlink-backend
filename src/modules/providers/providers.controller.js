@@ -201,30 +201,51 @@ const updateProviderProfile = async (req, res) => {
       });
     }
 
-    // Etapa 2: Verificar si el prestador ya tiene compliance personal aprobado para heredar docs / auto-aprobar catálogo estándar
-    const existingApprovedRes = await db.query(
-      `SELECT
-         criminal_record_url,
-         criminal_record_expiry,
-         insurance_policy_url,
-         insurance_expiry
-       FROM providers
-       WHERE user_id = $1 AND status = 'approved'::provider_status
-       ORDER BY id DESC
-       LIMIT 1`,
-      [userId]
-    );
+    // Etapa 2: Verificar compliance personal aprobado y heredar documentación personal vigente del usuario
+    const [existingApprovedRes, existingDocsRes] = await Promise.all([
+      db.query(
+        `SELECT
+           criminal_record_url,
+           criminal_record_expiry,
+           insurance_policy_url,
+           insurance_expiry
+         FROM providers
+         WHERE user_id = $1 AND status = 'approved'::provider_status
+         ORDER BY id DESC
+         LIMIT 1`,
+        [userId]
+      ),
+      db.query(
+        `SELECT
+           criminal_record_url,
+           criminal_record_expiry,
+           insurance_policy_url,
+           insurance_expiry
+         FROM providers
+         WHERE user_id = $1
+           AND (
+             criminal_record_url IS NOT NULL
+             OR insurance_policy_url IS NOT NULL
+             OR criminal_record_expiry IS NOT NULL
+             OR insurance_expiry IS NOT NULL
+           )
+         ORDER BY id DESC
+         LIMIT 1`,
+        [userId]
+      ),
+    ]);
     const approvedBase = existingApprovedRes.rows[0] || null;
+    const docsBase = approvedBase || existingDocsRes.rows[0] || null;
     const hasNewDocuments = Boolean(
       criminal_record_url || criminal_record_expiry || insurance_policy_url || insurance_expiry
     );
 
-    const resolvedCriminalUrl = criminal_record_url || approvedBase?.criminal_record_url || null;
+    const resolvedCriminalUrl = criminal_record_url || docsBase?.criminal_record_url || null;
     const resolvedCriminalExpiry =
-      criminal_record_expiry || approvedBase?.criminal_record_expiry || null;
-    const resolvedInsuranceUrl = insurance_policy_url || approvedBase?.insurance_policy_url || null;
+      criminal_record_expiry || docsBase?.criminal_record_expiry || null;
+    const resolvedInsuranceUrl = insurance_policy_url || docsBase?.insurance_policy_url || null;
     const resolvedInsuranceExpiry =
-      insurance_expiry || approvedBase?.insurance_expiry || null;
+      insurance_expiry || docsBase?.insurance_expiry || null;
 
     // Auto-aprobación: solo si es rubro del catálogo estándar, la persona ya está aprobada y no sube docs nuevos sin auditar
     const shouldAutoApprove = !isCustom && Boolean(approvedBase) && !hasNewDocuments;
@@ -321,10 +342,18 @@ const updateProviderProfile = async (req, res) => {
 };
 
 /**
- * Edita un perfil/especialidad existente perteneciente al prestador autenticado (`id` + `user_id`),
- * devuelve su estado de compliance a `'pending'` para una nueva auditoría y agrega al historial
- * las nuevas versiones documentales sin borrar las anteriores.
- * PUT /api/v1/providers/profile/:id
+ * Edita un perfil/especialidad existente o renueva documentación personal del prestador autenticado
+ * (`id` + `user_id`) aplicando las reglas de Fase 5.3:
+ * - **Edición de especialidad sin cambio documental:** resuelve si el rubro pertenece al catálogo
+ *   estándar (`STANDARD_SPECIALTIES_CATALOG`) o es personalizado (`is_custom_specialty`). Si la
+ *   persona ya posee compliance personal aprobado y cambia a un rubro estándar, se mantiene aprobada
+ *   al instante (`auto_approved = true`); si pasa a una especialidad personalizada, queda en revisión
+ *   puntual de Operaciones (`specialty_approval_status = 'pending'`).
+ * - **Renovación/actualización documental (Antecedentes o ART):** sincroniza el documento personal
+ *   en todas las especialidades del mismo `user_id`, agrega una única versión append-only en
+ *   `provider_document_versions` (solo para el documento que realmente cambió) y pasa el compliance
+ *   personal a `'pending'` para nueva auditoría de Operaciones.
+ * PATCH /api/v1/providers/profile/:id
  *
  * @param {import('express').Request} req - Solicitud HTTP con `params.id` y campos a actualizar.
  * @param {import('express').Response} res - Respuesta HTTP con el perfil actualizado.
@@ -332,29 +361,206 @@ const updateProviderProfile = async (req, res) => {
  */
 const editProviderProfile = async (req, res) => {
   try {
-    // Etapa 1: Lectura de parámetros y actualización parcial (COALESCE) restringida al usuario dueño
+    await ensureEvolutionSchema();
+    await ensureDocumentVersionsTable();
+
+    // Etapa 1: Validar existencia y propiedad del perfil objetivo
     const userId = req.user.userId;
     const { id } = req.params;
+    const existingRes = await db.query(
+      `
+        SELECT
+          id,
+          user_id,
+          specialty,
+          criminal_record_url,
+          criminal_record_expiry,
+          insurance_policy_url,
+          insurance_expiry,
+          COALESCE(is_custom_specialty, FALSE) AS is_custom_specialty,
+          custom_specialty_description,
+          COALESCE(specialty_approval_status, 'approved') AS specialty_approval_status,
+          status
+        FROM providers
+        WHERE id = $1 AND user_id = $2
+      `,
+      [id, userId]
+    );
+
+    if (existingRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Perfil de prestador no encontrado o no autorizado.' });
+    }
+
+    const existing = existingRes.rows[0];
     const {
       specialty,
+      is_custom_specialty,
+      custom_specialty_description,
       criminal_record_url,
       criminal_record_from,
       criminal_record_expiry,
       insurance_policy_url,
+      art_insurance_url,
       insurance_from,
-      insurance_expiry
+      insurance_expiry,
+      art_insurance_expiry
     } = req.body;
 
-    // Regla de compliance: cualquier modificación documental o de especialidad reinicia `status = 'pending'`
+    // Helper local para comparar fechas DATE/ISO sin falsos positivos por zona horaria
+    const normalizeDateKey = (value) => {
+      if (!value) return '';
+      if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return value.toISOString().slice(0, 10);
+      }
+      const str = String(value).trim();
+      return str.length >= 10 ? str.slice(0, 10) : str;
+    };
+
+    // Etapa 2: Detectar si se actualizaron realmente documentos personales (Antecedentes y/o ART)
+    const hasCriminalUrlField = Object.prototype.hasOwnProperty.call(req.body, 'criminal_record_url');
+    const hasCriminalExpiryField = Object.prototype.hasOwnProperty.call(
+      req.body,
+      'criminal_record_expiry'
+    );
+    const hasInsuranceUrlField =
+      Object.prototype.hasOwnProperty.call(req.body, 'insurance_policy_url') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'art_insurance_url');
+    const hasInsuranceExpiryField =
+      Object.prototype.hasOwnProperty.call(req.body, 'insurance_expiry') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'art_insurance_expiry');
+
+    const incomingCriminalUrl = hasCriminalUrlField
+      ? String(criminal_record_url || '').trim()
+      : undefined;
+    const incomingCriminalExpiry = hasCriminalExpiryField ? criminal_record_expiry || null : undefined;
+    const rawInsuranceUrl =
+      insurance_policy_url !== undefined ? insurance_policy_url : art_insurance_url;
+    const rawInsuranceExpiry =
+      insurance_expiry !== undefined ? insurance_expiry : art_insurance_expiry;
+    const incomingInsuranceUrl = hasInsuranceUrlField
+      ? String(rawInsuranceUrl || '').trim()
+      : undefined;
+    const incomingInsuranceExpiry = hasInsuranceExpiryField ? rawInsuranceExpiry || null : undefined;
+
+    const currentCriminalUrl = String(existing.criminal_record_url || '').trim();
+    const currentCriminalExpiryKey = normalizeDateKey(existing.criminal_record_expiry);
+    const currentInsuranceUrl = String(existing.insurance_policy_url || '').trim();
+    const currentInsuranceExpiryKey = normalizeDateKey(existing.insurance_expiry);
+
+    const criminalChanged = Boolean(
+      (incomingCriminalUrl !== undefined &&
+        incomingCriminalUrl !== '' &&
+        incomingCriminalUrl !== currentCriminalUrl) ||
+        (incomingCriminalExpiry !== undefined &&
+          normalizeDateKey(incomingCriminalExpiry) !== '' &&
+          normalizeDateKey(incomingCriminalExpiry) !== currentCriminalExpiryKey) ||
+        Boolean(criminal_record_from)
+    );
+
+    const insuranceChanged = Boolean(
+      (incomingInsuranceUrl !== undefined &&
+        incomingInsuranceUrl !== '' &&
+        incomingInsuranceUrl !== currentInsuranceUrl) ||
+        (incomingInsuranceExpiry !== undefined &&
+          normalizeDateKey(incomingInsuranceExpiry) !== '' &&
+          normalizeDateKey(incomingInsuranceExpiry) !== currentInsuranceExpiryKey) ||
+        Boolean(insurance_from)
+    );
+
+    const hasDocumentChanges = criminalChanged || insuranceChanged;
+
+    // Etapa 3: Resolver especialidad (catálogo estándar vs personalizada) si fue enviada
+    let nextSpecialty = existing.specialty;
+    let nextIsCustom = Boolean(existing.is_custom_specialty);
+    let nextCustomDescription = existing.custom_specialty_description || null;
+    let nextSpecialtyApprovalStatus = existing.specialty_approval_status || 'approved';
+    let specialtyChanged = false;
+
+    if (specialty !== undefined && String(specialty).trim()) {
+      const catalogMatch = resolveSpecialtyCatalogMatch(specialty);
+      const requestedCustom = Boolean(is_custom_specialty) || !catalogMatch.isStandard;
+      const cleanSpecialty = catalogMatch.canonicalSpecialty;
+      const cleanDescription =
+        custom_specialty_description !== undefined && custom_specialty_description !== null
+          ? String(custom_specialty_description).trim().slice(0, 300)
+          : existing.custom_specialty_description || null;
+
+      if (Boolean(is_custom_specialty) && (!cleanDescription || cleanDescription.length < 5)) {
+        return res.status(400).json({
+          error:
+            'Para proponer una especialidad personalizada debés incluir una breve descripción (mínimo 5 caracteres).',
+        });
+      }
+
+      specialtyChanged =
+        cleanSpecialty.toLowerCase() !== String(existing.specialty || '').trim().toLowerCase() ||
+        requestedCustom !== Boolean(existing.is_custom_specialty) ||
+        (requestedCustom &&
+          String(cleanDescription || '') !== String(existing.custom_specialty_description || ''));
+
+      nextSpecialty = cleanSpecialty;
+      nextIsCustom = requestedCustom;
+      nextCustomDescription = requestedCustom ? cleanDescription : null;
+
+      if (!requestedCustom) {
+        nextSpecialtyApprovalStatus = 'approved';
+      } else if (
+        !specialtyChanged &&
+        existing.specialty_approval_status === 'approved'
+      ) {
+        nextSpecialtyApprovalStatus = 'approved';
+      } else {
+        nextSpecialtyApprovalStatus = 'pending';
+      }
+    }
+
+    // Etapa 4: Determinar el estado de compliance resultante (auto-aprobación estándar vs auditoría)
+    const approvedCheckRes = await db.query(
+      `SELECT 1 FROM providers WHERE user_id = $1 AND status = 'approved'::provider_status LIMIT 1`,
+      [userId]
+    );
+    const userHasApprovedCompliance = approvedCheckRes.rows.length > 0;
+
+    let nextStatus = existing.status;
+    let autoApproved = false;
+
+    if (hasDocumentChanges) {
+      nextStatus = 'pending';
+    } else if (nextIsCustom && nextSpecialtyApprovalStatus !== 'approved') {
+      nextStatus = 'pending';
+    } else if (!nextIsCustom && (existing.status === 'approved' || userHasApprovedCompliance)) {
+      nextStatus = 'approved';
+      autoApproved = true;
+    }
+
+    const finalCriminalUrl =
+      criminalChanged && incomingCriminalUrl ? incomingCriminalUrl : existing.criminal_record_url;
+    const finalCriminalExpiry =
+      criminalChanged && incomingCriminalExpiry !== undefined
+        ? incomingCriminalExpiry
+        : existing.criminal_record_expiry;
+    const finalInsuranceUrl =
+      insuranceChanged && incomingInsuranceUrl
+        ? incomingInsuranceUrl
+        : existing.insurance_policy_url;
+    const finalInsuranceExpiry =
+      insuranceChanged && incomingInsuranceExpiry !== undefined
+        ? incomingInsuranceExpiry
+        : existing.insurance_expiry;
+
+    // Etapa 5: Persistir actualización en la fila objetivo
     const updateQuery = `
       UPDATE providers
-      SET specialty = COALESCE($1, specialty),
-          criminal_record_url = COALESCE($2, criminal_record_url),
-          criminal_record_expiry = COALESCE($3::date, criminal_record_expiry),
-          insurance_policy_url = COALESCE($4, insurance_policy_url),
-          insurance_expiry = COALESCE($5::date, insurance_expiry),
-          status = 'pending'
-      WHERE id = $6 AND user_id = $7
+      SET specialty = $1,
+          criminal_record_url = $2,
+          criminal_record_expiry = $3::date,
+          insurance_policy_url = $4,
+          insurance_expiry = $5::date,
+          is_custom_specialty = $6,
+          custom_specialty_description = $7,
+          specialty_approval_status = $8,
+          status = $9::provider_status
+      WHERE id = $10 AND user_id = $11
       RETURNING
         id,
         user_id,
@@ -363,55 +569,91 @@ const editProviderProfile = async (req, res) => {
         criminal_record_expiry,
         insurance_policy_url,
         insurance_expiry,
+        is_custom_specialty,
+        custom_specialty_description,
+        specialty_approval_status,
         status,
         rating_avg,
         created_at;
     `;
 
     const result = await db.query(updateQuery, [
-      specialty ? String(specialty).trim() : null,
-      criminal_record_url || null,
-      criminal_record_expiry || null,
-      insurance_policy_url || null,
-      insurance_expiry || null,
+      nextSpecialty,
+      finalCriminalUrl || null,
+      finalCriminalExpiry || null,
+      finalInsuranceUrl || null,
+      finalInsuranceExpiry || null,
+      nextIsCustom,
+      nextCustomDescription,
+      nextSpecialtyApprovalStatus,
+      nextStatus,
       id,
       userId
     ]);
 
-    // Etapa 2: Validar existencia y propiedad del perfil modificado
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Perfil de prestador no encontrado o no autorizado.' });
-    }
-
     const updatedProvider = result.rows[0];
 
-    // Etapa 3: Persistir nuevas versiones en el historial documental si se actualizaron URLs o vigencias
-    if (criminal_record_url || criminal_record_expiry) {
-      await recordDocumentVersion({
-        userId,
-        providerId: updatedProvider.id,
-        docType: 'criminal',
-        documentUrl: criminal_record_url || 'Sin URL',
-        validFrom: criminal_record_from || null,
-        validTo: criminal_record_expiry || null,
-        status: 'pending'
-      });
+    // Etapa 6: Si hubo renovación documental, propagar el documento personal a todas las especialidades
+    // del prestador y registrar versiones append-only solo de los documentos realmente modificados
+    if (hasDocumentChanges) {
+      await db.query(
+        `
+          UPDATE providers
+          SET criminal_record_url = CASE WHEN $1::boolean THEN $2 ELSE criminal_record_url END,
+              criminal_record_expiry = CASE WHEN $1::boolean THEN $3::date ELSE criminal_record_expiry END,
+              insurance_policy_url = CASE WHEN $4::boolean THEN $5 ELSE insurance_policy_url END,
+              insurance_expiry = CASE WHEN $4::boolean THEN $6::date ELSE insurance_expiry END,
+              status = 'pending'::provider_status
+          WHERE user_id = $7 AND id <> $8
+        `,
+        [
+          criminalChanged,
+          finalCriminalUrl || null,
+          finalCriminalExpiry || null,
+          insuranceChanged,
+          finalInsuranceUrl || null,
+          finalInsuranceExpiry || null,
+          userId,
+          updatedProvider.id
+        ]
+      );
+
+      if (criminalChanged) {
+        await recordDocumentVersion({
+          userId,
+          providerId: updatedProvider.id,
+          docType: 'criminal',
+          documentUrl: finalCriminalUrl || 'Sin URL',
+          validFrom: criminal_record_from || null,
+          validTo: finalCriminalExpiry || null,
+          status: 'pending'
+        });
+      }
+
+      if (insuranceChanged) {
+        await recordDocumentVersion({
+          userId,
+          providerId: updatedProvider.id,
+          docType: 'insurance',
+          documentUrl: finalInsuranceUrl || 'Sin URL',
+          validFrom: insurance_from || null,
+          validTo: finalInsuranceExpiry || null,
+          status: 'pending'
+        });
+      }
     }
 
-    if (insurance_policy_url || insurance_expiry) {
-      await recordDocumentVersion({
-        userId,
-        providerId: updatedProvider.id,
-        docType: 'insurance',
-        documentUrl: insurance_policy_url || 'Sin URL',
-        validFrom: insurance_from || null,
-        validTo: insurance_expiry || null,
-        status: 'pending'
-      });
-    }
+    const responseMessage = hasDocumentChanges
+      ? 'Documentación personal renovada y sincronizada en tus especialidades. Pendiente de auditoría de Operaciones.'
+      : autoApproved
+      ? `Especialidad "${updatedProvider.specialty}" actualizada y habilitada automáticamente.`
+      : nextIsCustom && nextSpecialtyApprovalStatus === 'pending'
+      ? `Especialidad personalizada "${updatedProvider.specialty}" enviada a revisión de Operaciones TrustLink.`
+      : 'Especialidad actualizada correctamente.';
 
     return res.status(200).json({
-      message: 'Perfil y versión documental actualizados con éxito. Pendiente de aprobación.',
+      message: responseMessage,
+      auto_approved: autoApproved,
       provider: updatedProvider
     });
   } catch (error) {

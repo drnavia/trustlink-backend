@@ -1668,5 +1668,47 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(approveCustom.status, 200);
     assert.equal(approveCustom.data.provider.status, 'approved');
     assert.equal(approveCustom.data.provider.specialty_approval_status, 'approved');
+
+    // 6. Editar especialidad estándar a otro rubro estándar sin cambiar documentos mantiene approved y NO duplica historial documental
+    const meBeforeEdit = await req('GET', '/api/v1/providers/me', undefined, provToken);
+    assert.equal(meBeforeEdit.status, 200);
+    const docsCountBeforeEdit = (meBeforeEdit.data.document_history || []).length;
+
+    const editStdRes = await req(
+      'PATCH',
+      `/api/v1/providers/profile/${stdRes.data.provider.id}`,
+      { specialty: 'Carpintero', is_custom_specialty: false },
+      provToken
+    );
+    assert.equal(editStdRes.status, 200);
+    assert.equal(editStdRes.data.auto_approved, true);
+    assert.equal(editStdRes.data.provider.status, 'approved');
+    assert.equal(editStdRes.data.provider.specialty, 'Carpintero');
+    assert.equal(editStdRes.data.provider.is_custom_specialty, false);
+
+    const meAfterEdit = await req('GET', '/api/v1/providers/me', undefined, provToken);
+    assert.equal((meAfterEdit.data.document_history || []).length, docsCountBeforeEdit);
+
+    // 7. Renovar 1 documento personal (ART) lo propaga a todas las especialidades del usuario y agrega exactamente 1 versión al historial
+    const renewedArtUrl = 'https://storage.trustlink.com/art_renovada_2027.pdf';
+    const renewArtRes = await req(
+      'PATCH',
+      `/api/v1/providers/profile/${stdRes.data.provider.id}`,
+      {
+        insurance_policy_url: renewedArtUrl,
+        insurance_expiry: '2028-06-30',
+      },
+      provToken
+    );
+    assert.equal(renewArtRes.status, 200);
+    assert.equal(renewArtRes.data.provider.status, 'pending');
+
+    const meAfterRenew = await req('GET', '/api/v1/providers/me', undefined, provToken);
+    assert.equal(meAfterRenew.status, 200);
+    assert.equal((meAfterRenew.data.document_history || []).length, docsCountBeforeEdit + 1);
+    assert.ok(
+      meAfterRenew.data.providers.every((p) => p.insurance_policy_url === renewedArtUrl),
+      'La renovación de ART debe sincronizarse en todas las especialidades del mismo prestador'
+    );
   });
 });

@@ -4,7 +4,7 @@ API REST modular de **TrustLink** — plataforma inteligente de servicios verifi
 
 > Documentación viva del proyecto:
 > - Negocio y producto: [docs/TRUSTLINK_MASTER_BRIEF.md](./docs/TRUSTLINK_MASTER_BRIEF.md)
-> - Roadmap técnico (Fases 1–5.2): [docs/ROADMAP_TECNICO.md](./docs/ROADMAP_TECNICO.md)
+> - Roadmap técnico (Fases 1–5.3): [docs/ROADMAP_TECNICO.md](./docs/ROADMAP_TECNICO.md)
 > - Puesta en producción en Supabase desde cero: [docs/DEPLOY_SUPABASE.md](./docs/DEPLOY_SUPABASE.md) + script SQL único [database/trustlink-production-init.sql](./database/trustlink-production-init.sql)
 > - Backlog diferido (externos y smoke test): [docs/PENDIENTES.md](./docs/PENDIENTES.md)
 
