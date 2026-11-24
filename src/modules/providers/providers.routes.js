@@ -25,6 +25,10 @@ const {
   listFavoriteProviders,
   addFavoriteProvider,
   removeFavoriteProvider,
+  updateCommercialProfile,
+  listProviderPublicQuestions,
+  askProviderPublicQuestion,
+  answerProviderPublicQuestion,
   listLocalSuspensions,
   createLocalSuspension,
   liftLocalSuspension,
@@ -48,6 +52,12 @@ router.patch('/profile/:id', verifyToken, verifyRoleOrPortal(['provider', 'super
 
 // Mostrar u ocultar una especialidad en el directorio sin afectar el estado de compliance aprobado
 router.patch('/profile/:id/visibility', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), toggleSpecialtyVisibility);
+
+// Actualizar ficha comercial rápida del prestador (urgencias 24h, presupuesto, facturación, medios de pago y bio)
+router.patch('/commercial-profile', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), updateCommercialProfile);
+
+// Responder una pregunta pública recibida en la ficha del prestador (Q&A comunitario)
+router.patch('/questions/:questionId/answer', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), answerProviderPublicQuestion);
 
 // Asociar un nuevo vehículo (con patente y póliza de seguro) a la flota del prestador
 router.post('/vehicle', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), addVehicle);
@@ -99,6 +109,19 @@ router.delete(
   verifyToken,
   verifyRoleOrPortal(['owner', 'family', 'admin', 'superadmin'], 'resident'),
   removeFavoriteProvider
+);
+
+// Preguntas y respuestas públicas (Q&A estilo ficha de producto) por prestador
+router.get(
+  '/:providerUserId/questions',
+  verifyToken,
+  listProviderPublicQuestions
+);
+router.post(
+  '/:providerUserId/questions',
+  verifyToken,
+  verifyRoleOrPortal(['owner', 'family', 'admin', 'superadmin'], 'resident'),
+  askProviderPublicQuestion
 );
 
 // ============================================================================

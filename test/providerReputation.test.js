@@ -11,6 +11,8 @@ const assert = require('node:assert/strict');
 const {
   REVIEW_MICRO_TAGS,
   normalizeReviewTags,
+  normalizeCommercialProfileInput,
+  computeResponseTimeStats,
   computeProviderReputation,
 } = require('../src/utils/providerReputation');
 
@@ -95,5 +97,48 @@ describe('providerReputation helper', () => {
     });
     assert.equal(suspended.level, 'alert');
     assert.equal(suspended.thermometer, 1);
+  });
+
+  // Caso 5: Normalización de la ficha comercial rápida (urgencias, presupuesto, factura y pagos)
+  it('normaliza la ficha comercial rápida descartando valores inválidos', () => {
+    const profile = normalizeCommercialProfileInput({
+      accepts_emergencies: true,
+      quote_visit_policy: 'sin_cargo',
+      invoice_type: 'factura_c',
+      accepted_payment_methods: ['efectivo', 'CRIPTOMONEDA', 'mercadopago', 'efectivo'],
+      service_bio: '  Electricista matriculado para tableros y urgencias.  ',
+    });
+    assert.equal(profile.accepts_emergencies, true);
+    assert.equal(profile.quote_visit_policy, 'sin_cargo');
+    assert.equal(profile.invoice_type, 'factura_c');
+    assert.deepEqual(profile.accepted_payment_methods, ['efectivo', 'mercadopago']);
+    assert.equal(profile.service_bio, 'Electricista matriculado para tableros y urgencias.');
+  });
+
+  // Caso 6: Cálculo de tiempo promedio de respuesta desde hilos de `visit_requests`
+  it('calcula tiempo promedio de respuesta y etiqueta legible desde visit_requests', () => {
+    const stats = computeResponseTimeStats([
+      {
+        created_at: '2026-11-24T10:00:00.000Z',
+        messages: [
+          { sender_role: 'resident', created_at: '2026-11-24T10:00:00.000Z', text: 'Hola' },
+          { sender_role: 'provider', created_at: '2026-11-24T10:20:00.000Z', text: 'Voy hoy' },
+        ],
+      },
+      {
+        created_at: '2026-11-24T12:00:00.000Z',
+        messages: [
+          { sender_role: 'resident', created_at: '2026-11-24T12:00:00.000Z', text: 'Consulta' },
+          { sender_role: 'provider', created_at: '2026-11-24T12:40:00.000Z', text: 'Confirmado' },
+        ],
+      },
+      {
+        created_at: '2026-11-24T14:00:00.000Z',
+        messages: [{ sender_role: 'resident', created_at: '2026-11-24T14:00:00.000Z', text: 'Sin respuesta' }],
+      },
+    ]);
+    assert.equal(stats.answered_count, 2);
+    assert.equal(stats.avg_response_minutes, 30);
+    assert.equal(stats.response_label, 'Responde en ~30 min');
   });
 });

@@ -1528,4 +1528,76 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(delFav.status, 200);
     assert.equal(delFav.data.is_favorite, false);
   });
+
+  // =========================================================================
+  // FASE 9: Marketplace Fase 5.2 — Ficha comercial, Urgencias 24h, Tiempo de respuesta y Q&A público
+  // =========================================================================
+  it('gestiona ficha comercial rápida, urgencias 24h, tiempo de respuesta y Q&A público comunitario (Fase 5.2)', async () => {
+    const provAccount = await req('GET', '/api/v1/account/me', undefined, provToken);
+    assert.equal(provAccount.status, 200);
+    const provUserId = Number(provAccount.data.account?.id || provAccount.data.user?.id);
+
+    // 1. Actualizar ficha comercial rápida y activar Urgencias 24h desde Portal Prestador
+    const commRes = await req(
+      'PATCH',
+      '/api/v1/providers/commercial-profile',
+      {
+        accepts_emergencies: true,
+        quote_visit_policy: 'sin_cargo',
+        invoice_type: 'factura_c',
+        accepted_payment_methods: ['efectivo', 'transferencia', 'mercadopago'],
+        service_bio: 'Especialista en tableros, térmicas y guardias 24h.',
+      },
+      provToken
+    );
+    assert.equal(commRes.status, 200);
+    assert.equal(commRes.data.commercial_profile.accepts_emergencies, true);
+    assert.equal(commRes.data.commercial_profile.quote_visit_policy, 'sin_cargo');
+
+    // 2. Residente publica una pregunta pública (Q&A) en la ficha del prestador
+    const askRes = await req(
+      'POST',
+      `/api/v1/providers/${provUserId}/questions`,
+      { question: '¿Atendés urgencias por corte de disyuntor los fines de semana?' },
+      ownerToken
+    );
+    assert.equal(askRes.status, 201);
+    const questionId = askRes.data.question.id;
+    assert.ok(questionId);
+
+    // 3. Prestador responde la pregunta pública y queda visible en GET /:providerUserId/questions
+    const ansRes = await req(
+      'PATCH',
+      `/api/v1/providers/questions/${questionId}/answer`,
+      { answer: 'Sí, atendemos urgencias sábados y domingos las 24 horas.' },
+      provToken
+    );
+    assert.equal(ansRes.status, 200);
+    assert.ok(ansRes.data.question.answered_at);
+
+    const listQRes = await req('GET', `/api/v1/providers/${provUserId}/questions`, undefined, ownerToken);
+    assert.equal(listQRes.status, 200);
+    assert.ok(
+      listQRes.data.questions.some(
+        (q) => Number(q.id) === Number(questionId) && q.answer.includes('24 horas')
+      )
+    );
+
+    // 4. Verificar que el directorio exponga ficha comercial, urgencias, Q&A y tiempo de respuesta
+    const dirRes = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dirRes.status, 200);
+    const entry = dirRes.data.providers.find((p) => Number(p.user_id) === Number(provUserId));
+    assert.ok(entry);
+    assert.equal(entry.accepts_emergencies, true);
+    assert.equal(entry.quote_visit_policy, 'sin_cargo');
+    assert.equal(entry.invoice_type, 'factura_c');
+    assert.ok(entry.public_questions_count >= 1);
+    assert.ok(entry.response_label, 'Debe calcular response_label a partir de visitas respondidas');
+
+    // 5. Verificar que GET /api/v1/providers/me exponga commercial_profile, response_stats y public_questions
+    const meRes = await req('GET', '/api/v1/providers/me', undefined, provToken);
+    assert.equal(meRes.status, 200);
+    assert.equal(meRes.data.commercial_profile.accepts_emergencies, true);
+    assert.ok(Array.isArray(meRes.data.public_questions) && meRes.data.public_questions.length >= 1);
+  });
 });

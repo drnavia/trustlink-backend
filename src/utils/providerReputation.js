@@ -22,6 +22,15 @@ const REVIEW_MICRO_TAGS = [
   'Recomendado',
 ];
 
+/** Valores permitidos para la política de presupuesto / visita técnica del prestador. */
+const ALLOWED_QUOTE_POLICIES = ['sin_cargo', 'arancelada', 'consultar'];
+
+/** Valores permitidos para la condición de facturación del prestador. */
+const ALLOWED_INVOICE_TYPES = ['factura_a', 'factura_c', 'ambas', 'sin_factura', 'consultar'];
+
+/** Medios de pago habilitados para mostrar en la ficha comercial del prestador. */
+const ALLOWED_PAYMENT_METHODS = ['efectivo', 'transferencia', 'mercadopago', 'tarjeta'];
+
 // Mapa auxiliar en minúsculas para normalizar variantes de capitalización o acentos básicos
 const REVIEW_TAG_LOOKUP = new Map(
   REVIEW_MICRO_TAGS.map((tag) => [
@@ -221,8 +230,146 @@ function computeProviderReputation(metrics = {}) {
   };
 }
 
+/**
+ * Sanitiza y normaliza los campos de la ficha comercial rápida del prestador (Fase 5.2):
+ * urgencias 24h, política de presupuesto, facturación, medios de pago y descripción breve.
+ *
+ * @param {object} [raw={}] - Payload recibido desde el formulario del Portal Prestador.
+ * @returns {{
+ *   accepts_emergencies: boolean,
+ *   quote_visit_policy: string,
+ *   invoice_type: string,
+ *   accepted_payment_methods: string[],
+ *   service_bio: string|null
+ * }} Objeto normalizado listo para persistir en `providers`.
+ */
+function normalizeCommercialProfileInput(raw = {}) {
+  const acceptsEmergencies = Boolean(raw.accepts_emergencies);
+
+  const rawQuote = String(raw.quote_visit_policy || 'consultar').trim().toLowerCase();
+  const quoteVisitPolicy = ALLOWED_QUOTE_POLICIES.includes(rawQuote) ? rawQuote : 'consultar';
+
+  const rawInvoice = String(raw.invoice_type || 'consultar').trim().toLowerCase();
+  const invoiceType = ALLOWED_INVOICE_TYPES.includes(rawInvoice) ? rawInvoice : 'consultar';
+
+  const rawMethods = Array.isArray(raw.accepted_payment_methods)
+    ? raw.accepted_payment_methods
+    : ['efectivo', 'transferencia', 'mercadopago'];
+  const acceptedPaymentMethods = [];
+  for (const m of rawMethods) {
+    const norm = String(m || '').trim().toLowerCase();
+    if (ALLOWED_PAYMENT_METHODS.includes(norm) && !acceptedPaymentMethods.includes(norm)) {
+      acceptedPaymentMethods.push(norm);
+    }
+  }
+
+  const bioClean =
+    raw.service_bio !== undefined && raw.service_bio !== null
+      ? String(raw.service_bio).trim().slice(0, 400)
+      : '';
+
+  return {
+    accepts_emergencies: acceptsEmergencies,
+    quote_visit_policy: quoteVisitPolicy,
+    invoice_type: invoiceType,
+    accepted_payment_methods: acceptedPaymentMethods,
+    service_bio: bioClean || null,
+  };
+}
+
+/**
+ * Formatea una duración promedio en minutos a una etiqueta humana estilo marketplace
+ * (ej.: `"Responde en < 15 min"`, `"Responde en ~35 min"`, `"Responde en ~2 h"`).
+ *
+ * @param {number|null} avgMinutes - Promedio en minutos o `null` si aún no hay muestras.
+ * @returns {string|null} Etiqueta legible o `null`.
+ */
+function formatResponseTimeLabel(avgMinutes) {
+  if (avgMinutes === null || avgMinutes === undefined || !Number.isFinite(avgMinutes)) {
+    return null;
+  }
+  const rounded = Math.max(1, Math.round(avgMinutes));
+  if (rounded < 15) return 'Responde en < 15 min';
+  if (rounded < 60) return `Responde en ~${rounded} min`;
+  const hours = Math.round(rounded / 60);
+  if (hours <= 1) return 'Responde en ~1 h';
+  if (hours <= 12) return `Responde en ~${hours} h`;
+  if (hours <= 24) return 'Responde en el día';
+  return 'Responde en +24 h';
+}
+
+/**
+ * Calcula estadísticas de tiempo promedio de respuesta de un prestador a partir
+ * de los hilos JSONB `messages` de `visit_requests`.
+ * Para cada visita mide la diferencia entre el primer mensaje del residente (o `created_at`)
+ * y la primera respuesta cuyo `sender_role` sea `'provider'`.
+ *
+ * @param {Array<{ created_at?: string|Date, messages?: Array|string }>} visitRows - Filas de visitas del prestador.
+ * @returns {{ avg_response_minutes: number|null, response_label: string|null, answered_count: number }}
+ */
+function computeResponseTimeStats(visitRows = []) {
+  if (!Array.isArray(visitRows) || visitRows.length === 0) {
+    return { avg_response_minutes: null, response_label: null, answered_count: 0 };
+  }
+
+  const samplesMinutes = [];
+
+  for (const row of visitRows) {
+    let msgs = [];
+    if (Array.isArray(row?.messages)) {
+      msgs = row.messages;
+    } else if (typeof row?.messages === 'string') {
+      try {
+        const parsed = JSON.parse(row.messages);
+        if (Array.isArray(parsed)) msgs = parsed;
+      } catch (_) {
+        msgs = [];
+      }
+    }
+
+    // Buscar la primera respuesta emitida por el prestador dentro del hilo
+    const firstProviderMsg = msgs.find(
+      (m) => String(m?.sender_role || '').toLowerCase() === 'provider' && m?.created_at
+    );
+    if (!firstProviderMsg) continue;
+
+    // Tomar como inicio el primer mensaje del residente (o `created_at` de la visita)
+    const firstResidentMsg = msgs.find(
+      (m) => String(m?.sender_role || '').toLowerCase() !== 'provider' && m?.created_at
+    );
+    const startRaw = firstResidentMsg?.created_at || row?.created_at;
+    const startMs = startRaw ? new Date(startRaw).getTime() : NaN;
+    const replyMs = new Date(firstProviderMsg.created_at).getTime();
+
+    if (Number.isNaN(startMs) || Number.isNaN(replyMs)) continue;
+    const diffMinutes = Math.max(1, (replyMs - startMs) / 60000);
+    // Acotar outliers extremos (máximo 7 días) para no distorsionar el promedio histórico
+    samplesMinutes.push(Math.min(diffMinutes, 7 * 24 * 60));
+  }
+
+  if (samplesMinutes.length === 0) {
+    return { avg_response_minutes: null, response_label: null, answered_count: 0 };
+  }
+
+  const avgMinutes = Math.round(
+    samplesMinutes.reduce((acc, v) => acc + v, 0) / samplesMinutes.length
+  );
+
+  return {
+    avg_response_minutes: avgMinutes,
+    response_label: formatResponseTimeLabel(avgMinutes),
+    answered_count: samplesMinutes.length,
+  };
+}
+
 module.exports = {
   REVIEW_MICRO_TAGS,
+  ALLOWED_QUOTE_POLICIES,
+  ALLOWED_INVOICE_TYPES,
+  ALLOWED_PAYMENT_METHODS,
   normalizeReviewTags,
+  normalizeCommercialProfileInput,
+  formatResponseTimeLabel,
+  computeResponseTimeStats,
   computeProviderReputation,
 };

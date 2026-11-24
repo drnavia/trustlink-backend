@@ -216,6 +216,32 @@ async function ensureEvolutionSchema() {
         ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb
       `);
 
+      // 10. Asegurar ficha comercial rápida, urgencias 24h y tabla Q&A público (Fase 5.2)
+      await db.query(`
+        ALTER TABLE public.providers
+        ADD COLUMN IF NOT EXISTS accepts_emergencies BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS quote_visit_policy VARCHAR(40) NOT NULL DEFAULT 'consultar',
+        ADD COLUMN IF NOT EXISTS invoice_type VARCHAR(30) NOT NULL DEFAULT 'consultar',
+        ADD COLUMN IF NOT EXISTS accepted_payment_methods JSONB NOT NULL DEFAULT '["efectivo","transferencia","mercadopago"]'::jsonb,
+        ADD COLUMN IF NOT EXISTS service_bio TEXT NULL
+      `);
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS public.provider_public_questions (
+          id SERIAL PRIMARY KEY,
+          provider_user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+          asked_by_user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+          question TEXT NOT NULL,
+          answer TEXT NULL,
+          answered_by_user_id INTEGER NULL REFERENCES public.users(id) ON DELETE SET NULL,
+          created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+          answered_at TIMESTAMP WITHOUT TIME ZONE NULL
+        )
+      `);
+      await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_provider_public_questions_provider
+        ON public.provider_public_questions (provider_user_id, created_at DESC)
+      `);
+
       schemaInitialized = true;
     } catch (err) {
       schemaPromise = null;

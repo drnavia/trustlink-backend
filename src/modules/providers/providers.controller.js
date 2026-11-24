@@ -18,6 +18,8 @@ const {
 } = require('../billing/billing.controller');
 const {
   computeProviderReputation,
+  normalizeCommercialProfileInput,
+  computeResponseTimeStats,
   REVIEW_MICRO_TAGS,
 } = require('../../utils/providerReputation');
 
@@ -777,6 +779,11 @@ const getMyProviderProfile = async (req, res) => {
           insurance_expiry,
           status,
           COALESCE(is_visible_in_directory, TRUE) AS is_visible_in_directory,
+          COALESCE(accepts_emergencies, FALSE) AS accepts_emergencies,
+          COALESCE(quote_visit_policy, 'consultar') AS quote_visit_policy,
+          COALESCE(invoice_type, 'consultar') AS invoice_type,
+          COALESCE(accepted_payment_methods, '["efectivo","transferencia","mercadopago"]'::jsonb) AS accepted_payment_methods,
+          service_bio,
           rating_avg,
           created_at
         FROM providers
@@ -857,44 +864,79 @@ const getMyProviderProfile = async (req, res) => {
       employees = employeesRes.rows;
     }
 
-    // Etapa 4: Calcular alertas de vencimiento (30 días), membresía activa y métricas de reputación en paralelo
-    const [expiryAlerts, membership, repMetricsRes, topTagsRes] = await Promise.all([
-      Promise.resolve(
-        buildProviderExpiryAlerts({
-          providers: providersRes.rows,
-          vehicles,
-          employees,
-          windowDays: 30,
-        })
-      ),
-      getActiveMembershipForUser(userId),
-      db.query(
-        `
-          SELECT
-            (SELECT COUNT(*)::int FROM service_contracts sc JOIN providers p ON p.id = sc.provider_id WHERE p.user_id = $1) AS total_jobs,
-            (SELECT COUNT(*)::int FROM service_contracts sc JOIN providers p ON p.id = sc.provider_id WHERE p.user_id = $1 AND sc.status = 'completed'::contract_status) AS completed_jobs,
-            (SELECT COUNT(*)::int FROM provider_reviews pr JOIN providers p ON p.id = pr.provider_id WHERE p.user_id = $1) AS reviews_count,
-            (SELECT COALESCE(AVG(pr.rating), 0)::numeric(4,2) FROM provider_reviews pr JOIN providers p ON p.id = pr.provider_id WHERE p.user_id = $1) AS rating_avg,
-            (SELECT COUNT(*)::int FROM public.service_disputes sd JOIN service_contracts sc ON sc.id = sd.contract_id JOIN providers p ON p.id = sc.provider_id WHERE p.user_id = $1) AS disputes_count
-        `,
-        [userId]
-      ),
-      db.query(
-        `
-          SELECT tag, COUNT(*)::int AS count
-          FROM provider_reviews pr
-          JOIN providers p ON p.id = pr.provider_id
-          CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(pr.tags, '[]'::jsonb)) AS tag
-          WHERE p.user_id = $1
-          GROUP BY tag
-          ORDER BY count DESC, tag ASC
-          LIMIT 5
-        `,
-        [userId]
-      ),
-    ]);
+    // Etapa 4: Calcular alertas de vencimiento (30 días), membresía, reputación, tiempo de respuesta y Q&A en paralelo
+    const [expiryAlerts, membership, repMetricsRes, topTagsRes, visitsForSpeedRes, publicQuestionsRes] =
+      await Promise.all([
+        Promise.resolve(
+          buildProviderExpiryAlerts({
+            providers: providersRes.rows,
+            vehicles,
+            employees,
+            windowDays: 30,
+          })
+        ),
+        getActiveMembershipForUser(userId),
+        db.query(
+          `
+            SELECT
+              (SELECT COUNT(*)::int FROM service_contracts sc JOIN providers p ON p.id = sc.provider_id WHERE p.user_id = $1) AS total_jobs,
+              (SELECT COUNT(*)::int FROM service_contracts sc JOIN providers p ON p.id = sc.provider_id WHERE p.user_id = $1 AND sc.status = 'completed'::contract_status) AS completed_jobs,
+              (SELECT COUNT(*)::int FROM provider_reviews pr JOIN providers p ON p.id = pr.provider_id WHERE p.user_id = $1) AS reviews_count,
+              (SELECT COALESCE(AVG(pr.rating), 0)::numeric(4,2) FROM provider_reviews pr JOIN providers p ON p.id = pr.provider_id WHERE p.user_id = $1) AS rating_avg,
+              (SELECT COUNT(*)::int FROM public.service_disputes sd JOIN service_contracts sc ON sc.id = sd.contract_id JOIN providers p ON p.id = sc.provider_id WHERE p.user_id = $1) AS disputes_count
+          `,
+          [userId]
+        ),
+        db.query(
+          `
+            SELECT tag, COUNT(*)::int AS count
+            FROM provider_reviews pr
+            JOIN providers p ON p.id = pr.provider_id
+            CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(pr.tags, '[]'::jsonb)) AS tag
+            WHERE p.user_id = $1
+            GROUP BY tag
+            ORDER BY count DESC, tag ASC
+            LIMIT 5
+          `,
+          [userId]
+        ),
+        db
+          .query(
+            `
+              SELECT vr.created_at, vr.messages
+              FROM visit_requests vr
+              JOIN providers p ON p.id = vr.provider_id
+              WHERE p.user_id = $1
+              ORDER BY vr.id DESC
+              LIMIT 100
+            `,
+            [userId]
+          )
+          .catch(() => ({ rows: [] })),
+        db.query(
+          `
+            SELECT
+              q.id,
+              q.provider_user_id,
+              q.asked_by_user_id,
+              q.question,
+              q.answer,
+              q.created_at,
+              q.answered_at,
+              u.first_name AS asked_by_first_name,
+              u.last_name AS asked_by_last_name
+            FROM public.provider_public_questions q
+            LEFT JOIN public.users u ON u.id = q.asked_by_user_id
+            WHERE q.provider_user_id = $1
+            ORDER BY (q.answer IS NULL) DESC, q.id DESC
+            LIMIT 50
+          `,
+          [userId]
+        ),
+      ]);
 
     const repRow = repMetricsRes.rows[0] || {};
+    const responseStats = computeResponseTimeStats(visitsForSpeedRes.rows);
     const hasExpiredPersonalDocs = expiryAlerts.some(
       (a) => a.severity === 'expired' && (a.category === 'criminal_record' || a.category === 'art_insurance')
     );
@@ -914,7 +956,28 @@ const getMyProviderProfile = async (req, res) => {
       total_jobs: Number(repRow.total_jobs || 0),
       disputes_count: Number(repRow.disputes_count || 0),
       top_tags: topTagsRes.rows,
+      avg_response_minutes: responseStats.avg_response_minutes,
+      response_label: responseStats.response_label,
     };
+
+    const primaryProfile = providersRes.rows[0] || null;
+    const commercialProfile = primaryProfile
+      ? {
+          accepts_emergencies: Boolean(primaryProfile.accepts_emergencies),
+          quote_visit_policy: primaryProfile.quote_visit_policy || 'consultar',
+          invoice_type: primaryProfile.invoice_type || 'consultar',
+          accepted_payment_methods: Array.isArray(primaryProfile.accepted_payment_methods)
+            ? primaryProfile.accepted_payment_methods
+            : ['efectivo', 'transferencia', 'mercadopago'],
+          service_bio: primaryProfile.service_bio || '',
+        }
+      : {
+          accepts_emergencies: false,
+          quote_visit_policy: 'consultar',
+          invoice_type: 'consultar',
+          accepted_payment_methods: ['efectivo', 'transferencia', 'mercadopago'],
+          service_bio: '',
+        };
 
     return res.status(200).json({
       providers: providersRes.rows,
@@ -925,6 +988,9 @@ const getMyProviderProfile = async (req, res) => {
       membership,
       membership_plans: MEMBERSHIP_PLANS,
       reputation,
+      response_stats: responseStats,
+      commercial_profile: commercialProfile,
+      public_questions: publicQuestionsRes.rows,
     });
   } catch (error) {
     console.error('Error al obtener perfil del prestador:', error);
@@ -1153,6 +1219,11 @@ const listVerifiedProviders = async (req, res) => {
           p.specialty,
           p.criminal_record_expiry,
           p.insurance_expiry,
+          COALESCE(p.accepts_emergencies, FALSE) AS accepts_emergencies,
+          COALESCE(p.quote_visit_policy, 'consultar') AS quote_visit_policy,
+          COALESCE(p.invoice_type, 'consultar') AS invoice_type,
+          COALESCE(p.accepted_payment_methods, '["efectivo","transferencia","mercadopago"]'::jsonb) AS accepted_payment_methods,
+          p.service_bio,
           COALESCE(p.rating_avg, 0.00)::numeric(4,2) AS rating_avg,
           p.id AS ordered_id,
           (
@@ -1218,6 +1289,22 @@ const listVerifiedProviders = async (req, res) => {
         COALESCE(SUM(ap.profile_disputes_count), 0)::int AS disputes_count,
         COALESCE(SUM(ap.profile_community_jobs), 0)::int AS community_jobs_count,
         COALESCE(SUM(ap.profile_community_visits), 0)::int AS community_visits_count,
+        BOOL_OR(ap.accepts_emergencies) AS accepts_emergencies,
+        (ARRAY_AGG(ap.quote_visit_policy ORDER BY ap.ordered_id ASC))[1] AS quote_visit_policy,
+        (ARRAY_AGG(ap.invoice_type ORDER BY ap.ordered_id ASC))[1] AS invoice_type,
+        (ARRAY_AGG(ap.accepted_payment_methods ORDER BY ap.ordered_id ASC))[1] AS accepted_payment_methods,
+        (ARRAY_AGG(ap.service_bio ORDER BY ap.ordered_id ASC) FILTER (WHERE ap.service_bio IS NOT NULL))[1] AS service_bio,
+        (
+          SELECT COUNT(*)::int
+          FROM public.provider_public_questions ppq
+          WHERE ppq.provider_user_id = ap.user_id
+        ) AS public_questions_count,
+        (
+          SELECT COUNT(*)::int
+          FROM public.provider_public_questions ppq
+          WHERE ppq.provider_user_id = ap.user_id
+            AND ppq.answer IS NULL
+        ) AS unanswered_questions_count,
         COALESCE(sub.is_verified_member, FALSE) AS is_verified_member,
         sub.plan_code AS membership_tier,
         sub.ends_at AS membership_ends_at,
@@ -1341,7 +1428,32 @@ const listVerifiedProviders = async (req, res) => {
 
     const result = await db.query(query, [viewerUserId, viewerCountryId]);
 
-    // Etapa 3: Calcular termómetro de reputación, disponibilidad efectiva hoy y actividad hiper-local
+    // Etapa 2.5: Consultar en batch hilos de `visit_requests` para calcular tiempo promedio de respuesta
+    const providerUserIds = result.rows.map((r) => Number(r.user_id)).filter(Boolean);
+    const visitsByUserId = new Map();
+    if (providerUserIds.length > 0) {
+      const visitsRes = await db
+        .query(
+          `
+            SELECT p.user_id, vr.created_at, vr.messages
+            FROM visit_requests vr
+            JOIN providers p ON p.id = vr.provider_id
+            WHERE p.user_id = ANY($1::int[])
+            ORDER BY vr.id DESC
+            LIMIT 1000
+          `,
+          [providerUserIds]
+        )
+        .catch(() => ({ rows: [] }));
+
+      for (const vr of visitsRes.rows) {
+        const uid = Number(vr.user_id);
+        if (!visitsByUserId.has(uid)) visitsByUserId.set(uid, []);
+        visitsByUserId.get(uid).push(vr);
+      }
+    }
+
+    // Etapa 3: Calcular termómetro de reputación, tiempo de respuesta, disponibilidad hoy y actividad hiper-local
     const enrichedProviders = result.rows.map((row) => {
       const hasExpiredDocs = Boolean(row.has_expired_docs);
       const hasActiveLocalSuspension = Boolean(row.has_active_local_suspension);
@@ -1350,6 +1462,7 @@ const listVerifiedProviders = async (req, res) => {
       const communityJobsCount = Number(row.community_jobs_count || 0);
       const communityVisitsCount = Number(row.community_visits_count || 0);
       const communityActivityCount = Math.max(communityJobsCount, communityVisitsCount);
+      const responseStats = computeResponseTimeStats(visitsByUserId.get(Number(row.user_id)) || []);
 
       const reputation = computeProviderReputation({
         ratingAvg: Number(row.rating_avg || 0),
@@ -1368,6 +1481,8 @@ const listVerifiedProviders = async (req, res) => {
         community_jobs_count: communityJobsCount,
         community_visits_count: communityVisitsCount,
         community_activity_count: communityActivityCount,
+        avg_response_minutes: responseStats.avg_response_minutes,
+        response_label: responseStats.response_label,
         reputation,
       };
     });
@@ -1493,6 +1608,213 @@ const removeFavoriteProvider = async (req, res) => {
   } catch (error) {
     console.error('Error al quitar prestador favorito:', error);
     return res.status(500).json({ error: 'Error interno al quitar el prestador de favoritos.' });
+  }
+};
+
+/**
+ * Actualiza la ficha comercial rápida del prestador autenticado en todas sus especialidades:
+ * urgencias 24h, política de presupuesto/visita, condición de facturación, medios de pago
+ * aceptados y breve descripción de servicios.
+ * PATCH /api/v1/providers/commercial-profile
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con los campos de ficha comercial.
+ * @param {import('express').Response} res - Respuesta HTTP con la ficha normalizada y persistida.
+ * @returns {Promise<import('express').Response>}
+ */
+const updateCommercialProfile = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const userId = Number(req.user.userId);
+    const normalized = normalizeCommercialProfileInput(req.body || {});
+
+    const updated = await db.query(
+      `UPDATE providers
+       SET
+         accepts_emergencies = $1,
+         quote_visit_policy = $2,
+         invoice_type = $3,
+         accepted_payment_methods = $4::jsonb,
+         service_bio = $5
+       WHERE user_id = $6
+       RETURNING id`,
+      [
+        normalized.accepts_emergencies,
+        normalized.quote_visit_policy,
+        normalized.invoice_type,
+        JSON.stringify(normalized.accepted_payment_methods),
+        normalized.service_bio,
+        userId,
+      ]
+    );
+
+    if (updated.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Primero debés registrar al menos una especialidad en Credenciales antes de completar tu ficha comercial.',
+      });
+    }
+
+    return res.status(200).json({
+      message: 'Ficha comercial y disponibilidad de urgencias actualizadas correctamente.',
+      updated_profiles: updated.rows.length,
+      commercial_profile: normalized,
+    });
+  } catch (error) {
+    console.error('Error al actualizar ficha comercial del prestador:', error);
+    return res.status(500).json({ error: 'Error interno al guardar la ficha comercial.' });
+  }
+};
+
+/**
+ * Lista las preguntas y respuestas públicas (Q&A estilo ficha de producto) de un prestador
+ * identificado por `providerUserId`, visibles para toda la comunidad.
+ * GET /api/v1/providers/:providerUserId/questions
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `:providerUserId` en params.
+ * @param {import('express').Response} res - Respuesta HTTP con la lista ordenada de preguntas y respuestas.
+ * @returns {Promise<import('express').Response>}
+ */
+const listProviderPublicQuestions = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const providerUserId = parseInt(req.params.providerUserId, 10);
+    if (!Number.isInteger(providerUserId) || providerUserId <= 0) {
+      return res.status(400).json({ error: 'Identificador de prestador inválido.' });
+    }
+
+    const questionsRes = await db.query(
+      `SELECT
+        q.id,
+        q.provider_user_id,
+        q.asked_by_user_id,
+        q.question,
+        q.answer,
+        q.created_at,
+        q.answered_at,
+        u.first_name AS asked_by_first_name,
+        u.last_name AS asked_by_last_name
+       FROM public.provider_public_questions q
+       LEFT JOIN public.users u ON u.id = q.asked_by_user_id
+       WHERE q.provider_user_id = $1
+       ORDER BY (q.answer IS NOT NULL) DESC, q.id DESC
+       LIMIT 100`,
+      [providerUserId]
+    );
+
+    return res.status(200).json({
+      provider_user_id: providerUserId,
+      count: questionsRes.rows.length,
+      questions: questionsRes.rows,
+    });
+  } catch (error) {
+    console.error('Error al consultar preguntas públicas del prestador:', error);
+    return res.status(500).json({ error: 'Error interno al consultar preguntas del prestador.' });
+  }
+};
+
+/**
+ * Publica una nueva pregunta pública de un residente en la ficha del prestador (`providerUserId`).
+ * POST /api/v1/providers/:providerUserId/questions
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `{ question }` en body.
+ * @param {import('express').Response} res - Respuesta HTTP `201` con la pregunta registrada.
+ * @returns {Promise<import('express').Response>}
+ */
+const askProviderPublicQuestion = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const askedByUserId = Number(req.user.userId);
+    const providerUserId = parseInt(req.params.providerUserId, 10);
+    const question = String(req.body?.question || '').trim();
+
+    if (!Number.isInteger(providerUserId) || providerUserId <= 0) {
+      return res.status(400).json({ error: 'Identificador de prestador inválido.' });
+    }
+    if (question.length < 5 || question.length > 400) {
+      return res.status(400).json({
+        error: 'La pregunta debe tener entre 5 y 400 caracteres.',
+      });
+    }
+
+    // Validar que el destinatario sea un prestador registrado
+    const targetRes = await db.query(
+      `SELECT id FROM providers WHERE user_id = $1 LIMIT 1`,
+      [providerUserId]
+    );
+    if (targetRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Prestador no encontrado.' });
+    }
+
+    const insertRes = await db.query(
+      `INSERT INTO public.provider_public_questions (provider_user_id, asked_by_user_id, question)
+       VALUES ($1, $2, $3)
+       RETURNING id, provider_user_id, asked_by_user_id, question, answer, created_at, answered_at`,
+      [providerUserId, askedByUserId, question]
+    );
+
+    return res.status(201).json({
+      message: 'Pregunta publicada. Cuando el prestador responda quedará visible para la comunidad.',
+      question: insertRes.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al publicar pregunta pública al prestador:', error);
+    return res.status(500).json({ error: 'Error interno al publicar la pregunta.' });
+  }
+};
+
+/**
+ * Permite al prestador dueño (o `superadmin`) responder o editar la respuesta de una
+ * pregunta pública recibida en su ficha.
+ * PATCH /api/v1/providers/questions/:questionId/answer
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `{ answer }` en body.
+ * @param {import('express').Response} res - Respuesta HTTP `200` con la pregunta respondida.
+ * @returns {Promise<import('express').Response>}
+ */
+const answerProviderPublicQuestion = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const actorUserId = Number(req.user.userId);
+    const isSuperadmin = req.user.role === 'superadmin';
+    const questionId = parseInt(req.params.questionId, 10);
+    const answer = String(req.body?.answer || '').trim();
+
+    if (!Number.isInteger(questionId) || questionId <= 0) {
+      return res.status(400).json({ error: 'Identificador de pregunta inválido.' });
+    }
+    if (answer.length < 2 || answer.length > 500) {
+      return res.status(400).json({
+        error: 'La respuesta debe tener entre 2 y 500 caracteres.',
+      });
+    }
+
+    const existingRes = await db.query(
+      `SELECT id, provider_user_id FROM public.provider_public_questions WHERE id = $1`,
+      [questionId]
+    );
+    if (existingRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Pregunta no encontrada.' });
+    }
+    if (!isSuperadmin && Number(existingRes.rows[0].provider_user_id) !== actorUserId) {
+      return res.status(403).json({
+        error: 'Solo el prestador destinatario puede responder esta pregunta.',
+      });
+    }
+
+    const updatedRes = await db.query(
+      `UPDATE public.provider_public_questions
+       SET answer = $1, answered_by_user_id = $2, answered_at = NOW()
+       WHERE id = $3
+       RETURNING id, provider_user_id, asked_by_user_id, question, answer, created_at, answered_at`,
+      [answer, actorUserId, questionId]
+    );
+
+    return res.status(200).json({
+      message: 'Respuesta publicada en tu ficha pública.',
+      question: updatedRes.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al responder pregunta pública:', error);
+    return res.status(500).json({ error: 'Error interno al guardar la respuesta.' });
   }
 };
 
@@ -2065,6 +2387,10 @@ module.exports = {
   listFavoriteProviders,
   addFavoriteProvider,
   removeFavoriteProvider,
+  updateCommercialProfile,
+  listProviderPublicQuestions,
+  askProviderPublicQuestion,
+  answerProviderPublicQuestion,
   listLocalSuspensions,
   createLocalSuspension,
   liftLocalSuspension,
