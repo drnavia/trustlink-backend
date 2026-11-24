@@ -1,13 +1,14 @@
 /**
  * @file auth.test.js
- * @description Script de pruebas de integración para verificar el funcionamiento 
- * 100% del módulo de autenticación (Registro y Login).
+ * @description Script manual de pruebas de integración para el módulo de autenticación.
+ * Requiere el servidor backend activo en `http://localhost:4000` y valida registro de residente,
+ * inicio de sesión exitoso con emisión de JWT y rechazo ante contraseña inválida.
  * @location /trustlink-backend/src/modules/auth/auth.test.js
  */
 
 const BASE_URL = 'http://localhost:4000/api/v1/auth';
 
-// Datos de prueba únicos para evitar colisiones de DNI o Email en cada ejecución
+// Payload de residente con DNI y email generados dinámicamente para evitar colisiones de unicidad
 const testUser = {
   country_id: null,
   role: 'owner',
@@ -21,12 +22,22 @@ const testUser = {
   lot_number: 'Lote 12'
 };
 
+/**
+ * Ejecuta secuencialmente las pruebas de integración HTTP del módulo de autenticación:
+ * 1) Alta de usuario residente (`POST /register`).
+ * 2) Login válido con emisión de token JWT (`POST /login`).
+ * 3) Rechazo de credenciales inválidas con estado 401 (`POST /login`).
+ *
+ * @returns {Promise<void>} Finaliza tras imprimir el resultado de cada escenario en consola.
+ */
 async function runAuthTests() {
   console.log('🧪 Iniciando pruebas automatizadas para el Módulo de Autenticación...\n');
 
   try {
     // ----------------------------------------------------
-    // PRUEBA 1: Registro de un nuevo usuario
+    // PRUEBA 1: Registro de un nuevo usuario residente
+    // Escenario: alta pública con rol 'owner' y datos de ubicación válidos.
+    // Resultado esperado: HTTP 201 con objeto `user` y su `id` generado en base de datos.
     // ----------------------------------------------------
     console.log('1️⃣ Probando Registro de Usuario (/register)...');
     const registerResponse = await fetch(`${BASE_URL}/register`, {
@@ -47,6 +58,8 @@ async function runAuthTests() {
 
     // ----------------------------------------------------
     // PRUEBA 2: Inicio de sesión (Login) con credenciales válidas
+    // Precondición: usuario recién registrado en la Prueba 1.
+    // Resultado esperado: HTTP 200 acompañado de un token JWT firmado.
     // ----------------------------------------------------
     console.log('\n2️⃣ Probando Inicio de Sesión Correcto (/login)...');
     const loginResponse = await fetch(`${BASE_URL}/login`, {
@@ -69,7 +82,9 @@ async function runAuthTests() {
     }
 
     // ----------------------------------------------------
-    // PRUEBA 3: Inicio de sesión con contraseña incorrecta
+    // PRUEBA 3: Inicio de sesión con contraseña incorrecta (seguridad)
+    // Precondición: email registrado existente pero contraseña errónea.
+    // Resultado esperado: HTTP 401 rechazando el acceso sin emitir token.
     // ----------------------------------------------------
     console.log('\n3️⃣ Probando Seguridad: Login con contraseña incorrecta...');
     const failLoginResponse = await fetch(`${BASE_URL}/login`, {
@@ -96,5 +111,5 @@ async function runAuthTests() {
   }
 }
 
-// Ejecutar pruebas
+// Punto de entrada al invocar el script directamente con `node`
 runAuthTests();

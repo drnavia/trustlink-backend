@@ -16,7 +16,10 @@ const {
 } = require('../../utils/complianceExpiry');
 
 /**
- * Asegura la existencia de la tabla gate_access_logs para auditar validaciones de Consola Garita.
+ * Asegura de forma idempotente la existencia de la tabla `gate_access_logs`
+ * para auditar cada validación ejecutada desde la Consola Garita.
+ *
+ * @returns {Promise<void>}
  */
 const ensureGateAccessLogsTable = async () => {
   await db.query(`
@@ -36,6 +39,13 @@ const ensureGateAccessLogsTable = async () => {
   `);
 };
 
+/**
+ * Enmascara un token QR conservando sus primeros 8 y últimos 6 caracteres
+ * para registrar trazabilidad en auditoría sin exponer el token íntegro.
+ *
+ * @param {string|null|undefined} token - Token QR original.
+ * @returns {string|null} Token enmascarado o `null` si no fue provisto.
+ */
 const maskQrToken = (token) => {
   if (!token) return null;
   const clean = String(token).trim();
@@ -43,6 +53,22 @@ const maskQrToken = (token) => {
   return `${clean.slice(0, 8)}...${clean.slice(-6)}`;
 };
 
+/**
+ * Registra de forma tolerante a fallos un evento de validación QR en `gate_access_logs`.
+ * Si ocurre un error de escritura, se loguea en consola sin bloquear la respuesta de garita.
+ *
+ * @param {Object} params - Metadatos del intento de acceso.
+ * @param {string} [params.qrToken] - Token QR evaluado (se guarda enmascarado).
+ * @param {number|null} [params.passId=null] - ID del pase si se encontró.
+ * @param {number|null} [params.countryId=null] - ID de la comunidad correspondiente.
+ * @param {string} [params.integrationLabel='Consola Garita'] - Origen de la validación.
+ * @param {string} [params.authMode='jwt'] - Modo de autenticación utilizado.
+ * @param {boolean} [params.authorized=false] - Resultado de la autorización.
+ * @param {string} [params.reasonCode='UNKNOWN'] - Código normalizado del resultado.
+ * @param {string} [params.message=''] - Mensaje descriptivo mostrado al operador.
+ * @param {number} [params.httpStatus=200] - Código HTTP devuelto por el endpoint.
+ * @returns {Promise<void>}
+ */
 const recordGateAccessLog = async ({
   qrToken,
   passId = null,
@@ -79,9 +105,19 @@ const recordGateAccessLog = async ({
   }
 };
 
+/**
+ * Busca si existe una suspensión operativa local activa para un prestador dentro
+ * de una comunidad específica (`provider_local_suspensions`).
+ * Verifica primero la existencia de la tabla para mantener compatibilidad con esquemas parciales.
+ *
+ * @param {number|string|null} countryId - ID de la comunidad donde se intenta ingresar.
+ * @param {number|string|null} providerId - ID del perfil de prestador.
+ * @returns {Promise<{id: number, reason: string}|null>} Registro de suspensión activa o `null`.
+ */
 const findActiveLocalSuspension = async (countryId, providerId) => {
   if (!countryId || !providerId) return null;
   try {
+    // Paso 1: Comprobar si la tabla de suspensiones locales existe en el esquema `public`
     const tableCheck = await db.query(
       `SELECT 1 FROM information_schema.tables
        WHERE table_schema = 'public' AND table_name = 'provider_local_suspensions'
@@ -89,6 +125,7 @@ const findActiveLocalSuspension = async (countryId, providerId) => {
     );
     if (tableCheck.rows.length === 0) return null;
 
+    // Paso 2: Obtener la suspensión activa más reciente para el par (comunidad, prestador)
     const res = await db.query(
       `SELECT id, reason
        FROM public.provider_local_suspensions
@@ -105,7 +142,10 @@ const findActiveLocalSuspension = async (countryId, providerId) => {
 };
 
 /**
- * Crea o actualiza de forma idempotente la tabla visit_requests y sus columnas.
+ * Crea o actualiza de forma idempotente la tabla `visit_requests` y todas sus columnas
+ * para soportar el flujo de coordinación bidireccional de visitas entre residentes y prestadores.
+ *
+ * @returns {Promise<void>}
  */
 const ensureVisitRequestsTable = async () => {
   await db.query(`
@@ -124,6 +164,7 @@ const ensureVisitRequestsTable = async () => {
     );
   `);
 
+  // Garantizar columnas adicionales en instalaciones creadas con versiones anteriores
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS country_id INTEGER NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS fraction_number VARCHAR(100) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS lot_number VARCHAR(100) NULL;`);
@@ -134,8 +175,11 @@ const ensureVisitRequestsTable = async () => {
 };
 
 /**
- * Crea o actualiza de forma idempotente la tabla provider_schedule_blocks
- * para gestionar horarios no laborables, visitas externas y bloqueos automáticos de TrustLink.
+ * Crea o actualiza de forma idempotente la tabla `provider_schedule_blocks`
+ * para gestionar horarios no laborables (`unavailable`), visitas externas (`external_visit`)
+ * y reservas automáticas vinculadas a visitas/pases de TrustLink (`trustlink_visit`, `trustlink_pass`).
+ *
+ * @returns {Promise<void>}
  */
 const ensureScheduleBlocksTable = async () => {
   await db.query(`
@@ -151,6 +195,7 @@ const ensureScheduleBlocksTable = async () => {
     );
   `);
 
+  // Asegurar columnas requeridas en esquemas previos
   await db.query(`ALTER TABLE provider_schedule_blocks ADD COLUMN IF NOT EXISTS block_type VARCHAR(30) NOT NULL DEFAULT 'unavailable';`);
   await db.query(`ALTER TABLE provider_schedule_blocks ADD COLUMN IF NOT EXISTS title VARCHAR(160) NULL;`);
   await db.query(`ALTER TABLE provider_schedule_blocks ADD COLUMN IF NOT EXISTS start_at TIMESTAMP WITHOUT TIME ZONE NULL;`);
@@ -159,7 +204,18 @@ const ensureScheduleBlocksTable = async () => {
 };
 
 /**
- * Registra un bloque de agenda para un prestador evitando duplicados exactos por source_ref.
+ * Inserta o actualiza (upsert) un bloque en la agenda del prestador evitando duplicados
+ * cuando coincide `source_ref` (por ejemplo `visit-<id>` o `pass-<id>`).
+ * Si `endAt` no es provisto o es anterior/igual a `startAt`, asigna una duración por defecto de 2 horas.
+ *
+ * @param {Object} params - Datos del bloque horario.
+ * @param {number|string} params.providerId - ID del prestador dueño de la agenda.
+ * @param {string} params.blockType - Tipo de bloque (`unavailable`, `external_visit`, `trustlink_visit`, `trustlink_pass`).
+ * @param {string} params.title - Título descriptivo visible en el calendario.
+ * @param {string|Date} params.startAt - Fecha/hora de inicio.
+ * @param {string|Date} [params.endAt] - Fecha/hora de fin (opcional; fallback +2h).
+ * @param {string|null} [params.sourceRef=null] - Referencia única para actualizar en lugar de duplicar.
+ * @returns {Promise<void>}
  */
 const upsertScheduleBlock = async ({
   providerId,
@@ -170,6 +226,8 @@ const upsertScheduleBlock = async ({
   sourceRef = null,
 }) => {
   await ensureScheduleBlocksTable();
+
+  // Paso 1: Validar inicio y garantizar un fin válido (mínimo +2 horas por defecto)
   const parsedStart = new Date(startAt);
   if (Number.isNaN(parsedStart.getTime())) return;
 
@@ -180,6 +238,7 @@ const upsertScheduleBlock = async ({
     ? new Date(parsedStart.getTime() + 2 * 60 * 60 * 1000)
     : parsedEnd;
 
+  // Paso 2: Si existe bloque previo con el mismo `source_ref`, actualizarlo en sitio
   if (sourceRef) {
     const existing = await db.query(
       'SELECT id FROM provider_schedule_blocks WHERE provider_id = $1 AND source_ref = $2 LIMIT 1',
@@ -196,6 +255,7 @@ const upsertScheduleBlock = async ({
     }
   }
 
+  // Paso 3: Insertar nuevo bloque en la agenda del prestador
   await db.query(
     `INSERT INTO provider_schedule_blocks (provider_id, block_type, title, start_at, end_at, source_ref)
      VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -211,7 +271,11 @@ const upsertScheduleBlock = async ({
 };
 
 /**
- * Normaliza el campo messages de una solicitud de visita a un array.
+ * Normaliza el campo JSONB `messages` de una solicitud de visita a un arreglo seguro,
+ * soportando tanto arreglos ya parseados por `pg` como cadenas JSON serializadas.
+ *
+ * @param {Array|string|null|undefined} rawMessages - Valor crudo del campo `messages`.
+ * @returns {Array<Object>} Arreglo de mensajes del hilo de coordinación.
  */
 const parseMessagesArray = (rawMessages) => {
   if (Array.isArray(rawMessages)) return rawMessages;
@@ -227,7 +291,10 @@ const parseMessagesArray = (rawMessages) => {
 };
 
 /**
- * Marca como 'expired' los pases 'pending' cuya end_time ya venció en UTC.
+ * Marca automáticamente como `'expired'::pass_status` todos los pases en estado `'pending'`
+ * cuya columna `end_time` (en UTC) ya superó la hora actual del servidor PostgreSQL.
+ *
+ * @returns {Promise<void>}
  */
 const expireOverduePasses = async () => {
   await db.query(
@@ -239,7 +306,10 @@ const expireOverduePasses = async () => {
 };
 
 /**
- * Verifica si existe la columna vehicle_plate en access_passes para compatibilidad de esquema.
+ * Verifica dinámicamente en `information_schema` si existe la columna `vehicle_plate`
+ * en `access_passes` para mantener compatibilidad con bases de datos previas a esa migración.
+ *
+ * @returns {Promise<boolean>} `true` si la columna `vehicle_plate` existe.
  */
 const hasVehiclePlateColumn = async () => {
   const res = await db.query(
@@ -254,7 +324,10 @@ const hasVehiclePlateColumn = async () => {
 };
 
 /**
- * Asegura la columna authorized_employees (JSONB) en access_passes para adjuntar ayudantes al Pase QR.
+ * Asegura de forma idempotente la columna `authorized_employees` (JSONB) en `access_passes`
+ * para almacenar el snapshot de la cuadrilla/ayudantes habilitados en un Pase QR.
+ *
+ * @returns {Promise<void>}
  */
 const ensureAuthorizedEmployeesColumn = async () => {
   await db.query(`
@@ -263,6 +336,13 @@ const ensureAuthorizedEmployeesColumn = async () => {
   `);
 };
 
+/**
+ * Normaliza el campo JSONB `authorized_employees` a un arreglo seguro de ayudantes,
+ * tolerando valores ya deserializados, cadenas JSON válidas o valores nulos/corruptos.
+ *
+ * @param {Array|string|null|undefined} rawVal - Valor crudo de `authorized_employees`.
+ * @returns {Array<Object>} Arreglo de empleados autorizados en el pase.
+ */
 const parseAuthorizedEmployeesArray = (rawVal) => {
   if (Array.isArray(rawVal)) return rawVal;
   if (typeof rawVal === 'string' && rawVal.trim()) {
@@ -277,12 +357,21 @@ const parseAuthorizedEmployeesArray = (rawVal) => {
 };
 
 /**
- * Resuelve un snapshot validado de ayudantes activos pertenecientes al mismo prestador (por user_id).
+ * Resuelve un snapshot validado de ayudantes/cuadrilla activos pertenecientes al mismo
+ * usuario prestador (`p_emp.user_id = p_target.user_id`) a partir de sus IDs.
+ * Deduplica IDs, filtra únicamente empleados activos e incluye su fecha de vencimiento de seguro
+ * para validación de compliance al emitir o verificar el pase.
+ *
+ * @param {number|string} providerId - ID del perfil de prestador objetivo del pase.
+ * @param {Array<number|string>} rawEmployeeIds - Lista de IDs de `provider_employees` solicitados.
+ * @returns {Promise<Array<{id: number, full_name: string, dni: string|null, role_label: string, insurance_expiry: string|null}>>}
  */
 const resolveAuthorizedEmployeesSnapshot = async (providerId, rawEmployeeIds) => {
   if (!Array.isArray(rawEmployeeIds) || rawEmployeeIds.length === 0) {
     return [];
   }
+
+  // Paso 1: Sanitizar y deduplicar los IDs enteros positivos recibidos
   const cleanIds = [
     ...new Set(
       rawEmployeeIds
@@ -292,6 +381,7 @@ const resolveAuthorizedEmployeesSnapshot = async (providerId, rawEmployeeIds) =>
   ];
   if (cleanIds.length === 0) return [];
 
+  // Paso 2: Consultar empleados activos verificando pertenencia al mismo usuario prestador
   const empRes = await db.query(
     `SELECT
        pe.id,
@@ -310,6 +400,7 @@ const resolveAuthorizedEmployeesSnapshot = async (providerId, rawEmployeeIds) =>
     [Number(providerId), cleanIds]
   );
 
+  // Paso 3: Normalizar formato del snapshot (incluyendo fecha `YYYY-MM-DD` del seguro)
   return empRes.rows.map((row) => ({
     id: row.id,
     full_name: row.full_name || 'Ayudante',
@@ -323,14 +414,20 @@ const resolveAuthorizedEmployeesSnapshot = async (providerId, rawEmployeeIds) =>
 
 /**
  * Obtiene y valida la ubicación residencial registrada del residente en la tabla `users`.
- * - Toma automáticamente `fraction_type` ('manzana' | 'fraccion' | 'na'), `fraction_number` y `lot_number`.
+ * - Toma automáticamente `fraction_type` (`'manzana'` | `'fraccion'` | `'na'`), `fraction_number` y `lot_number`.
  * - Exige que el residente tenga un `lot_number` cargado en su cuenta.
- * - Si se recibe un `lot_number` o `fraction_number` distinto al registrado del residente, rechaza la operación
- *   para garantizar que el residente solo pida visitas o emita pases hacia su propia ubicación registrada.
+ * - Si el cliente envía un `lot_number` o `fraction_number` distinto al registrado, rechaza la operación
+ *   como protección anti-suplantación para que cada residente solo opere sobre su propio lote.
+ *
+ * @param {number|string} residentUserId - ID del usuario residente autenticado.
+ * @param {string|null|undefined} requestedFractionNumber - Fracción/Manzana recibida opcionalmente en el body.
+ * @param {string|null|undefined} requestedLotNumber - Número de lote recibido opcionalmente en el body.
+ * @returns {Promise<{fractionType?: string, fractionNumber?: string|null, fractionDisplay?: string, lotNumber?: string, error?: string}>}
  */
 const resolveResidentLocation = async (residentUserId, requestedFractionNumber, requestedLotNumber) => {
   await ensureEvolutionSchema();
 
+  // Paso 1: Consultar ubicación oficial almacenada en el perfil del residente
   const res = await db.query(
     `SELECT
        COALESCE(fraction_type, 'na') AS fraction_type,
@@ -346,6 +443,7 @@ const resolveResidentLocation = async (residentUserId, requestedFractionNumber, 
     return { error: 'No se encontró el registro del residente en la base de datos.' };
   }
 
+  // Paso 2: Validar que el lote esté configurado y coincida con el solicitado (anti-spoofing)
   const resident = res.rows[0];
   const registeredLot = resident.lot_number ? String(resident.lot_number).trim() : '';
 
@@ -366,6 +464,7 @@ const resolveResidentLocation = async (residentUserId, requestedFractionNumber, 
     };
   }
 
+  // Paso 3: Construir etiqueta legible para Manzana/Fracción/N/A según `fraction_type`
   const registeredFractionType = String(resident.fraction_type || 'na').toLowerCase();
   const rawStoredFraction = resident.fraction_number ? String(resident.fraction_number).trim() : '';
   const hasStoredFraction =
@@ -381,6 +480,7 @@ const resolveResidentLocation = async (residentUserId, requestedFractionNumber, 
     ? `Manzana ${registeredFractionNum}`
     : registeredFractionNum;
 
+  // Paso 4: Verificar que la Manzana/Fracción enviada (si se envió) coincida con la registrada
   const cleanRequestedFraction =
     requestedFractionNumber !== undefined && requestedFractionNumber !== null
       ? String(requestedFractionNumber).trim()
@@ -406,14 +506,19 @@ const resolveResidentLocation = async (residentUserId, requestedFractionNumber, 
 };
 
 /**
- * Obtiene la agenda del prestador (bloques manuales/externos/automáticos + pases QR vigentes/pendientes).
+ * Obtiene la agenda completa del prestador autenticado: bloques manuales/externos/automáticos
+ * (`provider_schedule_blocks`) y pases QR vigentes o utilizados (`pending` / `used`).
  * GET /api/v1/passes/schedule/provider
+ *
+ * @param {import('express').Request} req - Solicitud autenticada del prestador.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ blocks, passes }`.
  */
 const getProviderSchedule = async (req, res) => {
   try {
     await ensureScheduleBlocksTable();
     await expireOverduePasses();
 
+    // Etapa 1: Resolver todos los perfiles de prestador asociados al usuario autenticado
     const userId = Number(req.user?.userId || req.user?.id);
     const providerProfilesRes = await db.query(
       'SELECT id FROM providers WHERE user_id = $1',
@@ -425,6 +530,7 @@ const getProviderSchedule = async (req, res) => {
       return res.status(200).json({ blocks: [], passes: [] });
     }
 
+    // Etapa 2: Consultar bloqueos de agenda (manuales, visitas externas y reservas TrustLink)
     const blocksRes = await db.query(
       `SELECT *
        FROM provider_schedule_blocks
@@ -433,6 +539,7 @@ const getProviderSchedule = async (req, res) => {
       [providerIds]
     );
 
+    // Etapa 3: Consultar pases QR activos o ya utilizados para superponer en la agenda
     const passesRes = await db.query(
       `SELECT
          ap.id,
@@ -462,8 +569,12 @@ const getProviderSchedule = async (req, res) => {
 };
 
 /**
- * Crea un bloque manual en la agenda del prestador (horario no laborable o visita externa).
+ * Crea un bloque manual en la agenda del prestador para marcar horarios no laborables
+ * (`unavailable`) o visitas agendadas por fuera de TrustLink (`external_visit`).
  * POST /api/v1/passes/schedule/blocks
+ *
+ * @param {import('express').Request} req - Body: `{ block_type?, title?, start_at, end_at }`.
+ * @param {import('express').Response} res - Respuesta HTTP 201 con el bloque creado.
  */
 const createScheduleBlock = async (req, res) => {
   try {
@@ -471,6 +582,7 @@ const createScheduleBlock = async (req, res) => {
     const userId = Number(req.user?.userId || req.user?.id);
     const { block_type, title, start_at, end_at } = req.body;
 
+    // Etapa 1: Identificar el perfil principal de prestador del usuario autenticado
     const providerProfilesRes = await db.query(
       'SELECT id FROM providers WHERE user_id = $1 ORDER BY id ASC LIMIT 1',
       [userId]
@@ -480,6 +592,7 @@ const createScheduleBlock = async (req, res) => {
       return res.status(404).json({ error: 'No se encontró un perfil de prestador asociado.' });
     }
 
+    // Etapa 2: Normalizar tipo de bloque y validar coherencia del rango horario
     const providerId = Number(providerProfilesRes.rows[0].id);
     const normalizedType =
       String(block_type || '').toLowerCase() === 'external_visit'
@@ -496,6 +609,7 @@ const createScheduleBlock = async (req, res) => {
       return res.status(400).json({ error: 'El rango horario es inválido.' });
     }
 
+    // Etapa 3: Persistir el bloqueo manual en `provider_schedule_blocks`
     const cleanTitle =
       String(title || '').trim() ||
       (normalizedType === 'external_visit' ? 'Visita externa agendada' : 'Horario no laborable');
@@ -521,8 +635,12 @@ const createScheduleBlock = async (req, res) => {
 };
 
 /**
- * Elimina un bloque manual de agenda del prestador.
+ * Elimina un bloque manual de la agenda del prestador verificando que pertenezca
+ * a alguno de los perfiles `providers` del usuario autenticado.
  * DELETE /api/v1/passes/schedule/blocks/:blockId
+ *
+ * @param {import('express').Request} req - Param `blockId`.
+ * @param {import('express').Response} res - Respuesta HTTP confirmando la eliminación.
  */
 const deleteScheduleBlock = async (req, res) => {
   try {
@@ -534,6 +652,7 @@ const deleteScheduleBlock = async (req, res) => {
       return res.status(400).json({ error: 'ID de bloque inválido.' });
     }
 
+    // Obtener todos los perfiles de prestador del usuario para restringir el DELETE por pertenencia
     const providerProfilesRes = await db.query(
       'SELECT id FROM providers WHERE user_id = $1',
       [userId]
@@ -561,13 +680,18 @@ const deleteScheduleBlock = async (req, res) => {
 
 /**
  * Crea una solicitud de visita/coordinación bidireccional del residente hacia un prestador.
- * Toma automáticamente Manzana/Fracción/N/A y Lote desde el registro del residente en `users`.
+ * Resuelve y bloquea automáticamente Manzana/Fracción/N/A y Lote desde la cuenta del residente
+ * e inicializa el hilo de mensajes en estado `'pending_provider'`.
  * POST /api/v1/passes/visit-requests
+ *
+ * @param {import('express').Request} req - Body: `{ provider_id, fraction_number?, lot_number?, preferred_date?, notes }`.
+ * @param {import('express').Response} res - Respuesta HTTP 201 con la solicitud de visita creada.
  */
 const createVisitCoordination = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
 
+    // Etapa 1: Validar sesión del residente y campos obligatorios del pedido
     const ownerId = Number(req.user?.userId || req.user?.id);
     const countryId = req.user?.countryId ? Number(req.user.countryId) : null;
     const {
@@ -590,6 +714,7 @@ const createVisitCoordination = async (req, res) => {
       });
     }
 
+    // Etapa 2: Comprobar existencia del prestador destino y obtener comunidad de respaldo
     const providerCheck = await db.query(
       `SELECT p.id, u.country_id
        FROM providers p
@@ -603,11 +728,13 @@ const createVisitCoordination = async (req, res) => {
       return res.status(404).json({ error: 'El prestador seleccionado no existe.' });
     }
 
+    // Etapa 3: Resolver y validar la ubicación residencial registrada del solicitante
     const locationResult = await resolveResidentLocation(ownerId, fraction_number, lot_number);
     if (locationResult.error) {
       return res.status(400).json({ error: locationResult.error });
     }
 
+    // Etapa 4: Inicializar el hilo de mensajería y persistir la solicitud en `visit_requests`
     const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
     const cleanNotes = String(notes).trim();
     const initialMessages = [
@@ -640,6 +767,7 @@ const createVisitCoordination = async (req, res) => {
     );
 
     const row = inserted.rows[0];
+    // Retornar solicitud creada con el hilo de mensajes normalizado como arreglo
     return res.status(201).json({
       message: 'Solicitud enviada al prestador. Esperá o coordiná su confirmación antes de emitir el QR.',
       visit: {
@@ -656,14 +784,19 @@ const createVisitCoordination = async (req, res) => {
 };
 
 /**
- * Lista las solicitudes de visita del residente autenticado.
+ * Lista todas las solicitudes de visita creadas por el residente autenticado,
+ * enriquecidas con nombre y especialidad del prestador.
  * GET /api/v1/passes/visit-requests/my
+ *
+ * @param {import('express').Request} req - Solicitud autenticada del residente.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ visits }`.
  */
 const listMyVisitRequests = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
     const ownerId = Number(req.user?.userId || req.user?.id);
 
+    // Consultar solicitudes del residente ordenadas de la más reciente a la más antigua
     const result = await db.query(
       `SELECT
          vr.*,
@@ -690,14 +823,19 @@ const listMyVisitRequests = async (req, res) => {
 };
 
 /**
- * Lista las solicitudes de visita recibidas por el prestador autenticado.
+ * Lista las solicitudes de visita recibidas por cualquiera de los perfiles de prestador
+ * del usuario autenticado, incluyendo datos de contacto del residente solicitante.
  * GET /api/v1/passes/visit-requests/provider
+ *
+ * @param {import('express').Request} req - Solicitud autenticada del prestador.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ visits }`.
  */
 const listProviderVisitRequests = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
     const userId = Number(req.user?.userId || req.user?.id);
 
+    // Etapa 1: Obtener todos los perfiles de prestador vinculados al usuario
     const providerProfilesRes = await db.query(
       'SELECT id FROM providers WHERE user_id = $1',
       [userId]
@@ -708,6 +846,7 @@ const listProviderVisitRequests = async (req, res) => {
       return res.status(200).json({ visits: [] });
     }
 
+    // Etapa 2: Consultar solicitudes entrantes junto a nombre y teléfono del residente
     const result = await db.query(
       `SELECT
          vr.*,
@@ -735,12 +874,18 @@ const listProviderVisitRequests = async (req, res) => {
 };
 
 /**
- * Agrega un mensaje dentro del hilo de coordinación de una visita.
+ * Agrega un nuevo mensaje al hilo JSONB de coordinación de una visita existente.
+ * Solo pueden escribir el residente creador, el prestador asignado o un administrador.
  * POST /api/v1/passes/visit-requests/:id/messages
+ *
+ * @param {import('express').Request} req - Param `id`; body `{ text }` o `{ message }`.
+ * @param {import('express').Response} res - Respuesta HTTP con la visita y su historial actualizado.
  */
 const addVisitRequestMessage = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
+
+    // Etapa 1: Validar ID de visita y contenido no vacío del mensaje
     const visitId = Number(req.params.id);
     const userId = Number(req.user?.userId || req.user?.id);
     const userRole = String(req.user?.role || '').toLowerCase();
@@ -753,6 +898,7 @@ const addVisitRequestMessage = async (req, res) => {
       return res.status(400).json({ error: 'Escribí un mensaje antes de enviar.' });
     }
 
+    // Etapa 2: Recuperar la visita y validar autorización de participación (residente, prestador asignado o admin)
     const visitRes = await db.query('SELECT * FROM visit_requests WHERE id = $1 LIMIT 1', [visitId]);
     if (visitRes.rows.length === 0) {
       return res.status(404).json({ error: 'Solicitud de visita no encontrada.' });
@@ -773,6 +919,7 @@ const addVisitRequestMessage = async (req, res) => {
       return res.status(403).json({ error: 'No tenés permiso para participar en esta visita.' });
     }
 
+    // Etapa 3: Anexar mensaje al arreglo JSONB y persistir en `visit_requests`
     const currentMessages = parseMessagesArray(visit.messages);
     const newMsg = {
       id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -806,12 +953,19 @@ const addVisitRequestMessage = async (req, res) => {
 };
 
 /**
- * Responde a una solicitud de visita (confirmar, proponer horario o rechazar) y bloquea agenda si se confirma.
+ * Permite al prestador asignado responder una solicitud de visita (`confirm`, `propose` o `decline`).
+ * Actualiza estado, fecha propuesta e historial de mensajes; si se confirma con fecha,
+ * bloquea automáticamente esa franja en la agenda del prestador (`upsertScheduleBlock`).
  * PATCH /api/v1/passes/visit-requests/:id/respond
+ *
+ * @param {import('express').Request} req - Param `id`; body `{ action, preferred_date?, reply_text? }`.
+ * @param {import('express').Response} res - Respuesta HTTP con la solicitud actualizada.
  */
 const respondVisitRequest = async (req, res) => {
   try {
     await ensureVisitRequestsTable();
+
+    // Etapa 1: Validar ID de visita y acción solicitada (`confirm` | `propose` | `decline`)
     const visitId = Number(req.params.id);
     const userId = Number(req.user?.userId || req.user?.id);
     const { action, preferred_date, reply_text } = req.body;
@@ -825,6 +979,7 @@ const respondVisitRequest = async (req, res) => {
       return res.status(400).json({ error: 'Acción inválida (confirm | propose | decline).' });
     }
 
+    // Etapa 2: Verificar existencia de la visita y que el usuario sea el prestador asignado
     const visitRes = await db.query('SELECT * FROM visit_requests WHERE id = $1 LIMIT 1', [visitId]);
     if (visitRes.rows.length === 0) {
       return res.status(404).json({ error: 'Solicitud de visita no encontrada.' });
@@ -841,6 +996,7 @@ const respondVisitRequest = async (req, res) => {
       return res.status(403).json({ error: 'Solo el prestador asignado puede responder esta visita.' });
     }
 
+    // Etapa 3: Resolver nuevo estado, fecha acordada y mensaje automático/personalizado
     const nextStatus =
       normalizedAction === 'confirm'
         ? 'confirmed'
@@ -870,6 +1026,7 @@ const respondVisitRequest = async (req, res) => {
       },
     ];
 
+    // Etapa 4: Persistir cambio de estado/mensajes y reservar agenda si se confirmó con fecha
     const updated = await db.query(
       `UPDATE visit_requests
        SET status = $1,
@@ -910,14 +1067,20 @@ const respondVisitRequest = async (req, res) => {
 };
 
 /**
- * Emite un nuevo Pase QR para un prestador.
- * Toma automáticamente Manzana/Fracción/N/A y Lote del residente registrado en `users`
- * y bloquea la franja horaria en la agenda del prestador.
+ * Emite un nuevo Pase QR para un prestador (y su cuadrilla opcional).
+ * Resuelve y bloquea la ubicación residencial desde `users`, impide la emisión si existen
+ * documentos vencidos (antecedentes o seguros del titular/cuadrilla), genera un token QR
+ * criptográfico de 32 bytes y bloquea la franja horaria en la agenda del prestador.
  * POST /api/v1/passes/create
+ *
+ * @param {import('express').Request} req - Body: `{ provider_id, fraction_number?, lot_number?, vehicle_plate?, employee_ids?, start_time, end_time }`.
+ * @param {import('express').Response} res - Respuesta HTTP 201 con el pase emitido o 403 si hay bloqueo documental.
  */
 const createPass = async (req, res) => {
   try {
     await ensureAuthorizedEmployeesColumn();
+
+    // Etapa 1: Validar campos obligatorios y existencia del prestador (junto a fechas de compliance)
     const ownerId = Number(req.user?.userId || req.user?.id);
     const countryId = req.user?.countryId ? Number(req.user.countryId) : null;
     const {
@@ -949,11 +1112,13 @@ const createPass = async (req, res) => {
       return res.status(404).json({ error: 'El prestador seleccionado no existe.' });
     }
 
+    // Etapa 2: Validar que la ubicación pertenezca a la cuenta registrada del residente
     const locationResult = await resolveResidentLocation(ownerId, fraction_number, lot_number);
     if (locationResult.error) {
       return res.status(400).json({ error: locationResult.error });
     }
 
+    // Etapa 3: Construir snapshot de ayudantes y bloquear emisión ante vencimiento documental (titular o cuadrilla)
     const authorizedEmployees = await resolveAuthorizedEmployeesSnapshot(
       Number(provider_id),
       employee_ids
@@ -973,6 +1138,7 @@ const createPass = async (req, res) => {
       });
     }
 
+    // Etapa 4: Generar token QR seguro e insertar el pase adaptándose a la existencia de `vehicle_plate`
     const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
     const qrToken = crypto.randomBytes(32).toString('hex');
     const supportsPlate = await hasVehiclePlateColumn();
@@ -991,6 +1157,7 @@ const createPass = async (req, res) => {
          VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, 'pending')
          RETURNING *`;
 
+    // Armar arreglo de parámetros posicionales acorde al esquema detectado (con o sin `vehicle_plate`)
     const params = supportsPlate
       ? [
           effectiveCountryId,
@@ -1022,6 +1189,7 @@ const createPass = async (req, res) => {
       authorized_employees: parseAuthorizedEmployeesArray(created.rows[0].authorized_employees),
     };
 
+    // Etapa 5: Reservar automáticamente la franja horaria en la agenda del prestador
     await upsertScheduleBlock({
       providerId: Number(provider_id),
       blockType: 'trustlink_pass',
@@ -1042,17 +1210,23 @@ const createPass = async (req, res) => {
 };
 
 /**
- * Lista los pases QR emitidos por el residente/familia autenticado.
+ * Lista los pases QR emitidos por el residente/familia autenticado,
+ * actualizando previamente pases vencidos y adjuntando datos del prestador, cuadrilla y comunidad.
  * GET /api/v1/passes/my
+ *
+ * @param {import('express').Request} req - Solicitud autenticada del residente.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ passes }`.
  */
 const getMyPasses = async (req, res) => {
   try {
+    // Etapa 1: Sincronizar esquema/vencimientos y resolver proyección opcional de patente
     await ensureAuthorizedEmployeesColumn();
     await expireOverduePasses();
     const ownerId = req.user.userId;
     const supportsPlate = await hasVehiclePlateColumn();
     const plateSelect = supportsPlate ? 'ap.vehicle_plate,' : 'NULL::text AS vehicle_plate,';
 
+    // Etapa 2: Consultar pases emitidos por el residente enriquecidos con prestador y comunidad
     const result = await db.query(
       `SELECT
          ap.id,
@@ -1094,11 +1268,16 @@ const getMyPasses = async (req, res) => {
 };
 
 /**
- * Lista los pases QR asignados al prestador autenticado.
+ * Lista todos los pases QR asignados a cualquiera de los perfiles de prestador del usuario autenticado,
+ * incluyendo datos de contacto del residente autorizante y la cuadrilla incluida.
  * GET /api/v1/passes/provider
+ *
+ * @param {import('express').Request} req - Solicitud autenticada del prestador.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ passes }`.
  */
 const listProviderPasses = async (req, res) => {
   try {
+    // Etapa 1: Sincronizar vencimientos y resolver todos los IDs de prestador del usuario
     await ensureAuthorizedEmployeesColumn();
     await expireOverduePasses();
     const userId = req.user.userId;
@@ -1114,6 +1293,7 @@ const listProviderPasses = async (req, res) => {
       return res.status(200).json({ passes: [] });
     }
 
+    // Etapa 2: Consultar pases asignados junto a datos del residente autorizante y comunidad
     const supportsPlate = await hasVehiclePlateColumn();
     const plateSelect = supportsPlate ? 'ap.vehicle_plate,' : 'NULL::text AS vehicle_plate,';
 
@@ -1147,6 +1327,7 @@ const listProviderPasses = async (req, res) => {
       [providerIds]
     );
 
+    // Normalizar la cuadrilla autorizada en cada pase antes de responder
     const passes = result.rows.map((row) => ({
       ...row,
       authorized_employees: parseAuthorizedEmployeesArray(row.authorized_employees),
@@ -1160,14 +1341,20 @@ const listProviderPasses = async (req, res) => {
 };
 
 /**
- * Permite editar un pase QR vigente propio del residente/familia.
- * Conserva y valida que la ubicación pertenezca a la cuenta registrada del residente.
+ * Permite al residente/familia editar un pase QR propio mientras se encuentre vigente
+ * (`status === 'pending'` y `end_time > NOW()` en UTC).
+ * Valida pertenencia de ubicación registrada y vigencia del seguro de cualquier ayudante agregado.
  * PATCH /api/v1/passes/:id
+ *
+ * @param {import('express').Request} req - Param `id`; body opcional con `fraction_number`, `lot_number`, `vehicle_plate`, `employee_ids`, `start_time`, `end_time`.
+ * @param {import('express').Response} res - Respuesta HTTP con el pase actualizado.
  */
 const updatePass = async (req, res) => {
   try {
     await ensureAuthorizedEmployeesColumn();
     await expireOverduePasses();
+
+    // Etapa 1: Validar ID y obtener registro actual del pase junto con marcas UTC de vigencia
     const passId = Number(req.params.id);
     const ownerId = Number(req.user.userId);
 
@@ -1191,6 +1378,7 @@ const updatePass = async (req, res) => {
       return res.status(404).json({ error: 'Pase QR no encontrado.' });
     }
 
+    // Etapa 2: Verificar propiedad del residente y que el pase siga vigente (`pending` y no vencido)
     const currentPass = currentRes.rows[0];
     if (Number(currentPass.owner_id) !== ownerId) {
       return res.status(403).json({ error: 'No tenés permiso para editar este pase.' });
@@ -1206,12 +1394,14 @@ const updatePass = async (req, res) => {
       });
     }
 
+    // Etapa 3: Validar ubicación registrada del residente (anti-suplantación)
     const { fraction_number, lot_number, vehicle_plate, employee_ids, start_time, end_time } = req.body;
     const locationResult = await resolveResidentLocation(ownerId, fraction_number, lot_number);
     if (locationResult.error) {
       return res.status(400).json({ error: locationResult.error });
     }
 
+    // Etapa 4: Recalcular cuadrilla si fue enviada y bloquear si algún ayudante tiene seguro vencido
     const nextAuthorizedEmployees = Array.isArray(employee_ids)
       ? await resolveAuthorizedEmployeesSnapshot(Number(currentPass.provider_id), employee_ids)
       : parseAuthorizedEmployeesArray(currentPass.authorized_employees);
@@ -1230,6 +1420,7 @@ const updatePass = async (req, res) => {
       }
     }
 
+    // Etapa 5: Persistir actualización en `access_passes` adaptándose a la columna opcional `vehicle_plate`
     const supportsPlate = await hasVehiclePlateColumn();
 
     const updateSql = supportsPlate
@@ -1256,6 +1447,7 @@ const updatePass = async (req, res) => {
         ? String(vehicle_plate).trim().toUpperCase()
         : null;
 
+    // Armar arreglo de parámetros posicionales acorde al esquema detectado (con o sin `vehicle_plate`)
     const params = supportsPlate
       ? [
           locationResult.fractionDisplay,
@@ -1292,12 +1484,18 @@ const updatePass = async (req, res) => {
 };
 
 /**
- * Cancela un pase QR pendiente propio o por rol administrativo y libera el bloque automático de agenda.
+ * Cancela un pase QR pendiente propio del residente o por un rol administrativo (`admin`/`superadmin`)
+ * y libera automáticamente el bloque de agenda asociado (`source_ref = 'pass-<id>'`).
  * PATCH /api/v1/passes/:id/cancel
+ *
+ * @param {import('express').Request} req - Param `id` del pase QR.
+ * @param {import('express').Response} res - Respuesta HTTP con el pase cancelado.
  */
 const cancelPass = async (req, res) => {
   try {
     await expireOverduePasses();
+
+    // Etapa 1: Validar ID y obtener estado/propietario del pase
     const passId = Number(req.params.id);
     const userId = req.user.userId;
     const userRole = String(req.user.role || '').toLowerCase();
@@ -1315,6 +1513,7 @@ const cancelPass = async (req, res) => {
       return res.status(404).json({ error: 'Pase QR no encontrado.' });
     }
 
+    // Etapa 2: Verificar permisos (propietario del pase o rol administrativo) y estado cancelable
     const passRecord = currentRes.rows[0];
     const isAdminRole = userRole === 'admin' || userRole === 'superadmin';
 
@@ -1336,6 +1535,7 @@ const cancelPass = async (req, res) => {
       });
     }
 
+    // Etapa 3: Cambiar estado a `cancelled` y liberar el bloque automático en `provider_schedule_blocks`
     const updated = await db.query(
       `UPDATE access_passes
        SET status = 'cancelled'::pass_status
@@ -1357,14 +1557,22 @@ const cancelPass = async (req, res) => {
 };
 
 /**
- * Valida un pase QR en garita / consola de seguridad.
+ * Valida un pase QR en tiempo real desde la Consola Garita / consola de seguridad interna.
+ * Verifica existencia del pase, compliance aprobado, vencimientos documentales de titular y
+ * cuadrilla hidratada, suspensión operativa local en la comunidad, estado pendiente, franja
+ * horaria UTC vigente y ejecuta el consumo atómico de ingreso único (`pending` -> `used`).
+ * Cada intento queda auditado en `gate_access_logs`.
  * POST /api/v1/passes/verify
+ *
+ * @param {import('express').Request} req - Body: `{ qr_token }`.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ authorized, code, message, details? }`.
  */
 const verifyPassByQR = async (req, res) => {
   const integrationLabel = `Consola Garita (${req.user?.role || 'security'})`;
   const { qr_token } = req.body || {};
 
   try {
+    // Etapa 1: Preparar columnas, vencer pases expirados y validar presencia obligatoria de `qr_token`
     await ensureAuthorizedEmployeesColumn();
     await expireOverduePasses();
 
@@ -1387,6 +1595,7 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 2: Consultar el pase junto a prestador, compliance, residente, cuadrilla y vehículo (si aplica)
     const supportsPlate = await hasVehiclePlateColumn();
     const plateSelect = supportsPlate ? 'ap.vehicle_plate,' : 'NULL::text AS vehicle_plate,';
 
@@ -1434,6 +1643,7 @@ const verifyPassByQR = async (req, res) => {
 
     const result = await db.query(query, [String(qr_token).trim()]);
 
+    // Rechazar y auditar cuando el token no corresponde a ningún pase registrado
     if (result.rows.length === 0) {
       const msg = 'Pase QR inválido o inexistente.';
       await recordGateAccessLog({
@@ -1455,6 +1665,7 @@ const verifyPassByQR = async (req, res) => {
 
     const passInfo = result.rows[0];
 
+    // Etapa 3: Validar que el prestador cuente con compliance aprobado (`approved`)
     if (passInfo.compliance_status !== 'approved') {
       const msg = `El prestador no posee compliance aprobado (estado: ${passInfo.compliance_status}).`;
       await recordGateAccessLog({
@@ -1475,6 +1686,7 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 4: Hidratar vencimientos vigentes de la cuadrilla y bloquear ante cualquier documento expirado
     const parsedCrew = parseAuthorizedEmployeesArray(passInfo.authorized_employees);
     const hydratedCrew = await hydrateAuthorizedEmployeesExpiry(db, parsedCrew);
     const expiryViolation = findComplianceExpiryViolation({
@@ -1503,6 +1715,7 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 5: Verificar si existe una suspensión operativa local activa en la comunidad
     const activeSuspension = await findActiveLocalSuspension(
       passInfo.country_id || req.user?.countryId,
       passInfo.provider_id
@@ -1527,6 +1740,7 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 6: Validar estado del pase (rechazar pases ya usados o en estado distinto de `pending`)
     if (passInfo.pass_status === 'used') {
       const msg = 'El pase QR ya fue utilizado para un ingreso previo.';
       await recordGateAccessLog({
@@ -1567,6 +1781,7 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 7: Comprobar que la hora UTC actual esté dentro de la franja autorizada [startMs, endMs]
     const startMs = Number(passInfo.start_utc_ms);
     const endMs = Number(passInfo.end_utc_ms);
     const nowMs = Number(passInfo.now_utc_ms);
@@ -1591,7 +1806,7 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
-    // Consumo atómico de ingreso único: cambia de 'pending' a 'used'
+    // Etapa 8: Consumo atómico de ingreso único (`pending` -> `used`) para evitar reuso concurrente
     const consumedRes = await db.query(
       `UPDATE access_passes
        SET status = 'used'::pass_status
@@ -1620,6 +1835,7 @@ const verifyPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 9: Registrar auditoría de ingreso concedido y devolver ficha visual para Consola Garita
     const grantedMsg = 'Acceso autorizado. Pase QR marcado como utilizado (ingreso único).';
     await recordGateAccessLog({
       qrToken: qr_token,
@@ -1632,6 +1848,7 @@ const verifyPassByQR = async (req, res) => {
       httpStatus: 200,
     });
 
+    // Resolver patente efectiva priorizando la declarada en el pase sobre la ficha del vehículo
     const authorizedEmployees = hydratedCrew;
     const effectivePlate = passInfo.vehicle_plate || passInfo.plate || null;
 
@@ -1676,6 +1893,7 @@ const verifyPassByQR = async (req, res) => {
   }
 };
 
+// Exportaciones públicas del módulo de agenda, coordinación de visitas, pases QR y Consola Garita
 module.exports = {
   getProviderSchedule,
   createScheduleBlock,

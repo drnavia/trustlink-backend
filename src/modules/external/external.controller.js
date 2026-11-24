@@ -14,6 +14,11 @@ const {
   hydrateAuthorizedEmployeesExpiry,
 } = require('../../utils/complianceExpiry');
 
+/**
+ * Catálogo comercial de planes B2B disponibles para comunidades/barrios privados.
+ * Define precio de referencia en ARS y cuota mensual de validaciones QR autorizadas
+ * (`null` equivale a validaciones ilimitadas).
+ */
 const COMMUNITY_B2B_PLANS = [
   {
     code: 'pilot',
@@ -45,14 +50,20 @@ const COMMUNITY_B2B_PLANS = [
   },
 ];
 
+/** Índice rápido de metadatos de planes B2B agrupados por su código (`plan_code`). */
 const B2B_PLANS_BY_CODE = Object.fromEntries(COMMUNITY_B2B_PLANS.map((p) => [p.code, p]));
+/** Estados de facturación permitidos para una suscripción B2B de comunidad. */
 const ALLOWED_B2B_BILLING_STATUSES = ['trial', 'active', 'grace', 'suspended'];
 
 /**
  * Asegura de forma idempotente que la tabla `countries` cuente con las columnas
- * de ubicación y licenciamiento B2B (plan_code, billing_status, subscription_ends_at, monthly_pass_quota).
+ * de ubicación y licenciamiento B2B (`plan_code`, `billing_status`, `subscription_ends_at`,
+ * `monthly_pass_quota`), y migra valores heredados de `locality` o `location` hacia `city`.
+ *
+ * @returns {Promise<void>}
  */
 const ensureCountriesColumns = async () => {
+  // Paso 1: Agregar columnas de domicilio y licenciamiento comercial si aún no existen
   await db.query(`
     ALTER TABLE countries
       ADD COLUMN IF NOT EXISTS address VARCHAR(255) NULL,
@@ -65,6 +76,7 @@ const ensureCountriesColumns = async () => {
       ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL;
   `);
 
+  // Paso 2: Inspeccionar columnas reales para soportar esquemas legacy con `locality` o `location`
   const colsRes = await db.query(`
     SELECT column_name
     FROM information_schema.columns
@@ -72,6 +84,7 @@ const ensureCountriesColumns = async () => {
   `);
   const cols = new Set(colsRes.rows.map((r) => r.column_name));
 
+  // Backfill de `city` a partir de columnas antiguas si están pobladas
   if (cols.has('locality')) {
     await db.query(`
       UPDATE countries
@@ -90,10 +103,14 @@ const ensureCountriesColumns = async () => {
 };
 
 /**
- * Asegura la existencia de la tabla country_integrations y migra columnas legacy (`api_key`)
- * hacia `api_key_hash` y `api_key_prefix` de forma idempotente.
+ * Asegura de forma idempotente la existencia de la tabla `country_integrations`
+ * y migra claves legacy almacenadas en texto plano (`api_key`) hacia su formato
+ * seguro con hash SHA-256 (`api_key_hash`) y prefijo enmascarado (`api_key_prefix`).
+ *
+ * @returns {Promise<void>}
  */
 const ensureIntegrationsTable = async () => {
+  // Paso 1: Crear tabla de integraciones API por comunidad si no existe
   await db.query(`
     CREATE TABLE IF NOT EXISTS country_integrations (
       id SERIAL PRIMARY KEY,
@@ -107,12 +124,14 @@ const ensureIntegrationsTable = async () => {
     );
   `);
 
+  // Paso 2: Garantizar columnas de almacenamiento seguro en instalaciones previas
   await db.query(`
     ALTER TABLE country_integrations
       ADD COLUMN IF NOT EXISTS api_key_hash VARCHAR(128) NULL,
       ADD COLUMN IF NOT EXISTS api_key_prefix VARCHAR(24) NULL;
   `);
 
+  // Paso 3: Detectar columna heredada `api_key` para migrar claves sin perder continuidad operativa
   const legacyColRes = await db.query(`
     SELECT 1
     FROM information_schema.columns
@@ -123,10 +142,12 @@ const ensureIntegrationsTable = async () => {
   `);
 
   if (legacyColRes.rows.length > 0) {
+    // Relajar NOT NULL de `api_key` legacy para permitir nuevos registros solo con hash
     await db
       .query('ALTER TABLE country_integrations ALTER COLUMN api_key DROP NOT NULL;')
       .catch(() => {});
 
+    // Calcular hash SHA-256 y prefijo visible para filas heredadas aún sin migrar
     const legacyRows = await db.query(
       `SELECT id, api_key
        FROM country_integrations
@@ -150,8 +171,10 @@ const ensureIntegrationsTable = async () => {
 };
 
 /**
- * Asegura la existencia de la tabla gate_access_logs de forma idempotente
- * para auditar intentos autorizados y denegados de validación de pases QR.
+ * Asegura de forma idempotente la existencia de la tabla `gate_access_logs`,
+ * donde se audita cada intento autorizado o denegado de validación QR en garita o API externa.
+ *
+ * @returns {Promise<void>}
  */
 const ensureAuditLogsTable = async () => {
   await db.query(`
@@ -172,12 +195,16 @@ const ensureAuditLogsTable = async () => {
 };
 
 /**
- * Persiste en PostgreSQL el estado 'expired'::pass_status para pases en estado 'pending'
- * cuya end_time (almacenada en UTC sin zona horaria) ya superó el instante actual (NOW()).
- * @param {number|null} passId
+ * Persiste en PostgreSQL el estado `'expired'::pass_status` para pases en estado `'pending'`
+ * cuya columna `end_time` (almacenada en UTC sin zona horaria) ya superó el instante actual (`NOW()`).
+ * Tolerante a fallos: registra el error sin interrumpir el flujo llamador.
+ *
+ * @param {number|null} [passId=null] - Si se indica, evalúa solo ese pase; si es null, barre todos los vencidos.
+ * @returns {Promise<void>}
  */
 const expireOverduePasses = async (passId = null) => {
   try {
+    // Expiración puntual de un único pase específico
     if (passId !== null && passId !== undefined) {
       await db.query(
         `
@@ -193,6 +220,7 @@ const expireOverduePasses = async (passId = null) => {
       return;
     }
 
+    // Barrido masivo de todos los pases pendientes fuera de ventana horaria
     await db.query(`
       UPDATE access_passes
       SET status = 'expired'::pass_status
@@ -205,9 +233,23 @@ const expireOverduePasses = async (passId = null) => {
   }
 };
 
+/**
+ * Genera el hash criptográfico SHA-256 en hexadecimal de una API Key externa
+ * (previo recorte de espacios) para almacenamiento y comparación sin exponer secretos.
+ *
+ * @param {string} rawKey - Clave API en texto plano recibida o recién generada.
+ * @returns {string} Hash SHA-256 en formato hexadecimal (64 caracteres).
+ */
 const hashApiKey = (rawKey) =>
   crypto.createHash('sha256').update(String(rawKey).trim()).digest('hex');
 
+/**
+ * Enmascara un token QR conservando los primeros 8 y los últimos 6 caracteres
+ * para mantener trazabilidad en auditoría sin persistir el secreto completo.
+ *
+ * @param {string|null|undefined} token - Token QR original.
+ * @returns {string|null} Token parcialmente enmascarado o `null` si está vacío.
+ */
 const maskToken = (token) => {
   if (!token) return null;
   const clean = String(token).trim();
@@ -216,7 +258,20 @@ const maskToken = (token) => {
 };
 
 /**
- * Registra un evento de validación de pase QR en gate_access_logs.
+ * Registra de forma tolerante a fallos un evento de validación de pase QR en `gate_access_logs`,
+ * enmascarando el token para preservar trazabilidad sin exponer credenciales completas.
+ *
+ * @param {Object} params - Datos del evento de auditoría.
+ * @param {string} [params.qrToken] - Token QR evaluado (se persiste enmascarado).
+ * @param {number|null} [params.passId=null] - ID del pase si fue hallado.
+ * @param {number|null} [params.countryId=null] - ID de la comunidad asociada.
+ * @param {string|null} [params.integrationLabel=null] - Etiqueta de garita/integración/rol.
+ * @param {string} [params.authMode='unknown'] - Modo de autenticación (`community_api_key`, `env_api_key`, `jwt`, etc.).
+ * @param {boolean} [params.authorized=false] - Indica si el acceso fue concedido.
+ * @param {string} [params.reasonCode='UNKNOWN'] - Código de resultado o motivo de rechazo.
+ * @param {string} [params.message=''] - Mensaje descriptivo devuelto al consumidor.
+ * @param {number} [params.httpStatus=200] - Código HTTP de la respuesta emitida.
+ * @returns {Promise<void>}
  */
 const recordGateAccessLog = async ({
   qrToken,
@@ -231,6 +286,7 @@ const recordGateAccessLog = async ({
 }) => {
   try {
     await ensureAuditLogsTable();
+    // Persistir el intento con el token enmascarado y los metadatos de resultado/HTTP
     await db.query(
       `
         INSERT INTO gate_access_logs (
@@ -263,6 +319,14 @@ const recordGateAccessLog = async ({
   }
 };
 
+/**
+ * Cuenta cuántas validaciones QR autorizadas (`authorized = TRUE`) consumió una comunidad
+ * durante el mes calendario en curso (desde el 1° del mes según el reloj del servidor SQL).
+ * Se utiliza para controlar la cuota mensual del plan B2B y mostrar métricas de consumo.
+ *
+ * @param {number|string|null} countryId - ID de la comunidad.
+ * @returns {Promise<number>} Cantidad de validaciones autorizadas en el mes actual.
+ */
 const getMonthlyQrUsedForCountry = async (countryId) => {
   if (!countryId) return 0;
   await ensureAuditLogsTable();
@@ -277,7 +341,18 @@ const getMonthlyQrUsedForCountry = async (countryId) => {
   return Number(res.rows[0]?.used || 0);
 };
 
+/**
+ * Evalúa si la licencia comercial B2B de una comunidad permite validar accesos QR:
+ * 1) Bloquea si `billing_status === 'suspended'`.
+ * 2) Bloquea si `subscription_ends_at` ya expiró (excepto cuando está en período `'grace'`).
+ * 3) Bloquea si el consumo mensual alcanzó o superó `monthly_pass_quota` (cuando es > 0).
+ *
+ * @param {Object} countryRow - Registro de comunidad con `billing_status`, `subscription_ends_at` y `monthly_pass_quota`.
+ * @param {number} [monthlyUsed=0] - Validaciones QR autorizadas acumuladas en el mes actual.
+ * @returns {{ok: boolean, code?: string, error?: string}} Resultado de habilitación comercial.
+ */
 const evaluateCountryB2BStatus = (countryRow, monthlyUsed = 0) => {
+  // Regla 1: Bloqueo inmediato por suspensión comercial
   const status = String(countryRow?.billing_status || 'active').toLowerCase();
   if (status === 'suspended') {
     return {
@@ -287,6 +362,7 @@ const evaluateCountryB2BStatus = (countryRow, monthlyUsed = 0) => {
     };
   }
 
+  // Regla 2: Verificar fecha de vencimiento de suscripción (respetando período de gracia)
   if (countryRow?.subscription_ends_at && status !== 'grace') {
     const endsAtMs = new Date(countryRow.subscription_ends_at).getTime();
     if (!Number.isNaN(endsAtMs) && endsAtMs < Date.now()) {
@@ -298,6 +374,7 @@ const evaluateCountryB2BStatus = (countryRow, monthlyUsed = 0) => {
     }
   }
 
+  // Regla 3: Controlar tope mensual de validaciones QR autorizadas (null = ilimitado)
   const quota =
     countryRow?.monthly_pass_quota !== null && countryRow?.monthly_pass_quota !== undefined
       ? Number(countryRow.monthly_pass_quota)
@@ -314,19 +391,30 @@ const evaluateCountryB2BStatus = (countryRow, monthlyUsed = 0) => {
 };
 
 /**
- * Autentica la llamada externa mediante API key por comunidad (country_integrations)
- * o clave global de respaldo (EXTERNAL_GATE_API_KEY), o bien vía JWT interno.
+ * Resuelve la autenticación y autorización de llamadas externas al validador de garita.
+ * Orden de precedencia:
+ * 1) Header `x-api-key` comparado contra hashes de `country_integrations` (verifica clave activa,
+ *    comunidad activa, licencia/cuota B2B y actualiza `last_used_at`).
+ * 2) Header `x-api-key` igual a la clave global de respaldo `EXTERNAL_GATE_API_KEY`.
+ * 3) Sesión JWT interna con rol autorizado (`admin`, `superadmin` o `security`).
+ *
+ * @param {import('express').Request} req - Solicitud HTTP entrante.
+ * @returns {Promise<{ok: boolean, status?: number, code?: string, error?: string, authMode: string, countryId: number|null, integrationLabel: string|null}>}
  */
 const resolveExternalAuth = async (req) => {
+  // Extraer credenciales posibles: header x-api-key, variable de entorno global y sesión JWT
   const providedKey = String(req.headers['x-api-key'] || '').trim();
   const envKey = String(process.env.EXTERNAL_GATE_API_KEY || '').trim();
   const hasValidJwt = Boolean(
     req.user && ['admin', 'superadmin', 'security'].includes(req.user.role)
   );
 
+  // Flujo 1: Autenticación mediante encabezado `x-api-key`
   if (providedKey) {
     await Promise.all([ensureCountriesColumns(), ensureIntegrationsTable()]);
     const keyHash = hashApiKey(providedKey);
+
+    // Buscar la clave hasheada junto con el estado operativo y comercial de su comunidad
     const integrationRes = await db.query(
       `
         SELECT
@@ -350,6 +438,8 @@ const resolveExternalAuth = async (req) => {
 
     if (integrationRes.rows.length > 0) {
       const integ = integrationRes.rows[0];
+
+      // Verificar que la clave no haya sido revocada y que la comunidad esté habilitada
       if (!integ.is_active) {
         return {
           ok: false,
@@ -373,6 +463,7 @@ const resolveExternalAuth = async (req) => {
         };
       }
 
+      // Evaluar estado de licencia comercial B2B y cuota mensual consumida
       const monthlyUsed = await getMonthlyQrUsedForCountry(integ.country_id);
       const b2bCheck = evaluateCountryB2BStatus(integ, monthlyUsed);
       if (!b2bCheck.ok) {
@@ -387,6 +478,7 @@ const resolveExternalAuth = async (req) => {
         };
       }
 
+      // Registrar último uso exitoso de la integración para monitoreo
       await db.query(
         'UPDATE country_integrations SET last_used_at = NOW() WHERE id = $1',
         [integ.id]
@@ -400,6 +492,7 @@ const resolveExternalAuth = async (req) => {
       };
     }
 
+    // Flujo 2: Fallback a clave global configurada por variable de entorno
     if (envKey && providedKey === envKey) {
       return {
         ok: true,
@@ -409,6 +502,7 @@ const resolveExternalAuth = async (req) => {
       };
     }
 
+    // Clave enviada pero no coincide con ninguna comunidad ni con la clave global
     return {
       ok: false,
       status: 401,
@@ -420,6 +514,7 @@ const resolveExternalAuth = async (req) => {
     };
   }
 
+  // Flujo 3: Autenticación mediante JWT interno de consola (admin, superadmin o security)
   if (hasValidJwt) {
     return {
       ok: true,
@@ -429,6 +524,7 @@ const resolveExternalAuth = async (req) => {
     };
   }
 
+  // Sin API Key ni sesión JWT autorizada
   return {
     ok: false,
     status: 401,
@@ -441,12 +537,18 @@ const resolveExternalAuth = async (req) => {
 };
 
 /**
- * Diagnóstico técnico del backend, base de datos y endpoint externo.
- * Uso exclusivo: rol 'superadmin'.
+ * Devuelve un diagnóstico técnico integral del servicio backend, conectividad/latencia con PostgreSQL,
+ * configuración del endpoint externo y métricas operativas globales (pases, prestadores, comunidades,
+ * integraciones activas y validaciones QR del mes).
+ * GET /api/v1/external/diagnostics (Uso exclusivo: rol `superadmin`).
+ *
+ * @param {import('express').Request} req - Solicitud HTTP entrante.
+ * @param {import('express').Response} res - Respuesta HTTP con estado `healthy` o `degraded`.
  */
 const getExternalDiagnostics = async (req, res) => {
   const startedAt = Date.now();
   try {
+    // Etapa 1: Asegurar tablas/columnas requeridas y sincronizar pases vencidos antes de medir KPIs
     await Promise.all([
       ensureCountriesColumns(),
       ensureIntegrationsTable(),
@@ -454,9 +556,11 @@ const getExternalDiagnostics = async (req, res) => {
       expireOverduePasses()
     ]);
 
+    // Etapa 2: Verificar conectividad con PostgreSQL y calcular latencia de respuesta
     const dbCheck = await db.query('SELECT NOW() AS db_time');
     const dbLatencyMs = Date.now() - startedAt;
 
+    // Etapa 3: Consolidar métricas operativas y comerciales en una única consulta agregada
     const metricsCheck = await db.query(`
       SELECT
         (SELECT COUNT(*)::int FROM access_passes) AS total_passes,
@@ -476,6 +580,7 @@ const getExternalDiagnostics = async (req, res) => {
 
     const envKey = String(process.env.EXTERNAL_GATE_API_KEY || '').trim();
 
+    // Etapa 4: Retornar reporte saludable con telemetría del proceso, BD y capacidades del endpoint
     return res.status(200).json({
       status: 'healthy',
       service: 'trustlink-backend',
@@ -520,12 +625,19 @@ const getExternalDiagnostics = async (req, res) => {
 };
 
 /**
- * Lista comunidades (countries) con paginación, filtro de estado y búsqueda.
+ * Lista comunidades (`countries`) con paginación, filtro por estado (`active`/`inactive`/`all`)
+ * y búsqueda textual sobre nombre, localidad, provincia, dirección o código postal.
+ * Incluye conteo de API Keys activas, consumo mensual de QR y catálogo de planes B2B.
+ * GET /api/v1/external/countries
+ *
+ * @param {import('express').Request} req - Query params: `page`, `limit`, `search`, `status`.
+ * @param {import('express').Response} res - Respuesta HTTP con comunidades enriquecidas y paginación.
  */
 const listCountries = async (req, res) => {
   try {
     await Promise.all([ensureCountriesColumns(), ensureIntegrationsTable(), ensureAuditLogsTable()]);
 
+    // Etapa 1: Sanitizar parámetros de paginación y filtros de búsqueda
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 4, 1), 100);
     const search = String(req.query.search || '').trim();
@@ -550,6 +662,7 @@ const listCountries = async (req, res) => {
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
+    // Etapa 2: Calcular total filtrado y acotar la página solicitada al rango válido
     const countRes = await db.query(
       `SELECT COUNT(*)::int AS total FROM countries c ${whereClause}`,
       params
@@ -559,6 +672,7 @@ const listCountries = async (req, res) => {
     const safePage = Math.min(page, totalPages);
     const safeOffset = (safePage - 1) * limit;
 
+    // Etapa 3: Consultar página de comunidades con subconsultas de claves activas y consumo QR mensual
     const listParams = [...params, limit, safeOffset];
     const result = await db.query(
       `
@@ -591,6 +705,7 @@ const listCountries = async (req, res) => {
       listParams
     );
 
+    // Enriquecer cada comunidad con el nombre legible del plan B2B asignado
     const enrichedCountries = result.rows.map((row) => ({
       ...row,
       plan_name: B2B_PLANS_BY_CODE[row.plan_code]?.name || row.plan_code || 'Piloto Comunidad',
@@ -615,12 +730,18 @@ const listCountries = async (req, res) => {
 };
 
 /**
- * Crea una nueva comunidad (country).
+ * Crea una nueva comunidad (`countries`) adaptándose dinámicamente a si existe la columna
+ * heredada `location` en el esquema de PostgreSQL.
+ * POST /api/v1/external/countries
+ *
+ * @param {import('express').Request} req - Body: `name` (obligatorio), `address`, `postal_code`, `city`, `province`, `is_active`.
+ * @param {import('express').Response} res - Respuesta HTTP 201 con la comunidad creada.
  */
 const createCountry = async (req, res) => {
   try {
     await ensureCountriesColumns();
 
+    // Etapa 1: Extraer y validar datos básicos de la comunidad
     const name = String(req.body?.name || '').trim();
     const address = String(req.body?.address || '').trim();
     const postalCode = String(req.body?.postal_code || '').trim();
@@ -632,6 +753,7 @@ const createCountry = async (req, res) => {
       return res.status(400).json({ error: 'El nombre de la comunidad es obligatorio.' });
     }
 
+    // Etapa 2: Verificar si existe columna legacy `location` para mantener compatibilidad hacia atrás
     const colsRes = await db.query(`
       SELECT column_name
       FROM information_schema.columns
@@ -641,6 +763,7 @@ const createCountry = async (req, res) => {
 
     const locationText = [address, city, province, postalCode].filter(Boolean).join(', ') || null;
 
+    // Etapa 3: Insertar incluyendo `location` concatenado si la columna legacy sigue presente
     if (cols.has('location')) {
       const result = await db.query(
         `
@@ -676,12 +799,18 @@ const createCountry = async (req, res) => {
 };
 
 /**
- * Actualiza los datos de una comunidad existente.
+ * Actualiza los datos descriptivos y de domicilio de una comunidad existente.
+ * Aplica actualización parcial preservando los valores actuales de cualquier campo omitido.
+ * PUT / PATCH /api/v1/external/countries/:id
+ *
+ * @param {import('express').Request} req - Param `id`; body opcional con `name`, `address`, `postal_code`, `city`, `province`.
+ * @param {import('express').Response} res - Respuesta HTTP con la comunidad actualizada.
  */
 const updateCountry = async (req, res) => {
   try {
     await ensureCountriesColumns();
 
+    // Etapa 1: Validar identificador y existencia de la comunidad
     const countryId = parseInt(req.params.id, 10);
     if (Number.isNaN(countryId)) {
       return res.status(400).json({ error: 'ID de comunidad inválido.' });
@@ -692,6 +821,7 @@ const updateCountry = async (req, res) => {
       return res.status(404).json({ error: 'Comunidad no encontrada.' });
     }
 
+    // Etapa 2: Fusionar campos recibidos con los valores persistidos actualmente
     const current = existing.rows[0];
     const name = req.body?.name !== undefined ? String(req.body.name).trim() : current.name;
     if (!name) {
@@ -710,6 +840,7 @@ const updateCountry = async (req, res) => {
         ? String(req.body.province).trim() || null
         : current.province;
 
+    // Etapa 3: Persistir cambios en `countries`
     const updated = await db.query(
       `
         UPDATE countries
@@ -735,10 +866,16 @@ const updateCountry = async (req, res) => {
 };
 
 /**
- * Activa o desactiva una comunidad.
+ * Activa o desactiva operativamente una comunidad (`is_active`).
+ * Si el body incluye un booleano explícito `is_active`, aplica ese valor; caso contrario invierte el actual.
+ * PATCH /api/v1/external/countries/:id/status
+ *
+ * @param {import('express').Request} req - Param `id`; body opcional `{ is_active?: boolean }`.
+ * @param {import('express').Response} res - Respuesta HTTP con el registro actualizado.
  */
 const toggleCountryStatus = async (req, res) => {
   try {
+    // Validar ID y comprobar existencia previa
     const countryId = parseInt(req.params.id, 10);
     if (Number.isNaN(countryId)) {
       return res.status(400).json({ error: 'ID de comunidad inválido.' });
@@ -749,6 +886,7 @@ const toggleCountryStatus = async (req, res) => {
       return res.status(404).json({ error: 'Comunidad no encontrada.' });
     }
 
+    // Determinar estado destino (explícito o toggle del estado actual)
     const nextActive =
       typeof req.body?.is_active === 'boolean' ? req.body.is_active : !existing.rows[0].is_active;
 
@@ -774,11 +912,17 @@ const toggleCountryStatus = async (req, res) => {
 
 /**
  * Actualiza el plan B2B, estado de facturación, vigencia y cuota mensual de QR de una comunidad.
- * PATCH /api/v1/external/countries/:id/billing (Exclusivo superadmin)
+ * Permite extender la vigencia acumulativamente con `extend_days` o fijar `subscription_ends_at`.
+ * PATCH /api/v1/external/countries/:id/billing (Exclusivo `superadmin`).
+ *
+ * @param {import('express').Request} req - Param `id`; body: `plan_code`, `billing_status`, `monthly_pass_quota`, `extend_days`, `subscription_ends_at`.
+ * @param {import('express').Response} res - Respuesta HTTP con la comunidad y su consumo QR mensual actual.
  */
 const updateCountryBilling = async (req, res) => {
   try {
     await Promise.all([ensureCountriesColumns(), ensureAuditLogsTable()]);
+
+    // Etapa 1: Validar ID y obtener configuración comercial vigente de la comunidad
     const countryId = parseInt(req.params.id, 10);
     if (Number.isNaN(countryId)) {
       return res.status(400).json({ error: 'ID de comunidad inválido.' });
@@ -790,6 +934,7 @@ const updateCountryBilling = async (req, res) => {
     }
     const current = existingRes.rows[0];
 
+    // Etapa 2: Validar plan B2B y estado comercial contra las listas permitidas
     const requestedPlan =
       req.body?.plan_code !== undefined ? String(req.body.plan_code).trim().toLowerCase() : current.plan_code || 'pilot';
     if (!B2B_PLANS_BY_CODE[requestedPlan]) {
@@ -808,6 +953,7 @@ const updateCountryBilling = async (req, res) => {
       });
     }
 
+    // Etapa 3: Resolver cuota mensual (override explícito, ilimitado con null/''/0 o default al cambiar plan)
     const planMeta = B2B_PLANS_BY_CODE[requestedPlan];
     let nextQuota = current.monthly_pass_quota;
     if (req.body?.monthly_pass_quota !== undefined) {
@@ -824,6 +970,7 @@ const updateCountryBilling = async (req, res) => {
       nextQuota = planMeta.default_monthly_quota;
     }
 
+    // Etapa 4: Calcular fecha de vencimiento (extensión por días sobre fecha vigente o fecha explícita)
     let nextEndsAt = current.subscription_ends_at || null;
     if (req.body?.extend_days !== undefined && req.body.extend_days !== null) {
       const extendDays = parseInt(req.body.extend_days, 10);
@@ -848,6 +995,7 @@ const updateCountryBilling = async (req, res) => {
       }
     }
 
+    // Etapa 5: Persistir actualización comercial y adjuntar uso mensual actual
     const updatedRes = await db.query(
       `
         UPDATE countries
@@ -881,17 +1029,23 @@ const updateCountryBilling = async (req, res) => {
 };
 
 /**
- * Devuelve el resumen de licencia B2B y consumo mensual de QR para la comunidad del admin local
- * (o la comunidad seleccionada por superadmin).
+ * Devuelve el resumen de licencia B2B, claves activas y porcentaje de consumo mensual de QR
+ * para la comunidad del administrador local (o la comunidad indicada/primera disponible si es `superadmin`).
  * GET /api/v1/external/my-community/billing
+ *
+ * @param {import('express').Request} req - Query opcional `country_id` (solo considerado para `superadmin`).
+ * @param {import('express').Response} res - Respuesta HTTP con detalle de comunidad, plan actual y catálogo B2B.
  */
 const getMyCommunityBilling = async (req, res) => {
   try {
     await Promise.all([ensureCountriesColumns(), ensureIntegrationsTable(), ensureAuditLogsTable()]);
+
+    // Etapa 1: Determinar la comunidad objetivo según el rol autenticado
     const isSuperadmin = req.user?.role === 'superadmin';
     const requestedCountryId = req.query.country_id ? parseInt(req.query.country_id, 10) : null;
     let targetCountryId = isSuperadmin && requestedCountryId ? requestedCountryId : req.user?.countryId;
 
+    // Para superadmin sin countryId en sesión ni query, usar la primera comunidad registrada como fallback
     if (!targetCountryId && isSuperadmin) {
       const firstCountry = await db.query('SELECT id FROM countries ORDER BY id ASC LIMIT 1');
       targetCountryId = firstCountry.rows[0]?.id || null;
@@ -901,6 +1055,7 @@ const getMyCommunityBilling = async (req, res) => {
       return res.status(404).json({ error: 'No se encontró una comunidad asociada a la cuenta.' });
     }
 
+    // Etapa 2: Consultar datos comerciales de la comunidad y cantidad de API Keys activas
     const countryRes = await db.query(
       `
         SELECT
@@ -925,6 +1080,7 @@ const getMyCommunityBilling = async (req, res) => {
       return res.status(404).json({ error: 'Comunidad no encontrada.' });
     }
 
+    // Etapa 3: Calcular consumo QR del mes en curso y porcentaje respecto a la cuota del plan
     const community = countryRes.rows[0];
     const monthlyUsed = await getMonthlyQrUsedForCountry(community.id);
     const plan = B2B_PLANS_BY_CODE[community.plan_code] || COMMUNITY_B2B_PLANS[0];
@@ -952,11 +1108,18 @@ const getMyCommunityBilling = async (req, res) => {
 };
 
 /**
- * Lista claves API de integración por comunidad (con paginación y filtro por comunidad).
+ * Lista las claves API de integración por comunidad con paginación y filtro opcional por `country_id`.
+ * Por seguridad solo expone `api_key_prefix` (nunca el hash ni el secreto en texto plano).
+ * GET /api/v1/external/integrations
+ *
+ * @param {import('express').Request} req - Query params: `page`, `limit`, `country_id`.
+ * @param {import('express').Response} res - Respuesta HTTP con integraciones y paginación.
  */
 const listCommunityIntegrations = async (req, res) => {
   try {
     await ensureIntegrationsTable();
+
+    // Etapa 1: Parsear paginación y filtro opcional por comunidad
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 50);
     const countryIdParam = req.query.country_id ? parseInt(req.query.country_id, 10) : null;
@@ -971,6 +1134,7 @@ const listCommunityIntegrations = async (req, res) => {
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
+    // Etapa 2: Contar registros totales y calcular offset seguro
     const countRes = await db.query(
       `SELECT COUNT(*)::int AS total FROM country_integrations ci ${whereClause}`,
       params
@@ -980,6 +1144,7 @@ const listCommunityIntegrations = async (req, res) => {
     const safePage = Math.min(page, totalPages);
     const safeOffset = (safePage - 1) * limit;
 
+    // Etapa 3: Consultar página de integraciones uniendo el nombre de la comunidad
     const listParams = [...params, limit, safeOffset];
     const result = await db.query(
       `
@@ -1001,6 +1166,7 @@ const listCommunityIntegrations = async (req, res) => {
       listParams
     );
 
+    // Devolver claves de integración paginadas (solo prefijos visibles, nunca secretos ni hashes)
     return res.status(200).json({
       integrations: result.rows,
       pagination: {
@@ -1017,11 +1183,18 @@ const listCommunityIntegrations = async (req, res) => {
 };
 
 /**
- * Crea una nueva clave API para una comunidad. Devuelve el secreto en texto plano una sola vez.
+ * Crea una nueva clave API criptográfica (`tlk_live_*`) para una comunidad.
+ * Persiste únicamente el hash SHA-256 y el prefijo visible; devuelve el secreto completo una sola vez.
+ * POST /api/v1/external/integrations
+ *
+ * @param {import('express').Request} req - Body: `country_id` (obligatorio), `label` (opcional).
+ * @param {import('express').Response} res - Respuesta HTTP 201 con `api_key` de exhibición única e integración creada.
  */
 const createCommunityIntegration = async (req, res) => {
   try {
     await ensureIntegrationsTable();
+
+    // Etapa 1: Validar comunidad destino y etiqueta descriptiva de la garita/sistema
     const countryId = parseInt(req.body?.country_id, 10);
     const label = String(req.body?.label || '').trim() || 'Garita Principal';
 
@@ -1034,10 +1207,12 @@ const createCommunityIntegration = async (req, res) => {
       return res.status(404).json({ error: 'La comunidad indicada no existe.' });
     }
 
+    // Etapa 2: Generar clave aleatoria de 24 bytes, calcular hash SHA-256 y prefijo enmascarado
     const rawApiKey = `tlk_live_${crypto.randomBytes(24).toString('hex')}`;
     const keyHash = hashApiKey(rawApiKey);
     const prefix = `${rawApiKey.slice(0, 14)}...${rawApiKey.slice(-4)}`;
 
+    // Etapa 3: Persistir integración activa (sin almacenar la clave en texto plano)
     const insertRes = await db.query(
       `
         INSERT INTO country_integrations (country_id, label, api_key_hash, api_key_prefix, is_active)
@@ -1062,11 +1237,18 @@ const createCommunityIntegration = async (req, res) => {
 };
 
 /**
- * Rota la clave API de una integración existente y devuelve el nuevo secreto una sola vez.
+ * Rota la clave API de una integración existente invalidando de inmediato la clave anterior,
+ * reactiva la integración y devuelve el nuevo secreto en texto plano una única vez.
+ * POST / PATCH /api/v1/external/integrations/:id/rotate
+ *
+ * @param {import('express').Request} req - Param `id` de la integración.
+ * @param {import('express').Response} res - Respuesta HTTP con el nuevo secreto `api_key` e integración actualizada.
  */
 const rotateCommunityIntegrationKey = async (req, res) => {
   try {
     await ensureIntegrationsTable();
+
+    // Etapa 1: Validar ID y verificar que la integración exista junto a su comunidad
     const integrationId = parseInt(req.params.id, 10);
     if (Number.isNaN(integrationId)) {
       return res.status(400).json({ error: 'ID de integración inválido.' });
@@ -1085,10 +1267,12 @@ const rotateCommunityIntegrationKey = async (req, res) => {
       return res.status(404).json({ error: 'Integración no encontrada.' });
     }
 
+    // Etapa 2: Generar nueva credencial, hash SHA-256 y prefijo enmascarado
     const rawApiKey = `tlk_live_${crypto.randomBytes(24).toString('hex')}`;
     const keyHash = hashApiKey(rawApiKey);
     const prefix = `${rawApiKey.slice(0, 14)}...${rawApiKey.slice(-4)}`;
 
+    // Etapa 3: Reemplazar hash en BD y asegurar `is_active = TRUE`
     const updated = await db.query(
       `
         UPDATE country_integrations
@@ -1116,11 +1300,18 @@ const rotateCommunityIntegrationKey = async (req, res) => {
 };
 
 /**
- * Activa o revoca una clave API de comunidad.
+ * Reactiva o revoca una clave API de comunidad actualizando su bandera `is_active`.
+ * Si no se envía `is_active` booleano en el body, alterna el estado actual.
+ * PATCH /api/v1/external/integrations/:id/status
+ *
+ * @param {import('express').Request} req - Param `id`; body opcional `{ is_active?: boolean }`.
+ * @param {import('express').Response} res - Respuesta HTTP con la integración actualizada.
  */
 const toggleCommunityIntegrationStatus = async (req, res) => {
   try {
     await ensureIntegrationsTable();
+
+    // Validar ID y existencia de la integración
     const integrationId = parseInt(req.params.id, 10);
     if (Number.isNaN(integrationId)) {
       return res.status(400).json({ error: 'ID de integración inválido.' });
@@ -1134,6 +1325,7 @@ const toggleCommunityIntegrationStatus = async (req, res) => {
       return res.status(404).json({ error: 'Integración no encontrada.' });
     }
 
+    // Determinar nuevo estado (explícito o inversión del estado actual) y persistir
     const nextActive =
       typeof req.body?.is_active === 'boolean'
         ? req.body.is_active
@@ -1160,13 +1352,20 @@ const toggleCommunityIntegrationStatus = async (req, res) => {
 };
 
 /**
- * Lista los pases QR recientes persistiendo 'expired' si venció su ventana horaria en UTC,
- * y exponiendo start_utc_ms / end_utc_ms para formateo exacto en la zona del usuario.
+ * Lista los pases QR recientes con paginación, filtro de estado y búsqueda libre,
+ * persistiendo previamente `'expired'` en pases vencidos y devolviendo `start_utc_ms`/`end_utc_ms`
+ * para formateo horario exacto en el cliente.
+ * GET /api/v1/external/passes
+ *
+ * @param {import('express').Request} req - Query params: `page`, `limit`, `status`, `search`.
+ * @param {import('express').Response} res - Respuesta HTTP con listado de pases y paginación.
  */
 const listRecentPasses = async (req, res) => {
   try {
+    // Etapa 1: Sincronizar estados vencidos antes de consultar
     await expireOverduePasses();
 
+    // Etapa 2: Sanitizar parámetros de paginación, filtro de estado y búsqueda textual
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 50);
     const status = String(req.query.status || 'all').trim().toLowerCase();
@@ -1190,6 +1389,7 @@ const listRecentPasses = async (req, res) => {
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
+    // Etapa 3: Obtener total filtrado y acotar página/offset
     const countRes = await db.query(
       `
         SELECT COUNT(*)::int AS total
@@ -1207,6 +1407,7 @@ const listRecentPasses = async (req, res) => {
     const safePage = Math.min(page, totalPages);
     const safeOffset = (safePage - 1) * limit;
 
+    // Etapa 4: Consultar pases enriquecidos con residente, prestador, comunidad y epochs UTC
     const listParams = [...params, limit, safeOffset];
     const result = await db.query(
       `
@@ -1240,6 +1441,7 @@ const listRecentPasses = async (req, res) => {
       listParams
     );
 
+    // Devolver pases paginados listos para renderizar con marcas temporales UTC exactas
     return res.status(200).json({
       passes: result.rows,
       pagination: {
@@ -1256,10 +1458,16 @@ const listRecentPasses = async (req, res) => {
 };
 
 /**
- * Cancela un pase QR pendiente cambiando su estado a 'cancelled' en PostgreSQL.
+ * Cancela un pase QR únicamente si se encuentra en estado `'pending'`,
+ * cambiando su estado a `'cancelled'::pass_status` en PostgreSQL.
+ * PATCH /api/v1/external/passes/:id/cancel
+ *
+ * @param {import('express').Request} req - Param `id` del pase QR.
+ * @param {import('express').Response} res - Respuesta HTTP con el pase cancelado.
  */
 const cancelPassById = async (req, res) => {
   try {
+    // Etapa 1: Validar identificador y comprobar existencia del pase
     const passId = parseInt(req.params.id, 10);
     if (Number.isNaN(passId)) {
       return res.status(400).json({ error: 'ID de pase inválido.' });
@@ -1270,6 +1478,7 @@ const cancelPassById = async (req, res) => {
       return res.status(404).json({ error: 'Pase QR no encontrado.' });
     }
 
+    // Etapa 2: Restringir la cancelación exclusivamente a pases pendientes
     const currentStatus = passRes.rows[0].status;
     if (currentStatus !== 'pending') {
       return res.status(400).json({
@@ -1277,6 +1486,7 @@ const cancelPassById = async (req, res) => {
       });
     }
 
+    // Etapa 3: Persistir el estado `cancelled`
     const updated = await db.query(
       `
         UPDATE access_passes
@@ -1298,8 +1508,11 @@ const cancelPassById = async (req, res) => {
 };
 
 /**
- * Consulta de forma segura el resumen y listado reciente de transacciones
- * adaptándose dinámicamente a las columnas reales de la tabla `transactions`.
+ * Consulta de forma tolerante a variaciones de esquema el resumen financiero (volumen bruto,
+ * comisiones/Take Rate y pagos netos a prestadores) y las últimas 6 transacciones de `transactions`.
+ * Si faltan columnas explícitas de comisión o neto, aplica el Take Rate de referencia del 7%.
+ *
+ * @returns {Promise<{summary: Object, recent: Array<Object>}>}
  */
 const fetchTransactionsAuditSafe = async () => {
   const defaultSummary = {
@@ -1310,6 +1523,7 @@ const fetchTransactionsAuditSafe = async () => {
   };
 
   try {
+    // Etapa 1: Inspeccionar columnas reales disponibles en la tabla `transactions`
     const colsRes = await db.query(`
       SELECT column_name
       FROM information_schema.columns
@@ -1320,6 +1534,7 @@ const fetchTransactionsAuditSafe = async () => {
       return { summary: defaultSummary, recent: [] };
     }
 
+    // Etapa 2: Mapear dinámicamente expresiones SQL para monto bruto, comisión, neto y estado
     const grossCol = cols.has('gross_amount')
       ? 't.gross_amount'
       : cols.has('amount')
@@ -1353,6 +1568,7 @@ const fetchTransactionsAuditSafe = async () => {
     const contractCol = cols.has('contract_id') ? 't.contract_id' : 'NULL';
     const orderCol = cols.has('id') ? 't.id DESC' : '1';
 
+    // Etapa 3: Calcular acumulados financieros globales
     const summaryRes = await db.query(`
       SELECT
         COUNT(*)::int AS total_transactions,
@@ -1362,6 +1578,7 @@ const fetchTransactionsAuditSafe = async () => {
       FROM transactions t
     `);
 
+    // Etapa 4: Armar JOIN opcional con contratos/prestadores/comunidades si existe `contract_id`
     const joinContracts = cols.has('contract_id')
       ? `
         LEFT JOIN service_contracts sc ON t.contract_id = sc.id
@@ -1375,6 +1592,7 @@ const fetchTransactionsAuditSafe = async () => {
       ? `TRIM(CONCAT(COALESCE(u_prov.first_name, ''), ' ', COALESCE(u_prov.last_name, ''))) AS provider_name, c.name AS country_name`
       : `NULL AS provider_name, NULL AS country_name`;
 
+    // Etapa 5: Obtener las 6 transacciones más recientes para vista rápida de auditoría
     const recentRes = await db.query(`
       SELECT
         ${cols.has('id') ? 't.id' : 'ROW_NUMBER() OVER () AS id'},
@@ -1401,17 +1619,24 @@ const fetchTransactionsAuditSafe = async () => {
 };
 
 /**
- * Obtiene bitácora paginada de intentos de validación de acceso en garita/API externa
- * y resumen de transacciones / comisiones (Take Rate) en PostgreSQL.
+ * Obtiene la bitácora paginada de intentos de validación de acceso en garita/API externa
+ * (`gate_access_logs`), junto con totales de autorizados/denegados y el resumen financiero
+ * tolerante de transacciones y comisiones (Take Rate).
+ * GET /api/v1/external/audit
+ *
+ * @param {import('express').Request} req - Query params: `page`, `limit`, `outcome` (`all`|`authorized`|`denied`), `search`.
+ * @param {import('express').Response} res - Respuesta HTTP con KPIs, bitácora paginada y resumen de transacciones.
  */
 const getAuditOverview = async (req, res) => {
   try {
+    // Etapa 1: Asegurar tablas requeridas y sincronizar estados de pases vencidos
     await Promise.all([
       ensureIntegrationsTable(),
       ensureAuditLogsTable(),
       expireOverduePasses()
     ]);
 
+    // Etapa 2: Sanitizar paginación, filtro de resultado (`outcome`) y búsqueda libre
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 8, 1), 50);
     const outcome = String(req.query.outcome || 'all').trim().toLowerCase();
@@ -1436,6 +1661,7 @@ const getAuditOverview = async (req, res) => {
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
+    // Etapa 3: Consultar KPIs globales de intentos (sin filtros) y total filtrado para paginación
     const summaryRes = await db.query(`
       SELECT
         COUNT(*)::int AS total_attempts,
@@ -1459,6 +1685,7 @@ const getAuditOverview = async (req, res) => {
     const safePage = Math.min(page, totalPages);
     const safeOffset = (safePage - 1) * limit;
 
+    // Etapa 4: Obtener página de eventos de auditoría unidos al nombre de comunidad
     const logsParams = [...params, limit, safeOffset];
     const logsRes = await db.query(
       `
@@ -1484,6 +1711,7 @@ const getAuditOverview = async (req, res) => {
       logsParams
     );
 
+    // Etapa 5: Anexar resumen financiero de transacciones de manera tolerante a fallos
     const txAudit = await fetchTransactionsAuditSafe();
 
     return res.status(200).json({
@@ -1511,11 +1739,20 @@ const getAuditOverview = async (req, res) => {
 };
 
 /**
- * Valida un pase QR en tiempo real para garitas o sistemas externos de barrios privados.
+ * Valida un pase QR en tiempo real para garitas o sistemas de control de acceso externos.
+ * Ejecuta cadena completa de controles: autenticación (`x-api-key` con cuota/licencia B2B o JWT),
+ * pertenencia de comunidad, vigencia horaria UTC, estado de pase, compliance aprobado, vencimientos
+ * documentales de titular y cuadrilla, suspensión operativa local y consumo atómico de ingreso único.
+ * Cada intento (exitoso o denegado) queda auditado en `gate_access_logs`.
+ * POST /api/v1/external/passes/verify
+ *
+ * @param {import('express').Request} req - Header `x-api-key` (o JWT); body `{ qr_token, country_id? }`.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ authorized, code, ... }` y datos del pase si se aprueba.
  */
 const verifyExternalPassByQR = async (req, res) => {
   await Promise.all([ensureIntegrationsTable(), ensureAuditLogsTable()]);
 
+  // Etapa 1: Autenticar integrador/sesión (incluye verificación de licencia y cuota B2B)
   const auth = await resolveExternalAuth(req);
   const qrToken = String(req.body?.qr_token || '').trim();
   const requestedCountryId =
@@ -1541,6 +1778,7 @@ const verifyExternalPassByQR = async (req, res) => {
     });
   }
 
+  // Etapa 2: Validar que el body incluya el token QR obligatorio
   if (!qrToken) {
     const msg = 'Debe proporcionar el token QR (qr_token) para validar el acceso.';
     await recordGateAccessLog({
@@ -1561,6 +1799,7 @@ const verifyExternalPassByQR = async (req, res) => {
   }
 
   try {
+    // Etapa 3: Asegurar columna de cuadrilla y consultar el pase completo con datos de cumplimiento y reloj UTC de BD
     await db.query(`
       ALTER TABLE public.access_passes
         ADD COLUMN IF NOT EXISTS authorized_employees JSONB NOT NULL DEFAULT '[]'::jsonb;
@@ -1602,6 +1841,7 @@ const verifyExternalPassByQR = async (req, res) => {
       [qrToken]
     );
 
+    // Rechazar y auditar si el token QR no existe en `access_passes`
     if (passRes.rows.length === 0) {
       const msg = 'El token QR indicado no corresponde a ningún pase registrado.';
       await recordGateAccessLog({
@@ -1621,6 +1861,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 4: Verificar aislamiento multi-comunidad (el pase debe pertenecer a la comunidad de la clave/solicitud)
     let record = passRes.rows[0];
     const effectiveCountryId = auth.countryId || requestedCountryId;
 
@@ -1648,6 +1889,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 5: Normalizar marcas temporales UTC y expirar de inmediato si un pase pendiente ya venció
     const startMs =
       record.start_utc_ms !== null && record.start_utc_ms !== undefined
         ? Number(record.start_utc_ms)
@@ -1666,6 +1908,7 @@ const verifyExternalPassByQR = async (req, res) => {
       record = { ...record, status: 'expired' };
     }
 
+    // Etapa 6: Validar estado del ciclo de vida del pase (solo se permite avanzar en estado `pending`)
     if (record.status === 'cancelled') {
       const msg = 'El pase QR fue cancelado y ya no es válido.';
       await recordGateAccessLog({
@@ -1686,6 +1929,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    // Bloquear pases ya vencidos fuera de vigencia horaria
     if (record.status === 'expired') {
       const msg = 'El pase QR se encuentra vencido / fuera de vigencia horaria.';
       await recordGateAccessLog({
@@ -1706,6 +1950,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    // Bloquear reintentos sobre pases de ingreso único ya consumidos
     if (record.status === 'used') {
       const msg = 'El pase QR ya fue utilizado para un ingreso previo.';
       await recordGateAccessLog({
@@ -1726,6 +1971,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    // Resguardo genérico frente a cualquier estado distinto de `pending`
     if (record.status !== 'pending') {
       const msg = `El pase QR no se encuentra habilitado (estado actual: ${record.status}).`;
       await recordGateAccessLog({
@@ -1746,6 +1992,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 7: Comprobar que el instante actual se encuentre dentro de la franja horaria [startMs, endMs]
     if (startMs !== null && !Number.isNaN(startMs) && nowMs < startMs) {
       const msg = 'El pase aún no está dentro de su franja horaria habilitada.';
       await recordGateAccessLog({
@@ -1787,6 +2034,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 8: Verificar que el prestador cuente con compliance global en estado `approved`
     if (record.compliance_status && record.compliance_status !== 'approved') {
       const msg = `El prestador no cuenta con compliance aprobado (estado: ${record.compliance_status}).`;
       await recordGateAccessLog({
@@ -1807,6 +2055,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 9: Hidratar vigencias actuales de la cuadrilla y bloquear ante cualquier documento vencido (antecedentes/seguro)
     const rawExternalCrew = Array.isArray(record.authorized_employees)
       ? record.authorized_employees
       : [];
@@ -1837,7 +2086,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
-    // Verificar suspensión operativa local activa en la comunidad
+    // Etapa 10: Verificar suspensión operativa local activa en la comunidad (si existe la tabla)
     const suspensionCountryId = record.country_id || effectiveCountryId;
     if (suspensionCountryId && record.provider_id) {
       const suspTable = await db.query(
@@ -1876,7 +2125,7 @@ const verifyExternalPassByQR = async (req, res) => {
       }
     }
 
-    // Consumo atómico de ingreso único: cambia de 'pending' a 'used'
+    // Etapa 11: Consumo atómico de ingreso único (`pending` -> `used`) para prevenir doble uso concurrente
     const consumedRes = await db.query(
       `UPDATE access_passes
        SET status = 'used'::pass_status
@@ -1905,6 +2154,7 @@ const verifyExternalPassByQR = async (req, res) => {
       });
     }
 
+    // Etapa 12: Recuperar vehículos registrados del prestador para control visual en barrera
     let vehicles = [];
     if (record.provider_id) {
       const vehRes = await db.query(
@@ -1919,6 +2169,7 @@ const verifyExternalPassByQR = async (req, res) => {
       vehicles = vehRes.rows;
     }
 
+    // Etapa 13: Auditar autorización concedida y retornar ficha completa del ingreso
     const grantedMsg = 'Acceso autorizado para ingreso perimetral. Pase marcado como utilizado (ingreso único).';
     await recordGateAccessLog({
       qrToken,
@@ -1960,6 +2211,7 @@ const verifyExternalPassByQR = async (req, res) => {
       }
     });
   } catch (error) {
+    // Auditar cualquier falla inesperada del servidor antes de responder HTTP 500
     console.error('Error al verificar pase QR externo:', error);
     await recordGateAccessLog({
       qrToken,
@@ -1979,6 +2231,7 @@ const verifyExternalPassByQR = async (req, res) => {
   }
 };
 
+// Exportaciones públicas del módulo de integración externa, comunidades, licencias B2B y auditoría
 module.exports = {
   COMMUNITY_B2B_PLANS,
   getExternalDiagnostics,

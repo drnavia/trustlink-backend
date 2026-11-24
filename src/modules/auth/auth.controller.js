@@ -1,6 +1,8 @@
 /**
  * @file auth.controller.js
- * @description Lógica de negocio para autenticación, registro, listado y actualización de cuentas privilegiadas (Ops Master).
+ * @description Lógica de negocio para autenticación (login), registro público de usuarios,
+ * consulta de comunidades activas, recuperación/restablecimiento de contraseña y alta, listado
+ * y actualización de cuentas privilegiadas (Ops Master: admin, superadmin y security).
  * @location /trustlink-backend/src/modules/auth/auth.controller.js
  */
 const crypto = require('crypto');
@@ -13,9 +15,18 @@ const {
   getDefaultPrimaryPortal,
 } = require('../../config/ensureEvolutionSchema');
 
+// Roles habilitados para autoregistro desde el formulario público
 const PUBLIC_ALLOWED_ROLES = ['owner', 'family', 'provider'];
+// Roles operativos internos que solo pueden ser creados o editados por personal privilegiado
 const PRIVILEGED_ALLOWED_ROLES = ['admin', 'superadmin', 'security'];
 
+/**
+ * Garantiza de forma idempotente la existencia de la tabla `password_reset_tokens`.
+ * Almacena únicamente hashes SHA-256 de tokens temporales con expiración y marca de uso único;
+ * al eliminarse un usuario, sus tokens se purgan en cascada (`ON DELETE CASCADE`).
+ *
+ * @returns {Promise<void>}
+ */
 const ensurePasswordResetTable = async () => {
   await db.query(`
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -29,8 +40,19 @@ const ensurePasswordResetTable = async () => {
   `);
 };
 
+/**
+ * Lista las comunidades/countries habilitados para mostrarlos en selectores públicos
+ * (por ejemplo, durante el registro de residentes y prestadores).
+ * Consulta `countries` filtrando exclusivamente `is_active = TRUE` ordenados por `id`.
+ * GET /api/v1/auth/countries
+ *
+ * @param {import('express').Request} _req - Petición HTTP (sin parámetros requeridos).
+ * @param {import('express').Response} res - Respuesta HTTP con `{ countries }`.
+ * @returns {Promise<import('express').Response>}
+ */
 const listPublicCountries = async (_req, res) => {
   try {
+    // Consulta únicamente las comunidades activas para poblar el selector público
     const result = await db.query(
       `SELECT id, name
        FROM countries
@@ -44,8 +66,20 @@ const listPublicCountries = async (_req, res) => {
   }
 };
 
+/**
+ * Registra un nuevo usuario estándar (`owner`, `family` o `provider`) desde el flujo público.
+ * Valida obligatoriedad de campos, lista blanca de roles, unicidad por correo/DNI,
+ * normaliza la ubicación residencial (manzana/fracción y lote), asigna portales por defecto,
+ * cifra la contraseña con bcrypt y persiste el alta en `users`.
+ * POST /api/v1/auth/register
+ *
+ * @param {import('express').Request} req - Petición HTTP con los datos de alta en `req.body`.
+ * @param {import('express').Response} res - Respuesta HTTP `201` con el usuario creado.
+ * @returns {Promise<import('express').Response>}
+ */
 const register = async (req, res) => {
   try {
+    // 1. Asegurar columnas evolutivas de portales/ubicación y extraer payload
     await ensureEvolutionSchema();
 
     const {
@@ -64,6 +98,7 @@ const register = async (req, res) => {
       driver_license_url,
     } = req.body;
 
+    // 2. Validar campos obligatorios y verificar que el rol esté permitido en registro público
     if (!role || !first_name || !last_name || !dni || !email || !password) {
       return res.status(400).json({ error: 'Faltan campos obligatorios para el registro.' });
     }
@@ -75,6 +110,7 @@ const register = async (req, res) => {
       });
     }
 
+    // 3. Sanitizar identificadores y validar unicidad de email (insensible a mayúsculas) o DNI
     const cleanEmail = String(email).trim().toLowerCase();
     const cleanDni = String(dni).trim();
 
@@ -86,6 +122,7 @@ const register = async (req, res) => {
       return res.status(400).json({ error: 'Ya existe un usuario registrado con ese correo electrónico o DNI.' });
     }
 
+    // 4. Normalizar ubicación residencial: soporta alias `fraction` y deduce 'manzana' vs 'fraccion' si falta `fraction_type`
     const resolvedFractionNumber =
       fraction_number !== undefined && fraction_number !== null && String(fraction_number).trim() !== ''
         ? String(fraction_number).trim()
@@ -106,6 +143,7 @@ const register = async (req, res) => {
         ? String(lot_number).trim()
         : null;
 
+    // 5. Resolver capacidades de portal según rol y generar hash bcrypt (factor de costo 10)
     const primaryPortal = getDefaultPrimaryPortal(normalizedRole);
     const canUseResident = ['owner', 'family', 'resident'].includes(normalizedRole);
     const canUseProvider = normalizedRole === 'provider';
@@ -113,6 +151,7 @@ const register = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
+    // 6. Insertar registro en `users` con `portals_configured = TRUE` y devolver vista segura (sin password_hash)
     const query = `
       INSERT INTO users (
         country_id, role, first_name, last_name, dni, email, password_hash, phone,
@@ -155,8 +194,20 @@ const register = async (req, res) => {
   }
 };
 
+/**
+ * Crea una cuenta privilegiada (`admin`, `superadmin` o `security`) desde Operaciones / Superadmin.
+ * Regla de negocio: las cuentas `superadmin` son globales (`country_id = NULL`) y reciben
+ * habilitación en ambos portales operativos (`can_use_resident` y `can_use_provider`),
+ * mientras que `admin` y `security` quedan asociados a su `country_id`.
+ * POST /api/v1/auth/privileged-users
+ *
+ * @param {import('express').Request} req - Petición HTTP con los datos de la cuenta privilegiada.
+ * @param {import('express').Response} res - Respuesta HTTP `201` con la cuenta creada.
+ * @returns {Promise<import('express').Response>}
+ */
 const createPrivilegedUser = async (req, res) => {
   try {
+    // 1. Asegurar esquema evolutivo y validar presencia de campos requeridos
     await ensureEvolutionSchema();
 
     const { country_id, role, first_name, last_name, dni, email, password, phone } = req.body;
@@ -165,11 +216,13 @@ const createPrivilegedUser = async (req, res) => {
       return res.status(400).json({ error: 'Faltan campos obligatorios para crear la cuenta privilegiada.' });
     }
 
+    // 2. Verificar que el rol solicitado pertenezca al conjunto privilegiado
     const normalizedRole = String(role).trim().toLowerCase();
     if (!PRIVILEGED_ALLOWED_ROLES.includes(normalizedRole)) {
       return res.status(400).json({ error: 'Rol privilegiado inválido (admin, superadmin o security).' });
     }
 
+    // 3. Validar que el correo electrónico y el DNI no existan previamente en `users`
     const cleanEmail = String(email).trim().toLowerCase();
     const cleanDni = String(dni).trim();
 
@@ -181,6 +234,7 @@ const createPrivilegedUser = async (req, res) => {
       return res.status(400).json({ error: 'Ya existe un usuario registrado con ese correo electrónico o DNI.' });
     }
 
+    // 4. Cifrar contraseña y persistir cuenta privilegiada (superadmin sin country_id fijo y con ambos portales)
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
@@ -216,8 +270,19 @@ const createPrivilegedUser = async (req, res) => {
   }
 };
 
+/**
+ * Autentica un usuario por correo electrónico y contraseña, verificando que la cuenta
+ * esté activa (`is_active = TRUE`) y emitiendo un JWT de sesión válido por 8 horas junto
+ * con los metadatos de perfil, ubicación residencial y portales habilitados.
+ * POST /api/v1/auth/login
+ *
+ * @param {import('express').Request} req - Petición HTTP con `{ email, password }`.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ token, user }`.
+ * @returns {Promise<import('express').Response>}
+ */
 const login = async (req, res) => {
   try {
+    // 1. Asegurar esquema evolutivo y buscar al usuario por correo (insensible a mayúsculas)
     await ensureEvolutionSchema();
     const { email, password } = req.body;
 
@@ -230,6 +295,7 @@ const login = async (req, res) => {
 
     const user = result.rows[0];
 
+    // 2. Bloquear acceso a cuentas suspendidas/inactivas y validar hash bcrypt
     if (!user.is_active) {
       return res.status(403).json({ error: 'La cuenta se encuentra inactiva.' });
     }
@@ -239,6 +305,7 @@ const login = async (req, res) => {
       return res.status(401).json({ error: 'Credenciales inválidas.' });
     }
 
+    // 3. Construir payload mínimo y firmar token JWT de sesión (vigencia 8 horas)
     const tokenPayload = {
       userId: user.id,
       countryId: user.country_id,
@@ -248,6 +315,7 @@ const login = async (req, res) => {
 
     const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '8h' });
 
+    // 4. Retornar token y snapshot saneado del usuario (con valores por defecto de ubicación/portales)
     return res.status(200).json({
       message: 'Inicio de sesión exitoso.',
       token,
@@ -272,8 +340,19 @@ const login = async (req, res) => {
   }
 };
 
+/**
+ * Obtiene el listado completo de usuarios privilegiados (`superadmin`, `admin` y `security`)
+ * para administración desde Ops Master, enriquecido con el nombre de la comunidad (`country_name`)
+ * mediante `LEFT JOIN` (permanece `NULL` para cuentas globales `superadmin`).
+ * GET /api/v1/auth/privileged-users
+ *
+ * @param {import('express').Request} req - Petición HTTP autenticada de Superadmin.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ count, users }`.
+ * @returns {Promise<import('express').Response>}
+ */
 const getPrivilegedUsers = async (req, res) => {
   try {
+    // Consulta los roles operativos internos ordenados del más reciente al más antiguo
     const query = `
       SELECT u.id, u.first_name, u.last_name, u.email, u.dni, u.role, u.country_id,
              c.name AS country_name, u.is_active, u.created_at
@@ -294,8 +373,19 @@ const getPrivilegedUsers = async (req, res) => {
   }
 };
 
+/**
+ * Actualiza de forma parcial los datos, rol, comunidad asignada, estado activo o contraseña
+ * de una cuenta privilegiada existente (`superadmin`, `admin` o `security`).
+ * Si el rol pasa a ser `superadmin`, fuerza `country_id = NULL` (alcance global).
+ * PUT/PATCH /api/v1/auth/privileged-users/:id
+ *
+ * @param {import('express').Request} req - Petición HTTP con `:id` en params y campos opcionales en body.
+ * @param {import('express').Response} res - Respuesta HTTP con la cuenta actualizada.
+ * @returns {Promise<import('express').Response>}
+ */
 const updatePrivilegedUser = async (req, res) => {
   try {
+    // 1. Extraer identificador y validar el nuevo rol privilegiado si fue incluido en la petición
     const { id } = req.params;
     const { first_name, last_name, email, dni, password, role, country_id, is_active } = req.body;
 
@@ -303,6 +393,7 @@ const updatePrivilegedUser = async (req, res) => {
       return res.status(400).json({ error: 'Rol inválido (admin, superadmin o security).' });
     }
 
+    // 2. Resolver `country_id` según regla de negocio: superadmin siempre limpia comunidad a NULL
     const normalizedRole = role !== undefined ? String(role).toLowerCase() : null;
     const resolvedCountryId =
       normalizedRole === 'superadmin'
@@ -311,6 +402,7 @@ const updatePrivilegedUser = async (req, res) => {
         ? Number(country_id)
         : undefined;
 
+    // 3. Construir cláusulas SET dinámicas para campos opcionales (comunidad y nueva contraseña)
     let extraSet = '';
     const values = [first_name, last_name, email, dni, normalizedRole, is_active, id];
 
@@ -326,6 +418,7 @@ const updatePrivilegedUser = async (req, res) => {
       extraSet += `, password_hash = $${values.length}`;
     }
 
+    // 4. Actualizar usando COALESCE para conservar valores previos en campos no enviados, restringido a roles privilegiados
     const query = `
       UPDATE users
       SET first_name = COALESCE($1, first_name),
@@ -357,11 +450,17 @@ const updatePrivilegedUser = async (req, res) => {
 
 /**
  * Solicita recuperación de contraseña generando un token temporal (30 min) almacenado como hash SHA-256.
- * Nunca revela si el correo existe en la base (evita enumeración de cuentas).
+ * Nunca revela si el correo existe o está activo en la base de datos (mitiga enumeración de cuentas).
+ * Invalida tokens previos pendientes del mismo usuario antes de emitir el nuevo.
  * POST /api/v1/auth/forgot-password
+ *
+ * @param {import('express').Request} req - Petición HTTP con `{ email }`.
+ * @param {import('express').Response} res - Respuesta HTTP genérica (incluye `dev_reset_token` fuera de producción).
+ * @returns {Promise<import('express').Response>}
  */
 const forgotPassword = async (req, res) => {
   try {
+    // 1. Garantizar existencia de tabla y normalizar correo recibido
     await ensurePasswordResetTable();
     const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
 
@@ -374,6 +473,7 @@ const forgotPassword = async (req, res) => {
         'Si el correo corresponde a una cuenta activa, se generó un código de recuperación válido por 30 minutos.',
     };
 
+    // 2. Buscar cuenta activa; si no existe o está inactiva, responder igual que un caso válido (anti-enumeración)
     const userRes = await db.query(
       'SELECT id, email, is_active FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1',
       [cleanEmail]
@@ -383,10 +483,12 @@ const forgotPassword = async (req, res) => {
       return res.status(200).json(genericResponse);
     }
 
+    // 3. Generar token criptográfico aleatorio (48 caracteres hex) y derivar su hash SHA-256 para almacenamiento seguro
     const userId = userRes.rows[0].id;
     const rawToken = crypto.randomBytes(24).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
 
+    // 4. Invalidar tokens previos sin usar del mismo usuario y registrar el nuevo con vencimiento de 30 minutos
     await db.query(
       'UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL',
       [userId]
@@ -398,6 +500,7 @@ const forgotPassword = async (req, res) => {
       [userId, tokenHash]
     );
 
+    // 5. En entornos de desarrollo/pruebas se devuelve el token plano para facilitar validación local
     if (process.env.NODE_ENV !== 'production') {
       return res.status(200).json({
         ...genericResponse,
@@ -413,11 +516,18 @@ const forgotPassword = async (req, res) => {
 };
 
 /**
- * Restablece la contraseña validando un token temporal vigente y no consumido.
+ * Restablece la contraseña de un usuario validando un token temporal vigente y no consumido.
+ * Calcula el hash SHA-256 del token recibido para localizarlo, actualiza `users.password_hash`
+ * con bcrypt y marca el token como utilizado (`used_at = NOW()`) para evitar reutilización.
  * POST /api/v1/auth/reset-password
+ *
+ * @param {import('express').Request} req - Petición HTTP con `{ token, new_password }`.
+ * @param {import('express').Response} res - Respuesta HTTP confirmando el cambio de contraseña.
+ * @returns {Promise<import('express').Response>}
  */
 const resetPassword = async (req, res) => {
   try {
+    // 1. Asegurar tabla de tokens y validar presencia del código y longitud mínima de la nueva clave
     await ensurePasswordResetTable();
     const rawToken = String(req.body?.token || '').trim();
     const newPassword = String(req.body?.new_password || '');
@@ -428,6 +538,7 @@ const resetPassword = async (req, res) => {
       });
     }
 
+    // 2. Buscar el registro por hash SHA-256 y verificar vigencia temporal y que no haya sido consumido
     const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
     const tokenRes = await db.query(
       `SELECT id, user_id, expires_at, used_at
@@ -446,6 +557,7 @@ const resetPassword = async (req, res) => {
       return res.status(400).json({ error: 'El código de recuperación ya fue utilizado o expiró.' });
     }
 
+    // 3. Cifrar la nueva contraseña, actualizar `users` y marcar el token como consumido
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(newPassword, salt);
 

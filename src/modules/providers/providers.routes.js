@@ -1,8 +1,9 @@
 /**
  * @file providers.routes.js
- * @description Enrutador completo para perfiles de prestadores, compliance, flota vehicular,
- * directorio unificado para residentes, auditoría centralizada en Ops TrustLink
- * y reportes/suspensiones operativas locales por comunidad (admin / superadmin).
+ * @description Enrutador montado en `/api/v1/providers` para la gestión integral de prestadores:
+ * autogestión de especialidades, documentación de compliance, flota vehicular y cuadrilla;
+ * auditoría centralizada en Ops TrustLink; directorio verificado para residentes; y control
+ * operativo local por comunidad (suspensiones locales y alertas de vencimientos documentales).
  * @location /trustlink-backend/src/modules/providers/providers.routes.js
  */
 
@@ -30,37 +31,46 @@ const { verifyToken, verifyRole, verifyRoleOrPortal } = require('../../middlewar
 
 const router = Router();
 
-// Obtener credenciales/perfiles y flota vehicular del prestador autenticado
+// ============================================================================
+// 1. AUTOGESTIÓN DEL PORTAL PRESTADOR (Perfil, Compliance, Flota y Cuadrilla)
+// ============================================================================
+// Obtener credenciales/perfiles, especialidades, documentos y flota vehicular del prestador autenticado
 router.get('/me', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), getMyProviderProfile);
 
-// Registrar una nueva especialidad y documentación de compliance
+// Registrar una nueva especialidad y subir documentación inicial de compliance (antecedentes/ART)
 router.post('/profile', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), updateProviderProfile);
 
-// Editar una credencial de compliance existente por ID
+// Editar una credencial/especialidad de compliance existente por ID (actualiza fechas/certificados)
 router.patch('/profile/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), editProviderProfile);
 
-// Mostrar u ocultar una especialidad en el directorio sin afectar el compliance aprobado
+// Mostrar u ocultar una especialidad en el directorio sin afectar el estado de compliance aprobado
 router.patch('/profile/:id/visibility', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), toggleSpecialtyVisibility);
 
-// Asociar un nuevo vehículo a la flota del prestador
+// Asociar un nuevo vehículo (con patente y póliza de seguro) a la flota del prestador
 router.post('/vehicle', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), addVehicle);
 
-// Editar un vehículo existente por ID
+// Editar datos o renovar seguro de un vehículo existente por ID
 router.patch('/vehicle/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), editVehicle);
 
-// Gestión de ayudantes / cuadrilla del prestador
+// CRUD de ayudantes / cuadrilla vinculados al prestador (con control individual de póliza ART)
 router.get('/employees', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), listProviderEmployees);
 router.post('/employees', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), addProviderEmployee);
 router.patch('/employees/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), updateProviderEmployee);
 router.delete('/employees/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), deleteProviderEmployee);
 
-// Listar todos los prestadores registrados para auditoría centralizada en Ops TrustLink
+// ============================================================================
+// 2. AUDITORÍA CENTRALIZADA DE COMPLIANCE — OPS TRUSTLINK (Exclusivo Superadmin)
+// ============================================================================
+// Listar todos los prestadores registrados con su documentación y estados de validación
 router.get('/all', verifyToken, verifyRole(['superadmin']), listAllProvidersForOps);
 
-// Aprobar, rechazar o dejar pendiente el estado de compliance global de un prestador
+// Aprobar, rechazar o pasar a pendiente el estado de compliance global de un prestador
 router.patch('/compliance', verifyToken, verifyRole(['superadmin']), updateComplianceStatus);
 
-// Directorio unificado de prestadores verificados para residentes y roles autorizados
+// ============================================================================
+// 3. DIRECTORIO UNIFICADO DE PRESTADORES VERIFICADOS (Portal Residente / Admin)
+// ============================================================================
+// Devuelve prestadores aprobados, visibles y sin suspensión activa en la comunidad del solicitante
 router.get(
   '/directory',
   verifyToken,
@@ -68,7 +78,10 @@ router.get(
   listVerifiedProviders
 );
 
-// Reportes y suspensiones operativas locales por comunidad (Roles: admin, superadmin)
+// ============================================================================
+// 4. CONTROL OPERATIVO LOCAL POR COMUNIDAD (Roles: admin, superadmin)
+// ============================================================================
+// Listar reportes y suspensiones locales de prestadores dentro de la comunidad
 router.get(
   '/local-suspensions',
   verifyToken,
@@ -76,6 +89,7 @@ router.get(
   listLocalSuspensions
 );
 
+// Crear una suspensión operativa local (bloquea emisión/validación de QR solo en esa comunidad)
 router.post(
   '/local-suspensions',
   verifyToken,
@@ -83,6 +97,7 @@ router.post(
   createLocalSuspension
 );
 
+// Levantar una suspensión local activa registrando fecha de rehabilitación (`lifted_at`)
 router.patch(
   '/local-suspensions/:id/lift',
   verifyToken,
@@ -90,7 +105,7 @@ router.patch(
   liftLocalSuspension
 );
 
-// Alertas proactivas de vencimiento documental (ART, antecedentes, seguro vehicular y cuadrilla)
+// Alertas proactivas de documentación vencida o próxima a vencer (ART, antecedentes, vehículos y cuadrilla)
 router.get(
   '/expiry-alerts',
   verifyToken,

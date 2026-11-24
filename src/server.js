@@ -1,7 +1,8 @@
 /**
  * @file server.js
  * @description Punto de entrada principal del backend de TrustLink. Configura Express,
- * CORS adaptable (local y externo), middlewares globales y enrutamiento modular.
+ * cabeceras defensivas, política CORS adaptable (local y externo), parseo JSON con captura
+ * de rawBody para webhooks, enrutamiento modular v1 y verificación evolutiva de esquema al arranque.
  * @location /trustlink-backend/src/server.js
  */
 
@@ -9,6 +10,7 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 
+// Importación de enrutadores por dominio de negocio
 const authRoutes = require('./modules/auth/auth.routes');
 const passesRoutes = require('./modules/passes/passes.routes');
 const providersRoutes = require('./modules/providers/providers.routes');
@@ -22,10 +24,11 @@ const billingRoutes = require('./modules/billing/billing.routes');
 const { ensureEvolutionSchema } = require('./config/ensureEvolutionSchema');
 const { securityHeaders } = require('./middlewares/security.middleware');
 
+// Inicialización de la instancia Express y endurecimiento básico de cabeceras/proxy
 const app = express();
 const PORT = process.env.PORT || 4000;
-app.disable('x-powered-by');
-app.set('trust proxy', 1);
+app.disable('x-powered-by'); // Oculta la firma tecnológica de Express en respuestas HTTP
+app.set('trust proxy', 1); // Respeta X-Forwarded-For / X-Forwarded-Proto detrás de proxies (Render, Nginx)
 
 // CONFIGURACIÓN DE CORS (LOCAL + EXTERNO)
 // Si se define CORS_ORIGINS (ej: "https://tu-app.vercel.app,http://localhost:5173"),
@@ -36,6 +39,11 @@ const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .filter(Boolean);
 
 const corsOptions = {
+  /**
+   * Valida el encabezado Origin de cada solicitud entrante contra la lista blanca configurada.
+   * @param {string|undefined} origin
+   * @param {(err: Error|null, allow?: boolean) => void} callback
+   */
   origin: (origin, callback) => {
     // Peticiones sin cabecera Origin (curl, Postman, healthchecks internos)
     if (!origin || allowedOrigins.length === 0) {
@@ -50,6 +58,8 @@ const corsOptions = {
 };
 
 // MIDDLEWARES GLOBALES
+// 1) Cabeceras defensivas HTTP, 2) CORS, 3) Parseo JSON de hasta 10 MB (soporta adjuntos base64)
+//    preservando `req.rawBody` para validación de firmas en webhooks externos (ej. Mercado Pago).
 app.use(securityHeaders);
 app.use(cors(corsOptions));
 app.use(
@@ -62,18 +72,19 @@ app.use(
 );
 
 // RUTAS MODULARES DE LA API (v1)
-app.use('/api/v1/auth', authRoutes);
-app.use('/api/v1/passes', passesRoutes);
-app.use('/api/v1/providers', providersRoutes);
-app.use('/api/v1/payments', paymentsRoutes);
-app.use('/api/v1/contracts', contractsRoutes);
-app.use('/api/v1/external', externalRoutes);
-app.use('/api/v1/reviews', reviewsRoutes);
-app.use('/api/v1/branding', brandingRoutes);
-app.use('/api/v1/account', accountRoutes);
-app.use('/api/v1/billing', billingRoutes);
+app.use('/api/v1/auth', authRoutes);           // Autenticación, registro, reset y usuarios privilegiados
+app.use('/api/v1/passes', passesRoutes);       // Agenda del prestador, visitas y pases QR
+app.use('/api/v1/providers', providersRoutes); // Perfiles, compliance, flota, cuadrilla y directorio
+app.use('/api/v1/payments', paymentsRoutes);   // Configuración de pasarela, checkout y webhooks
+app.use('/api/v1/contracts', contractsRoutes); // Ciclo de vida de contratos, recibos y disputas
+app.use('/api/v1/external', externalRoutes);   // API externa de garitas, comunidades, API keys y auditoría
+app.use('/api/v1/reviews', reviewsRoutes);     // Reseñas cruzadas Residente <-> Prestador
+app.use('/api/v1/branding', brandingRoutes);   // Configuración visual white-label
+app.use('/api/v1/account', accountRoutes);     // Mi Cuenta, perfil, portal principal y contraseña
+app.use('/api/v1/billing', billingRoutes);     // Membresías "Socio Verificado" de prestadores
 
 // ENDPOINT DE SALUD DEL SERVIDOR
+// Utilizado por monitores externos y verificaciones de despliegue (Render / CI).
 app.get('/health', (req, res) => {
   const runtimeEnv =
     process.env.RENDER || process.env.NODE_ENV === 'production' ? 'external' : 'local';
@@ -88,6 +99,7 @@ app.get('/health', (req, res) => {
 });
 
 // INICIO DEL SERVIDOR
+// Levanta el listener HTTP y ejecuta en segundo plano la verificación idempotente del esquema evolutivo.
 app.listen(PORT, () => {
   console.log(`🚀 Servidor modular de TrustLink corriendo en el puerto ${PORT}`);
   ensureEvolutionSchema().catch((err) => {

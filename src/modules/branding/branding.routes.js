@@ -1,7 +1,8 @@
 /**
  * @file branding.routes.js
- * @description Enrutador modular para consulta y actualización (exclusivo superadmin)
- * de la configuración de apariencia de TrustLink.
+ * @description Enrutador montado en `/api/v1/branding` para la consulta pública y la
+ * actualización protegida (exclusivo Superadmin) de la apariencia white-label de TrustLink
+ * (nombre, subtítulo, paleta cromática, logo y modo oscuro/claro).
  * @location /trustlink-backend/src/modules/branding/branding.routes.js
  */
 
@@ -11,10 +12,10 @@ const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware')
 
 const router = Router();
 
-// Consulta pública de apariencia activa al cargar la plataforma
+// Consulta pública sin autenticación para aplicar identidad visual desde la pantalla de login
 router.get('/', getBranding);
 
-// Actualización protegida para el rol superadmin
+// Actualización de la paleta, textos institucionales y logo (Exclusivo Superadmin)
 router.put('/', verifyToken, verifyRole(['superadmin']), updateBranding);
 
 module.exports = router;

@@ -1,8 +1,11 @@
 /**
  * @file e2e.test.js
  * @description Suite automatizada de pruebas de integración end-to-end para TrustLink Backend
- * usando el runner nativo `node:test`. Levanta una instancia aislada en puerto temporal,
- * valida todos los flujos críticos y limpia los registros temporales al finalizar.
+ * usando el runner nativo `node:test`. Levanta una instancia aislada del servidor en un puerto
+ * temporal, recorre de forma secuencial todos los flujos críticos del negocio (auth, compliance,
+ * flota, visitas, pases QR y garita interna/externa, contratos, pagos 7%/93%, webhooks HMAC y MP,
+ * identidad dual, cuadrillas, vencimientos documentales, membresías, licenciamiento B2B, escrow,
+ * reclamos/garantía y visibilidad por especialidad) y limpia los registros temporales al finalizar.
  * @location /trustlink-backend/test/e2e.test.js
  */
 
@@ -18,12 +21,32 @@ require('dotenv').config({ path: path.join(ROOT_DIR, '.env') });
 const jwt = require('jsonwebtoken');
 const db = require('../src/config/db');
 
+// Configuración aislada para el servidor temporal y el secreto de firma de webhooks en pruebas
 const PORT = Number(process.env.TEST_PORT || 4197);
 const BASE = `http://127.0.0.1:${PORT}`;
 const WEBHOOK_SECRET = 'tlk_e2e_webhook_secret';
 
+/**
+ * Pausa la ejecución asíncrona durante un intervalo en milisegundos.
+ * Se utiliza para espaciar los reintentos de polling contra `/health` durante el arranque del servidor.
+ *
+ * @param {number} ms - Duración de la espera en milisegundos.
+ * @returns {Promise<void>} Promesa que resuelve al cumplirse el tiempo indicado.
+ */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Cliente HTTP liviano para invocar endpoints de la instancia E2E del backend.
+ * Serializa automáticamente cuerpos objeto a JSON (respetando cadenas crudas cuando se firma HMAC),
+ * adjunta autenticación Bearer opcional y parsea la respuesta JSON tolerando cuerpos vacíos.
+ *
+ * @param {string} method - Verbo HTTP (`GET`, `POST`, `PATCH`, `DELETE`, etc.).
+ * @param {string} urlPath - Ruta relativa al servidor base (por ejemplo `/api/v1/auth/login`).
+ * @param {object|string|undefined} [body] - Payload a enviar; si es string se transmite sin re-serializar.
+ * @param {string|null} [token] - Token JWT para cabecera `Authorization: Bearer <token>`.
+ * @param {Record<string, string>} [extraHeaders={}] - Cabeceras adicionales (firmas webhook, API keys, etc.).
+ * @returns {Promise<{status: number, ok: boolean, data: any}>} Estado HTTP, bandera `ok` y JSON parseado.
+ */
 async function req(method, urlPath, body, token, extraHeaders = {}) {
   const rawBody =
     body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined;
@@ -40,7 +63,10 @@ async function req(method, urlPath, body, token, extraHeaders = {}) {
   return { status: res.status, ok: res.ok, data };
 }
 
+// Suite secuencial de extremo a extremo: cada caso reutiliza tokens, usuarios y entidades
+// construidas en fases previas para validar el ciclo de vida completo de la plataforma.
 describe('TrustLink Backend — E2E Core Suite', () => {
+  // Estado compartido a lo largo de la corrida E2E y lista de IDs a depurar en `after`
   let serverProc;
   let countryId;
   let createdCountryId = null;
@@ -59,8 +85,11 @@ describe('TrustLink Backend — E2E Core Suite', () => {
   let pass2Qr;
   let contractId;
 
+  // Marca de tiempo única por corrida para generar emails, DNIs y patentes sin colisiones
   const ts = Date.now();
 
+  // Hook de inicialización: levanta `src/server.js` en un puerto aislado con secreto de webhook propio,
+  // espera a que `/health` responda ONLINE, obtiene/crea una comunidad base y firma un JWT superadmin.
   before(async () => {
     serverProc = spawn(process.execPath, ['src/server.js'], {
       cwd: ROOT_DIR,
@@ -68,6 +97,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
       stdio: 'ignore',
     });
 
+    // Polling de disponibilidad del servidor hasta 30 intentos (máximo ~7.5s)
     let healthy = false;
     for (let i = 0; i < 30; i++) {
       try {
@@ -81,6 +111,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     }
     assert.equal(healthy, true, 'El servidor backend no respondió en /health');
 
+    // Reutiliza una comunidad existente para no alterar datos reales o siembra una temporal si la DB está vacía
     const existingCountry = await db.query('SELECT id FROM countries ORDER BY id ASC LIMIT 1');
     if (existingCountry.rows.length > 0) {
       countryId = existingCountry.rows[0].id;
@@ -92,6 +123,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
       createdCountryId = countryId;
     }
 
+    // Token administrativo sintético utilizado para operaciones de backoffice/superadmin en los tests
     superToken = jwt.sign(
       { userId: 1, countryId, role: 'superadmin', email: 'e2e-super@trustlink.local' },
       process.env.JWT_SECRET,
@@ -99,6 +131,9 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     );
   });
 
+  // Hook de cierre: elimina todos los registros temporales creados durante la suite (logs de garita,
+  // solicitudes de visita, bloqueos de agenda, usuarios y comunidad temporal si correspondió),
+  // detiene el proceso hijo del servidor y cierra el pool de conexiones PostgreSQL.
   after(async () => {
     try {
       if (createdUserIds.length > 0) {
@@ -128,6 +163,13 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     }
   });
 
+  // =========================================================================
+  // FASE 1: Endpoints públicos, control de roles y registro de actores base
+  // =========================================================================
+
+  // Escenario: disponibilidad del servicio y consulta pública del catálogo de barrios para onboarding.
+  // Precondiciones: servidor levantado con al menos una comunidad registrada en DB.
+  // Resultado esperado: `/health` responde 200 `ONLINE` y `/auth/countries` devuelve lista no vacía.
   it('expone /health y catálogo público de comunidades en GET /api/v1/auth/countries', async () => {
     const h = await req('GET', '/health');
     assert.equal(h.status, 200);
@@ -139,7 +181,12 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.ok(c.data.countries.length >= 1);
   });
 
+  // Escenario: prevención de escalación de privilegios en registro abierto y alta controlada de guardia.
+  // Precondiciones: token `superToken` vigente para invocar el endpoint protegido `/auth/users/privileged`.
+  // Resultado esperado: rechaza con 403 el registro público de `superadmin`, `admin` y `security`;
+  // permite crear el usuario `security` autenticado como superadmin y obtener su `secToken` por login.
   it('bloquea registro público de roles privilegiados y permite alta protegida de security', async () => {
+    // 1. Verificar que ningún rol privilegiado puede auto-registrarse en /register
     for (const forbiddenRole of ['superadmin', 'admin', 'security']) {
       const r = await req('POST', '/api/v1/auth/register', {
         role: forbiddenRole,
@@ -152,6 +199,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
       assert.equal(r.status, 403, `Rol ${forbiddenRole} debería devolver 403 en /register`);
     }
 
+    // 2. Dar de alta usuario de garita (security) mediante endpoint privilegiado y autenticarlo
     const secEmail = `e2e.sec.${ts}@test.local`;
     const createdSec = await req(
       'POST',
@@ -179,7 +227,13 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     secToken = loginSec.data.token;
   });
 
+  // Escenario: alta pública de residente (`owner`) y prestador (`provider`) e inicio de sesión.
+  // Precondiciones: `countryId` existente y credenciales únicas basadas en `ts`.
+  // Resultado esperado: crea ambos usuarios, devuelve ubicación normalizada (`fraction_type`,
+  // `fraction_number`, `lot_number`) en el login del residente y guarda `ownerToken`, `provToken`
+  // y `superRealToken` (respaldado por un `userId` real en DB para claves foráneas de auditoría).
   it('registra owner y provider con ubicación normalizada y devuelve perfil enriquecido en login', async () => {
+    // 1. Registro y login del residente con fracción/manzana y lote normalizados
     const ownerEmail = `e2e.owner.${ts}@test.local`;
     const regOwner = await req('POST', '/api/v1/auth/register', {
       country_id: countryId,
@@ -207,12 +261,14 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(loginOwner.data.user.lot_number, '18');
     ownerToken = loginOwner.data.token;
 
+    // Token superadmin vinculado a un userId existente en DB (requerido por FKs como created_by en suspensiones)
     superRealToken = jwt.sign(
       { userId: ownerUserId, countryId, role: 'superadmin', email: ownerEmail },
       process.env.JWT_SECRET,
       { expiresIn: '1h' }
     );
 
+    // 2. Registro y login del prestador de servicios
     const provEmail = `e2e.prov.${ts}@test.local`;
     const regProv = await req('POST', '/api/v1/auth/register', {
       country_id: countryId,
@@ -234,7 +290,16 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     provToken = loginProv.data.token;
   });
 
+  // =========================================================================
+  // FASE 2: Onboarding documental del prestador, flota vehicular y compliance
+  // =========================================================================
+
+  // Escenario: carga y edición de legajo profesional/flota del prestador y aprobación administrativa.
+  // Precondiciones: prestador autenticado (`provToken`) y superadmin (`superToken`).
+  // Resultado esperado: crea y actualiza perfil documental y vehículo con póliza vigente, y transiciona
+  // el compliance del prestador a `'approved'` habilitándolo para recibir visitas y pases QR.
   it('gestiona perfil documental (POST/PATCH), flota con seguro (POST/PATCH) y aprobación compliance', async () => {
+    // 1. Alta y actualización de perfil de especialidad y documentos (antecedentes + ART)
     const prof = await req(
       'POST',
       '/api/v1/providers/profile',
@@ -256,6 +321,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     );
     assert.equal(patchProf.status, 200);
 
+    // 2. Alta y edición de vehículo de flota con póliza de seguro y vigencia
     const plate = `E2${String(ts).slice(-5)}`;
     const veh = await req(
       'POST',
@@ -284,6 +350,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(editVeh.status, 200);
     assert.equal(editVeh.data.vehicle.color, 'Gris');
 
+    // 3. Aprobación de compliance por backoffice para habilitar operación en comunidad
     const approve = await req(
       'PATCH',
       '/api/v1/providers/compliance',
@@ -293,7 +360,19 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(approve.status, 200);
   });
 
+  // =========================================================================
+  // FASE 3: Coordinación de visitas, Pases QR y seguridad en garita interna/externa
+  // =========================================================================
+
+  // Escenario: flujo completo de visita -> pase QR editable -> validación de un solo uso en garita
+  // interna y bloqueo/levantamiento por suspensión local de comunidad en garita externa.
+  // Precondiciones: prestador aprobado (`providerId`), residente (`ownerToken`), guardia (`secToken`)
+  // y administrador (`superRealToken`).
+  // Resultado esperado: confirma visita, emite y edita pase 1, lo consume en garita interna rechazando
+  // reescaneo (`PASS_ALREADY_USED`), bloquea pase 2 ante suspensión local (`LOCAL_SUSPENSION_ACTIVE`)
+  // y tras levantar la suspensión autoriza una única vez en `/external/passes/verify`.
   it('coordina visitas, emite/edita pases QR y aplica ingreso único + suspensión local en ambas garitas', async () => {
+    // 1. Solicitud de visita del residente y confirmación por parte del prestador
     const visit = await req(
       'POST',
       '/api/v1/passes/visit-requests',
@@ -316,6 +395,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     );
     assert.equal(respond.status, 200);
 
+    // 2. Emisión de Pase QR #1 y actualización de patente previa al ingreso
     const p1 = await req(
       'POST',
       '/api/v1/passes/create',
@@ -342,6 +422,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(editPass.status, 200);
     assert.equal(editPass.data.pass.vehicle_plate, 'ZZ999ZZ');
 
+    // 3. Regla de ingreso único en Garita Interna: primer escaneo marca 'used', segundo bloquea (403)
     const scan1 = await req('POST', '/api/v1/passes/verify', { qr_token: pass1Qr }, secToken);
     assert.equal(scan1.status, 200);
     assert.equal(scan1.data.details.status, 'used');
@@ -350,6 +431,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(rescan1.status, 403);
     assert.equal(rescan1.data.code, 'PASS_ALREADY_USED');
 
+    // 4. Emisión de Pase QR #2 y prueba de suspensión local en el barrio + levantamiento en API Externa
     const p2 = await req(
       'POST',
       '/api/v1/passes/create',
@@ -372,6 +454,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     );
     assert.equal(susp.status, 201);
 
+    // Con suspensión local activa, la garita externa debe denegar con LOCAL_SUSPENSION_ACTIVE
     const extBlocked = await req(
       'POST',
       '/api/v1/external/passes/verify',
@@ -381,6 +464,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(extBlocked.status, 403);
     assert.equal(extBlocked.data.code, 'LOCAL_SUSPENSION_ACTIVE');
 
+    // Al levantar la suspensión, el pase se autoriza una sola vez y un reintento devuelve PASS_ALREADY_USED
     const lift = await req(
       'PATCH',
       `/api/v1/providers/local-suspensions/${susp.data.suspension.id}/lift`,
@@ -408,7 +492,17 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(extReplay.data.code, 'PASS_ALREADY_USED');
   });
 
+  // =========================================================================
+  // FASE 4: Contratos, pagos 7%/93%, seguridad de webhook HMAC y reseñas cruzadas
+  // =========================================================================
+
+  // Escenario: creación de contrato vinculado a pase, cotización con split 7%/93%, verificación
+  // de firma HMAC-SHA256 en webhook de pagos y calificaciones cruzadas (residente <-> prestador).
+  // Precondiciones: `providerId`, `pass1Id` y secreto `WEBHOOK_SECRET` configurado en el servidor E2E.
+  // Resultado esperado: rechaza webhook sin firma (401), aprueba pago con firma válida (`hmac_sha256`)
+  // y permite registrar ambas reseñas cruzadas (201).
   it('procesa contratos, checkout 7%/93%, webhook HMAC y reseñas cruzadas bidireccionales', async () => {
+    // 1. Alta de contrato de servicio y generación de cotización/transacción pendiente
     const c = await req(
       'POST',
       '/api/v1/contracts',
@@ -427,6 +521,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(q.status, 201);
     const gwId = q.data.transaction.gateway_payment_id;
 
+    // 2. Seguridad del webhook: rechazo 401 sin firma y aprobación 200 con firma HMAC-SHA256 válida
     const whNoSig = await req('POST', '/api/v1/payments/webhook', {
       gateway_payment_id: gwId,
       status: 'approved',
@@ -441,6 +536,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(whOk.status, 200);
     assert.equal(whOk.data.verification_mode, 'hmac_sha256');
 
+    // 3. Reputación bidireccional: residente califica al prestador y prestador califica al residente
     const revProv = await req(
       'POST',
       '/api/v1/reviews/provider',
@@ -458,11 +554,22 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(revOwner.status, 201);
   });
 
+  // =========================================================================
+  // FASE 5: Identidad dual bidireccional (Residente + Prestador) y Mi Cuenta
+  // =========================================================================
+
+  // Escenario: un residente habilita también el portal prestador (y viceversa), configurando
+  // portal principal y accediendo a los endpoints protegidos del segundo rol sin duplicar cuenta.
+  // Precondiciones: cuentas `ownerToken` y `provToken` ya creadas.
+  // Resultado esperado: ambos usuarios activan identidad dual, `owner` accede a `/providers/me`
+  // y `provider` accede al directorio de residentes y a `/reviews/contracts?portal=resident`.
   it('habilita identidad dual bidireccional y portal principal desde /api/v1/account', async () => {
+    // 1. Consulta del perfil unificado de cuenta del residente
     const me = await req('GET', '/api/v1/account/me', undefined, ownerToken);
     assert.equal(me.status, 200);
     assert.equal(Array.isArray(me.data.countries), true);
 
+    // 2. Residente activa portal prestador, lo define como principal y consulta /providers/me
     const enableProv = await req(
       'PATCH',
       '/api/v1/account/profile',
@@ -490,6 +597,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     const dualProv = await req('GET', '/api/v1/providers/me', undefined, ownerToken);
     assert.equal(dualProv.status, 200);
 
+    // 3. Prestador activa portal residente y consume directorio y contratos en vista residente
     const enableRes = await req(
       'PATCH',
       '/api/v1/account/profile',
@@ -512,13 +620,23 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(dualRev.data.portal, 'resident');
   });
 
+  // =========================================================================
+  // FASE 6: Hardening HTTP, recuperación de contraseña y gestión de cuadrilla
+  // =========================================================================
+
+  // Escenario: validación de cabeceras de seguridad HTTP, flujo completo de reseteo de clave
+  // con token de un solo uso y ciclo CRUD de empleados/ayudantes del prestador.
+  // Precondiciones: cuenta residente (`ownerEmail`) y prestador (`provToken`) registrados.
+  // Resultado esperado: cabeceras `nosniff`, `DENY` y sin `x-powered-by`; reseteo exitoso de contraseña
+  // rechazando reutilización del token (400); alta, listado, edición y baja de ayudante.
   it('envía cabeceras defensivas, permite recuperación de contraseña y CRUD de ayudantes/cuadrilla', async () => {
+    // 1. Verificar cabeceras defensivas y ocultamiento de firma del servidor Express
     const healthRes = await fetch(`${BASE}/health`);
     assert.equal(healthRes.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(healthRes.headers.get('x-frame-options'), 'DENY');
     assert.equal(healthRes.headers.get('x-powered-by'), null);
 
-    // Flujo forgot-password -> reset-password -> login con nueva contraseña
+    // 2. Flujo forgot-password -> reset-password -> login con nueva contraseña
     const ownerEmail = `e2e.owner.${ts}@test.local`;
     const forgot = await req('POST', '/api/v1/auth/forgot-password', { email: ownerEmail });
     assert.equal(forgot.status, 200);
@@ -543,7 +661,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     });
     assert.equal(reuseReset.status, 400);
 
-    // CRUD de ayudantes / cuadrilla del prestador
+    // 3. CRUD de ayudantes / cuadrilla del prestador
     const addEmp = await req(
       'POST',
       '/api/v1/providers/employees',
@@ -577,6 +695,11 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(delEmp.status, 200);
   });
 
+  // Escenario: integración de ayudantes de cuadrilla con alertas de vencimiento próximo, directorio
+  // de residentes, emisión de Pase QR con `employee_ids` y lectura en Consola Garita.
+  // Precondiciones: ayudante con ART por vencer en 10 días creado bajo el prestador aprobado.
+  // Resultado esperado: alerta `expiring_soon` visible para prestador y admin, cuadrilla expuesta
+  // en directorio y propagada hasta la respuesta de autorización en `/passes/verify`.
   it('adjunta ayudantes de cuadrilla al Pase QR, los expone en garita y calcula alertas de vencimiento', async () => {
     const soonDate = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     const addEmp = await req(
@@ -664,6 +787,12 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     await req('DELETE', `/api/v1/providers/employees/${crewEmpId}`, undefined, provToken);
   });
 
+  // Escenario: desactivación reversible del portal prestador para operar como "Solo Residente"
+  // y cambio autenticado de contraseña desde Mi Cuenta.
+  // Precondiciones: prestador con portal residente ya habilitado en la fase de identidad dual.
+  // Resultado esperado: bloquea dejar ambos portales desactivados (400), revoca acceso inmediato
+  // a `/providers/me` (403) y oculta al prestador del directorio; al reactivar recupera su estado
+  // y valida el cambio de contraseña con verificación de clave actual.
   it('permite a un prestador pasar a Solo Residente (ocultándose del directorio y bloqueando API prestador) y volver a activarse', async () => {
     // 1. El prestador (que ya activó Residente en test anterior con Lote 45) desactiva Portal Prestador
     const toOnlyResident = await req(
@@ -762,6 +891,15 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(okPwd.status, 200);
   });
 
+  // =========================================================================
+  // FASE 7 (Roadmap 1.1 - 4 y Evolutivas): Vencimientos, Monetización, B2B, MP y Post-Servicio
+  // =========================================================================
+
+  // Escenario: bloqueo automático por documentación vencida tanto al emitir pases QR como al escanear
+  // en garita interna y API externa (ART del prestador, antecedentes penales y ART de cuadrilla).
+  // Precondiciones: manipulación controlada de fechas de vencimiento en DB para simular expiración.
+  // Resultado esperado: códigos 403 `INSURANCE_EXPIRED`, `CRIMINAL_RECORD_EXPIRED` (en ambas garitas)
+  // y `CREW_INSURANCE_EXPIRED` al adjuntar un ayudante vencido, restaurando el estado al finalizar.
   it('bloquea emisión y validación QR ante ART/antecedentes/cuadrilla vencidos (Fase 1.1)', async () => {
     const pastDate = '2020-01-15';
     const futureDate = '2028-06-01';
@@ -869,6 +1007,10 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     await req('DELETE', `/api/v1/providers/employees/${expEmpId}`, undefined, provToken);
   });
 
+  // Escenario: ciclo de vida completo de la membresía "Socio Verificado" del prestador.
+  // Precondiciones: prestador aprobado sin membresía activa inicialmente.
+  // Resultado esperado: auto-suscripción a `verified_monthly`, visibilidad prioritaria en directorio
+  // y `/providers/me`, revocación manual y reactivación por 60 días (`verified_pro`) desde Superadmin.
   it('gestiona membresía Socio Verificado (alta, directorio prioritario y control Superadmin) (Fase 1.2)', async () => {
     // 1. Consulta inicial de membresía propia
     const initialBilling = await req('GET', '/api/v1/billing/provider/me', undefined, provToken);
@@ -934,6 +1076,11 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(opsRow.membership_tier, 'verified_pro');
   });
 
+  // Escenario: gobierno del licenciamiento B2B por comunidad y enforcement en la API externa de garita.
+  // Precondiciones: respaldo del estado de billing actual del barrio y creación de una API Key temporal.
+  // Resultado esperado: configura plan `pro` con cuota, bloquea con 403 `COUNTRY_SUBSCRIPTION_SUSPENDED`
+  // y `COUNTRY_SUBSCRIPTION_EXPIRED`, permite continuar en estado `grace` hasta `PASS_NOT_FOUND` (404)
+  // y restaura el estado original de la comunidad en el bloque `finally`.
   it('gestiona licenciamiento B2B por comunidad y bloquea API externa si está suspendida o vencida (Fase 2)', async () => {
     const prevBillingRes = await db.query(
       'SELECT plan_code, billing_status, subscription_ends_at, monthly_pass_quota FROM countries WHERE id = $1 LIMIT 1',
@@ -1083,6 +1230,11 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     }
   });
 
+  // Escenario: exposición de configuración de pasarela y validación de webhook con el formato oficial
+  // `x-signature` (`ts=<unix>,v1=<hmac>`) y `x-request-id` de Mercado Pago.
+  // Precondiciones: servidor E2E en modo `mock` con comisión 7% y contrato con cotización pendiente.
+  // Resultado esperado: `/payments/config` informa `mock` y `7%`; el webhook autentica la firma
+  // reportando `verification_mode: 'mp_x_signature'` y limpia el contrato temporal.
   it('expone configuración de pasarela en /payments/config y valida firma oficial x-signature de Mercado Pago (Fase 3)', async () => {
     const cfgRes = await req('GET', '/api/v1/payments/config', undefined, ownerToken);
     assert.equal(cfgRes.status, 200);
@@ -1134,6 +1286,11 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     await db.query('DELETE FROM service_contracts WHERE id = $1', [mpContractId]);
   });
 
+  // Escenario: ciclo post-pago completo — conformidad final con liberación escrow, emisión del
+  // Comprobante del Hogar (`TLK-REC-*`) y circuito de reclamos/garantía con resolución administrativa.
+  // Precondiciones: contrato nuevo pagado en modo mock (`in_progress` + transacción `approved`).
+  // Resultado esperado: `/complete` libera el pago (`released`), `/receipt` retorna comprobante válido,
+  // `/dispute` impide duplicados abiertos (409) y Superadmin resuelve el reclamo con nota y timestamp.
   it('registra conformidad final (con liberación escrow), genera Comprobante del Hogar y gestiona reclamos/garantía (Fase 4)', async () => {
     // 1. Crear contrato y pagarlo en modo mock -> queda 'in_progress' con transacción 'approved'
     const cRes = await req(
@@ -1228,6 +1385,11 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     await db.query('DELETE FROM service_contracts WHERE id = $1', [f4ContractId]);
   });
 
+  // Escenario: pausa/reactivación de visibilidad de una especialidad en el directorio sin perder
+  // la aprobación de compliance, y consulta del resumen financiero del prestador (neto 93%).
+  // Precondiciones: prestador aprobado con al menos un contrato registrado durante la suite.
+  // Resultado esperado: ocultar especialidad la quita del directorio manteniendo `status: 'approved'`,
+  // volver a mostrarla la restaura y `/contracts/provider` expone lista y `total_net_payout` numérico.
   it('persiste visibilidad por especialidad sin alterar compliance y expone contratos/ingresos en /contracts/provider (Evolutivas 1-2)', async () => {
     // 1. Ocultar especialidad del directorio manteniendo status = 'approved'
     const hideRes = await req(

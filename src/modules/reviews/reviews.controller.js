@@ -8,8 +8,11 @@
 const db = require('../../config/db');
 
 /**
- * Asegura la existencia de la tabla owner_reviews de forma idempotente
- * para registrar las calificaciones emitidas por prestadores hacia residentes/propietarios.
+ * Asegura la existencia de la tabla `owner_reviews` de forma idempotente para registrar
+ * las calificaciones emitidas por prestadores hacia residentes/propietarios.
+ * Garantiza una única calificación por contrato (`UNIQUE` en `contract_id`) y puntaje entero entre 1 y 5.
+ *
+ * @returns {Promise<void>}
  */
 const ensureOwnerReviewsTable = async () => {
   await db.query(`
@@ -26,11 +29,18 @@ const ensureOwnerReviewsTable = async () => {
 };
 
 /**
- * Lista contratos del usuario autenticado (residente/propietario o prestador)
- * junto con el estado de reseñas cruzadas (reseña a prestador y reseña a residente).
+ * Lista los contratos del usuario autenticado (según vista de portal Residente o Prestador)
+ * junto con su última transacción de pago y el estado de ambas reseñas cruzadas
+ * (`provider_reviews` y `owner_reviews`).
+ * GET /api/v1/reviews/contracts
+ *
+ * @param {import('express').Request} req - Petición HTTP con sesión JWT y query opcional `?portal=resident|provider`.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ portal, role, contracts }`.
+ * @returns {Promise<import('express').Response>}
  */
 const getContractsForReviews = async (req, res) => {
   try {
+    // 1. Asegurar tabla de reseñas a propietarios y determinar si la vista corresponde a Prestador o Residente
     await ensureOwnerReviewsTable();
 
     const userId = req.user.userId;
@@ -39,6 +49,8 @@ const getContractsForReviews = async (req, res) => {
     const useProviderView =
       requestedPortal === 'provider' || (requestedPortal !== 'resident' && role === 'provider');
 
+    // 2. Rama Portal Prestador: obtiene contratos asignados al perfil `providers.user_id = $1`,
+    //    su última transacción mediante `LEFT JOIN LATERAL` y las reseñas en ambos sentidos
     if (useProviderView) {
       const result = await db.query(
         `SELECT
@@ -95,6 +107,8 @@ const getContractsForReviews = async (req, res) => {
       });
     }
 
+    // 3. Rama Portal Residente: obtiene contratos contratados por `sc.owner_id = $1`
+    //    con última transacción (`LEFT JOIN LATERAL`) y estado de reseña emitida/recibida
     const result = await db.query(
       `SELECT
         sc.id AS contract_id,
@@ -156,12 +170,18 @@ const getContractsForReviews = async (req, res) => {
 };
 
 /**
- * Permite a un residente/propietario ('owner' o 'family') calificar al prestador
- * de un contrato asociado, marca el contrato como completado si estaba pendiente
- * y recalcula rating_avg en la tabla providers.
+ * Permite a un residente/propietario (`owner` o `family`) calificar al prestador
+ * de un contrato asociado, marca automáticamente el contrato como `'completed'` si aún
+ * estaba abierto y recalcula el promedio histórico `rating_avg` en `providers`.
+ * POST /api/v1/reviews/provider
+ *
+ * @param {import('express').Request} req - Petición HTTP con `{ contract_id, rating, comment? }`.
+ * @param {import('express').Response} res - Respuesta HTTP `201` con la reseña y el nuevo promedio.
+ * @returns {Promise<import('express').Response>}
  */
 const createProviderReview = async (req, res) => {
   try {
+    // 1. Parsear y validar identificador del contrato, puntaje entero (1..5) y comentario opcional
     const ownerId = req.user.userId;
     const contractId = parseInt(req.body.contract_id, 10);
     const rating = parseInt(req.body.rating, 10);
@@ -176,6 +196,7 @@ const createProviderReview = async (req, res) => {
       return res.status(400).json({ error: 'La calificación debe ser un número entero de 1 a 5.' });
     }
 
+    // 2. Verificar existencia del contrato y que el usuario autenticado sea el propietario contratante
     const contractRes = await db.query(
       `SELECT id, owner_id, provider_id, status
        FROM service_contracts
@@ -192,6 +213,7 @@ const createProviderReview = async (req, res) => {
       return res.status(403).json({ error: 'No tiene permisos para calificar este contrato.' });
     }
 
+    // 3. Persistir la calificación en `provider_reviews` (la restricción UNIQUE previene reseñas duplicadas)
     const insertRes = await db.query(
       `INSERT INTO provider_reviews (contract_id, provider_id, owner_id, rating, comment)
        VALUES ($1, $2, $3, $4, $5)
@@ -199,6 +221,7 @@ const createProviderReview = async (req, res) => {
       [contractId, contract.provider_id, ownerId, rating, comment || null]
     );
 
+    // 4. Transicionar el contrato a estado `'completed'` si aún figuraba pendiente/en curso
     if (contract.status !== 'completed') {
       await db.query(
         `UPDATE service_contracts
@@ -208,6 +231,7 @@ const createProviderReview = async (req, res) => {
       );
     }
 
+    // 5. Recalcular el promedio global `AVG(rating)` a 2 decimales y sincronizar `providers.rating_avg`
     const avgRes = await db.query(
       `SELECT COALESCE(AVG(rating), 0)::numeric(3,2) AS new_avg
        FROM provider_reviews
@@ -227,6 +251,7 @@ const createProviderReview = async (req, res) => {
       updated_provider_rating: newAverage
     });
   } catch (error) {
+    // Código PostgreSQL 23505 = violación de restricción UNIQUE (contrato ya calificado)
     if (error.code === '23505') {
       return res.status(400).json({ error: 'Ya emitiste una reseña para este contrato.' });
     }
@@ -236,11 +261,17 @@ const createProviderReview = async (req, res) => {
 };
 
 /**
- * Permite a un prestador ('provider') calificar la experiencia con el residente/propietario
- * de un contrato asignado a su perfil.
+ * Permite a un prestador (`provider`) calificar la experiencia con el residente/propietario
+ * de un contrato asignado a su perfil, registrando la reseña cruzada en `owner_reviews`.
+ * POST /api/v1/reviews/owner
+ *
+ * @param {import('express').Request} req - Petición HTTP con `{ contract_id, rating, comment? }`.
+ * @param {import('express').Response} res - Respuesta HTTP `201` con la calificación creada.
+ * @returns {Promise<import('express').Response>}
  */
 const createOwnerReview = async (req, res) => {
   try {
+    // 1. Asegurar tabla `owner_reviews` y validar contrato y puntaje entero (1..5)
     await ensureOwnerReviewsTable();
 
     const userId = req.user.userId;
@@ -257,6 +288,7 @@ const createOwnerReview = async (req, res) => {
       return res.status(400).json({ error: 'La calificación debe ser un número entero de 1 a 5.' });
     }
 
+    // 2. Consultar contrato cruzando con `providers` para verificar propiedad del prestador autenticado
     const contractRes = await db.query(
       `SELECT sc.id, sc.owner_id, sc.provider_id, p.user_id AS provider_user_id
        FROM service_contracts sc
@@ -274,6 +306,7 @@ const createOwnerReview = async (req, res) => {
       return res.status(403).json({ error: 'No tiene permisos para calificar este contrato.' });
     }
 
+    // 3. Persistir la calificación hacia el residente en `owner_reviews`
     const insertRes = await db.query(
       `INSERT INTO owner_reviews (contract_id, provider_id, owner_id, rating, comment)
        VALUES ($1, $2, $3, $4, $5)
@@ -286,6 +319,7 @@ const createOwnerReview = async (req, res) => {
       review: insertRes.rows[0]
     });
   } catch (error) {
+    // Código PostgreSQL 23505 = violación de UNIQUE en `contract_id` (ya fue calificado)
     if (error.code === '23505') {
       return res.status(400).json({ error: 'Ya emitiste una calificación para este contrato.' });
     }
@@ -295,15 +329,23 @@ const createOwnerReview = async (req, res) => {
 };
 
 /**
- * Consulta reseñas recibidas por un prestador específico.
+ * Consulta todas las reseñas públicas recibidas por un prestador específico,
+ * enriquecidas con el nombre del residente que las emitió y ordenadas de más reciente a más antigua.
+ * GET /api/v1/reviews/provider/:providerId
+ *
+ * @param {import('express').Request} req - Petición HTTP con `:providerId` en params.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ provider_id, count, reviews }`.
+ * @returns {Promise<import('express').Response>}
  */
 const getProviderReviewsById = async (req, res) => {
   try {
+    // 1. Validar que `providerId` sea un entero positivo
     const providerId = parseInt(req.params.providerId, 10);
     if (!Number.isInteger(providerId) || providerId <= 0) {
       return res.status(400).json({ error: 'ID de prestador inválido.' });
     }
 
+    // 2. Consultar reseñas del prestador uniendo datos básicos del residente autor
     const reviewsRes = await db.query(
       `SELECT
         pr.id,

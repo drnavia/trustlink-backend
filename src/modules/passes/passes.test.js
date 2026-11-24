@@ -1,7 +1,9 @@
 /**
  * @file passes.test.js
- * @description Script de pruebas de integración completo para verificar el funcionamiento 
- * 100% del módulo de pases de acceso y validación en garita (QR).
+ * @description Script manual de pruebas de integración para el módulo de pases de acceso y garita (QR).
+ * Requiere el servidor backend activo en `http://localhost:4000` y acceso a PostgreSQL.
+ * Siembra un barrio, residente, guardia, prestador aprobado y vehículo; verifica emisión de QR,
+ * validación legítima en garita y rechazo de tokens inexistentes, limpiando el barrio al finalizar.
  * @location /trustlink-backend/src/modules/passes/passes.test.js
  */
 
@@ -11,6 +13,17 @@ require('dotenv').config();
 
 const BASE_URL = 'http://localhost:4000/api/v1/passes';
 
+/**
+ * Ejecuta la secuencia de pruebas de integración del módulo de Pases QR y Garita:
+ * - Paso 0: siembra datos aislados en DB (country, owner, security, provider aprobado y vehículo)
+ *   y firma tokens JWT para los roles `owner` y `security`.
+ * - Prueba 1: creación de un pase QR vigente (`POST /passes/create`).
+ * - Prueba 2: verificación exitosa en garita (`POST /passes/verify`).
+ * - Prueba 3: rechazo de seguridad ante un QR inexistente (`404`).
+ * - Limpieza: elimina el country temporal en cascada dentro del bloque `finally`.
+ *
+ * @returns {Promise<void>} Resuelve al completar los casos y ejecutar la limpieza en base de datos.
+ */
 async function runPassesTests() {
   console.log('🧪 Iniciando pruebas automatizadas para el Módulo de Pases y Garita...\n');
 
@@ -19,6 +32,8 @@ async function runPassesTests() {
   try {
     // ----------------------------------------------------
     // PASO 0: Configurar datos de prueba en la Base de Datos
+    // Precondiciones: comunidad aislada con residente, guardia de garita y prestador
+    // en estado `approved` con vehículo registrado para habilitar la emisión y lectura de QR.
     // ----------------------------------------------------
     console.log('0️⃣ Preparando datos de prueba (Country, Owner, Security, Provider, Vehículo)...');
     
@@ -78,6 +93,8 @@ async function runPassesTests() {
 
     // ----------------------------------------------------
     // PRUEBA 1: Crear Pase de Acceso (Rol Owner)
+    // Escenario: un residente autoriza el ingreso de un prestador aprobado dentro de una ventana horaria.
+    // Resultado esperado: HTTP 201 con objeto `pass` y `qr_token` único generado.
     // ----------------------------------------------------
     console.log('1️⃣ Probando Creación de Pase QR (/passes/create)...');
     // Margen amplio de ±24 horas para evitar desfasajes de zona horaria en test local
@@ -112,6 +129,8 @@ async function runPassesTests() {
 
     // ----------------------------------------------------
     // PRUEBA 2: Validar Pase en Garita (Rol Security) - Caso Válido
+    // Precondición: pase QR vigente emitido en la Prueba 1 y token del guardia de la misma comunidad.
+    // Resultado esperado: HTTP 200 con `authorized: true` y detalle completo del prestador/destino.
     // ----------------------------------------------------
     console.log('\n2️⃣ Probando Validación en Garita (/passes/verify) con QR legítimo...');
     const verifyRes = await fetch(`${BASE_URL}/verify`, {
@@ -134,6 +153,8 @@ async function runPassesTests() {
 
     // ----------------------------------------------------
     // PRUEBA 3: Validar Seguridad con QR Inexistente
+    // Escenario: escaneo de un token adulterado o no registrado en la base de datos.
+    // Resultado esperado: HTTP 404 con `authorized: false` denegando el acceso en garita.
     // ----------------------------------------------------
     console.log('\n3️⃣ Probando Seguridad: Intento de acceso con QR falso...');
     const invalidVerifyRes = await fetch(`${BASE_URL}/verify`, {
@@ -165,4 +186,5 @@ async function runPassesTests() {
   }
 }
 
+// Punto de entrada al ejecutar el script de forma independiente
 runPassesTests();

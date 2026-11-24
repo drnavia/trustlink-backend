@@ -1,8 +1,9 @@
 /**
  * @file migrate.js
  * @description Runner idempotente y ordenado de migraciones evolutivas para PostgreSQL de TrustLink.
- * Consolida en un único script ejecutable (`npm run migrate`) todas las tablas y columnas
- * evolutivas introducidas tras el esquema base (database/script-schema.sql.txt).
+ * Consolida en un único script ejecutable (`npm run migrate`) todas las tablas, columnas e índices
+ * evolutivos introducidos tras el esquema base (`database/script-schema.sql.txt`).
+ * Cada migración está diseñada para ejecutarse de forma segura múltiples veces sin destruir datos.
  * @location /trustlink-backend/src/db/migrate.js
  */
 
@@ -10,7 +11,18 @@ require('dotenv').config();
 const db = require('../config/db');
 const { ensureEvolutionSchema } = require('../config/ensureEvolutionSchema');
 
+/**
+ * Catálogo ordenado de migraciones evolutivas de TrustLink (001 a 016).
+ * Cada entrada posee un identificador único (`id`) registrado en `schema_migrations`
+ * y una función asíncrona (`run`) con sentencias DDL/DML idempotentes.
+ */
 const MIGRATIONS = [
+  // ---------------------------------------------------------------------------
+  // 001: Dirección postal estructurada de comunidades (`countries`)
+  // Agrega `address`, `postal_code`, `city` y `province` a `countries`.
+  // Habilita la ficha geográfica completa de cada barrio/country para el alta,
+  // la administración centralizada y el contexto de ubicación en el directorio.
+  // ---------------------------------------------------------------------------
   {
     id: '001_countries_address_columns',
     run: async () => {
@@ -23,6 +35,13 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 002: Vencimientos documentales e historial de versiones (`providers`, `provider_document_versions`)
+  // Agrega `criminal_record_expiry` e `insurance_expiry` a `providers` y crea la tabla
+  // `provider_document_versions` para conservar trazabilidad de certificados (antecedentes y ART).
+  // Habilita alertas de vencimiento, auditoría de renovaciones y bloqueo automático en garita.
+  // ---------------------------------------------------------------------------
   {
     id: '002_providers_expiry_and_document_versions',
     run: async () => {
@@ -46,6 +65,13 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 003: Tipología y seguro obligatorio de la flota vehicular (`provider_vehicles`)
+  // Agrega `vehicle_type`, `vehicle_insurance_url`, `vehicle_insurance_from` y
+  // `vehicle_insurance_expiry` a `provider_vehicles`.
+  // Habilita el control de póliza vehicular por patente y alertas de vencimiento de flota.
+  // ---------------------------------------------------------------------------
   {
     id: '003_provider_vehicles_type_and_insurance',
     run: async () => {
@@ -58,6 +84,12 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 004: Patente vehicular vinculada al pase de acceso (`access_passes`)
+  // Agrega `vehicle_plate` a `access_passes`.
+  // Habilita asociar un vehículo específico del prestador a cada pase QR para verificación en garita.
+  // ---------------------------------------------------------------------------
   {
     id: '004_access_passes_vehicle_plate',
     run: async () => {
@@ -67,12 +99,27 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 005: Identidad dual, ubicación normalizada y reseñas cruzadas
+  // Delega en `ensureEvolutionSchema()` para asegurar en `users` las columnas de
+  // ubicación (`fraction_type`) y portales duales (`can_use_resident`, `can_use_provider`,
+  // `primary_portal`, `portals_configured`), además de la tabla `owner_reviews`.
+  // Habilita que un mismo usuario opere como residente y prestador, y la reputación bidireccional.
+  // ---------------------------------------------------------------------------
   {
     id: '005_dual_identity_location_and_owner_reviews',
     run: async () => {
       await ensureEvolutionSchema();
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 006: Coordinación de visitas y agenda del prestador (`visit_requests`, `provider_schedule_blocks`)
+  // Crea `visit_requests` (solicitudes de visita con hilo JSONB de mensajes y estado) y
+  // `provider_schedule_blocks` (bloqueos manuales o reservados en la agenda del prestador).
+  // Habilita la coordinación previa Residente <-> Prestador y la disponibilidad online antes del QR.
+  // ---------------------------------------------------------------------------
   {
     id: '006_visit_requests_and_schedule_blocks',
     run: async () => {
@@ -105,6 +152,15 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 007: Suspensiones locales, integraciones API, auditoría de garita y branding
+  // Crea 4 tablas clave de operación y gobierno:
+  // - `provider_local_suspensions`: bloqueos operativos de un prestador dentro de un barrio específico.
+  // - `country_integrations`: credenciales API (hash + prefijo) por comunidad para garitas externas.
+  // - `gate_access_logs`: bitácora inmutable de cada intento de validación QR en garita/API externa.
+  // - `platform_branding`: personalización visual white-label (colores, textos, logo, modo oscuro).
+  // ---------------------------------------------------------------------------
   {
     id: '007_local_suspensions_integrations_audit_and_branding',
     run: async () => {
@@ -172,6 +228,13 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 008: Tokens seguros para recuperación de contraseña (`password_reset_tokens`)
+  // Crea `password_reset_tokens` almacenando únicamente el hash del token, su expiración
+  // y marca de uso (`used_at`).
+  // Habilita el flujo de "Olvidé mi contraseña" de un solo uso sin exponer secretos en DB.
+  // ---------------------------------------------------------------------------
   {
     id: '008_password_reset_tokens',
     run: async () => {
@@ -187,6 +250,14 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 009: Cuadrilla y ayudantes del prestador sin cuenta propia (`provider_employees`)
+  // Permite `employee_user_id` nulo (catch silencioso si ya es nullable) y agrega
+  // `full_name`, `dni`, `phone`, `role_label`, `insurance_policy_url`, `insurance_expiry`
+  // e `is_active` a `provider_employees`.
+  // Habilita registrar ayudantes de obra/mantenimiento con su póliza ART individual.
+  // ---------------------------------------------------------------------------
   {
     id: '009_provider_employees_crew_columns',
     run: async () => {
@@ -206,6 +277,13 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 010: Nómina de ayudantes autorizados dentro del pase QR (`access_passes`)
+  // Agrega la columna JSONB `authorized_employees` a `access_passes`.
+  // Habilita incluir un snapshot de los ayudantes autorizados en el ingreso y validar
+  // en tiempo real la vigencia de sus seguros ART al escanear en garita.
+  // ---------------------------------------------------------------------------
   {
     id: '010_access_passes_authorized_employees',
     run: async () => {
@@ -215,6 +293,14 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 011: Bandera de configuración de portales y backfill legacy (`users`)
+  // Agrega `portals_configured` a `users` y ejecuta una normalización única para cuentas
+  // existentes con `portals_configured = FALSE`, derivando `can_use_provider`,
+  // `can_use_resident` y `primary_portal` a partir del rol y lote registrados.
+  // Evita sobrescribir cambios posteriores realizados manualmente desde "Mi Cuenta".
+  // ---------------------------------------------------------------------------
   {
     id: '011_users_portals_configured_and_cleanup',
     run: async () => {
@@ -246,6 +332,12 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 012: Membresía "Socio Verificado" para prestadores (`provider_subscriptions`)
+  // Crea la tabla `provider_subscriptions` y su índice compuesto por `(user_id, status, ends_at DESC)`.
+  // Habilita suscripciones recurrentes, renovaciones, vencimientos y gestión manual desde Ops.
+  // ---------------------------------------------------------------------------
   {
     id: '012_provider_subscriptions',
     run: async () => {
@@ -270,6 +362,14 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 013: Licenciamiento B2B de comunidades y migración de API Keys hasheadas
+  // Agrega `plan_code`, `billing_status`, `subscription_ends_at` y `monthly_pass_quota` a `countries`.
+  // Además compatibiliza instalaciones legacy de `country_integrations` asegurando `api_key_hash`
+  // y `api_key_prefix`, y relajando la restricción `NOT NULL` en la columna histórica `api_key`.
+  // Habilita planes comerciales por barrio, cuotas mensuales de QR y claves API seguras.
+  // ---------------------------------------------------------------------------
   {
     id: '013_countries_b2b_licensing',
     run: async () => {
@@ -291,6 +391,14 @@ const MIGRATIONS = [
       `).catch(() => {});
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 014: Integración de pasarela Mercado Pago Checkout Pro (`transactions`)
+  // Agrega `preference_id`, `checkout_url`, `gateway_mode`, `gateway_raw_status` y `updated_at`
+  // a `transactions`.
+  // Habilita operar pagos tanto en modo simulado (`mock`) como real (`mercadopago`) con
+  // trazabilidad completa de preferencias de pago y respuestas de webhooks.
+  // ---------------------------------------------------------------------------
   {
     id: '014_transactions_mercadopago_columns',
     run: async () => {
@@ -304,6 +412,13 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 015: Conformidad final de trabajos y sistema de reclamos/disputas (`service_contracts`, `service_disputes`)
+  // Agrega `completed_at` y `completion_notes` a `service_contracts`, y crea la tabla
+  // `service_disputes` (con evidencias JSONB, estado y resolución administrativa) junto con su índice.
+  // Habilita el cierre formal del servicio por el residente y la mediación de reclamos por garantía.
+  // ---------------------------------------------------------------------------
   {
     id: '015_contract_completion_and_disputes',
     run: async () => {
@@ -333,6 +448,13 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 016: Control granular de visibilidad en el directorio por especialidad (`providers`)
+  // Agrega `is_visible_in_directory` (TRUE por defecto) a `providers`.
+  // Habilita que un prestador oculte o reactive una especialidad puntual en el directorio
+  // público sin perder su estado de compliance aprobado ni sus documentos vigentes.
+  // ---------------------------------------------------------------------------
   {
     id: '016_provider_specialty_visibility',
     run: async () => {
@@ -344,6 +466,18 @@ const MIGRATIONS = [
   },
 ];
 
+/**
+ * Ejecuta secuencialmente todas las migraciones evolutivas declaradas en `MIGRATIONS`.
+ *
+ * Estrategia de idempotencia:
+ * 1. Crea la tabla de control `schema_migrations` si aún no existe.
+ * 2. Re-verifica cada migración en orden estricto (todas sus sentencias usan `IF NOT EXISTS`
+ *    o actualizaciones condicionadas), garantizando reparación automática ante despliegues parciales.
+ * 3. Registra cada `id` en `schema_migrations` con `ON CONFLICT (id) DO NOTHING`, permitiendo
+ *    invocar el script repetidas veces (CI/CD, arranque o mantenimiento manual) sin fallos ni duplicados.
+ *
+ * @returns {Promise<void>}
+ */
 async function runMigrations() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -362,6 +496,7 @@ async function runMigrations() {
   }
 }
 
+// Ejecución directa por CLI (`node src/db/migrate.js` o `npm run migrate`)
 if (require.main === module) {
   runMigrations()
     .then(async () => {

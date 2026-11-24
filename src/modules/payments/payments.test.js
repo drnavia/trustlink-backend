@@ -1,7 +1,8 @@
 /**
  * @file payments.test.js
- * @description Script de pruebas de integración para verificar el funcionamiento 
- * 100% del módulo de pagos, cotizaciones in situ, cálculo de comisiones y webhooks.
+ * @description Script manual de pruebas de integración para el módulo de pagos y transacciones.
+ * Requiere el servidor backend activo en `http://localhost:4000` (en modo sin firma obligatoria de webhook)
+ * y acceso a PostgreSQL. Verifica cotización presencial con split 7%/93% y aprobación vía webhook.
  * @location /trustlink-backend/src/modules/payments/payments.test.js
  */
 
@@ -11,6 +12,15 @@ require('dotenv').config();
 
 const BASE_URL = 'http://localhost:4000/api/v1/payments';
 
+/**
+ * Ejecuta las pruebas de integración del flujo de cotización y confirmación de pago:
+ * - Paso 0: crea en DB un country, residente, prestador aprobado y contrato en estado `pending`.
+ * - Prueba 1: registra la cotización in situ (`POST /payments/quote`) y valida generación del split 7%/93%.
+ * - Prueba 2: simula notificación de aprobación desde la pasarela (`POST /payments/webhook`).
+ * - Limpieza: borra el country temporal en cascada dentro del bloque `finally`.
+ *
+ * @returns {Promise<void>} Finaliza tras validar las respuestas HTTP y limpiar la base de datos.
+ */
 async function runPaymentsTests() {
   console.log('🧪 Iniciando pruebas automatizadas para el Módulo de Pagos y Transacciones...\n');
 
@@ -19,6 +29,8 @@ async function runPaymentsTests() {
   try {
     // ----------------------------------------------------
     // PASO 0: Configurar entorno de prueba en la Base de Datos
+    // Precondiciones: comunidad aislada, residente, prestador aprobado y contrato de servicio
+    // pendiente de cotización (`agreed_amount = 0.00`, `status = 'pending'`).
     // ----------------------------------------------------
     console.log('0️⃣ Preparando datos de prueba (Country, Owner, Provider, Contract)...');
 
@@ -70,6 +82,9 @@ async function runPaymentsTests() {
 
     // ----------------------------------------------------
     // PRUEBA 1: Prestador carga cotización in situ (/payments/quote)
+    // Escenario: el prestador informa el monto acordado en el domicilio ($100.000 ARS).
+    // Resultado esperado: HTTP 201 con transacción generada, split de comisión (7% / 93%)
+    // y un `gateway_payment_id` listo para la confirmación posterior.
     // ----------------------------------------------------
     console.log('1️⃣ Probando registro de cotización presencial por el prestador (/payments/quote)...');
     const quoteRes = await fetch(`${BASE_URL}/quote`, {
@@ -103,6 +118,8 @@ async function runPaymentsTests() {
 
     // ----------------------------------------------------
     // PRUEBA 2: Simulación de Aprobación de Pago vía Webhook (/payments/webhook)
+    // Precondición: transacción pendiente creada en la Prueba 1 identificada por `gatewayPaymentId`.
+    // Resultado esperado: HTTP 200 con `received: true` y `transaction_status: 'approved'`.
     // ----------------------------------------------------
     console.log('\n2️⃣ Probando confirmación de pago por webhook de pasarela (/payments/webhook)...');
     const webhookRes = await fetch(`${BASE_URL}/webhook`, {
@@ -137,4 +154,5 @@ async function runPaymentsTests() {
   }
 }
 
+// Punto de entrada al ejecutar el script directamente
 runPaymentsTests();

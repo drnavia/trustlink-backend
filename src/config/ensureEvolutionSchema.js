@@ -1,21 +1,25 @@
 /**
  * @file ensureEvolutionSchema.js
- * @description Helper idempotente para asegurar las columnas y tablas evolutivas de TrustLink:
- * - Ubicación residencial normalizada en `users` (fraction_type, fraction_number, lot_number).
- * - Capacidades duales y portal principal configurable (can_use_resident, can_use_provider, primary_portal).
- * - Tabla `owner_reviews` para reseñas de prestadores hacia residentes/propietarios.
+ * @description Helper idempotente para asegurar en tiempo de arranque o migración las columnas
+ * y tablas evolutivas de TrustLink:
+ * - Ubicación residencial normalizada en `users` (`fraction_type`, `fraction_number`, `lot_number`).
+ * - Capacidades duales y portal principal configurable (`can_use_resident`, `can_use_provider`, `primary_portal`).
+ * - Reseñas cruzadas (`owner_reviews`), membresías (`provider_subscriptions`), licenciamiento B2B (`countries`),
+ *   integración Mercado Pago (`transactions`), disputas (`service_disputes`) y visibilidad de especialidades (`providers`).
  * @location /trustlink-backend/src/config/ensureEvolutionSchema.js
  */
 
 const db = require('./db');
 
+// Estado en memoria (singleton por proceso) para evitar ejecutar DDL concurrente o repetitivo
 let schemaInitialized = false;
 let schemaPromise = null;
 
 /**
- * Normaliza el tipo de área de manzana/fracción ('manzana' | 'fraccion' | 'na').
- * @param {string|null|undefined} rawType
- * @returns {'manzana'|'fraccion'|'na'}
+ * Normaliza el tipo de área residencial de manzana/fracción (`manzana` | `fraccion` | `na`).
+ * Acepta abreviaturas y variantes con acento provenientes de formularios o datos legacy.
+ * @param {string|null|undefined} rawType - Valor ingresado o almacenado en DB.
+ * @returns {'manzana'|'fraccion'|'na'} Tipo de área normalizado.
  */
 function normalizeAreaType(rawType) {
   if (!rawType) return 'na';
@@ -28,9 +32,10 @@ function normalizeAreaType(rawType) {
 }
 
 /**
- * Limpia un valor para que conserve únicamente dígitos (o null si no hay dígitos).
- * @param {string|number|null|undefined} rawValue
- * @returns {string|null}
+ * Limpia un valor de entrada para conservar únicamente dígitos numéricos (o `null` si queda vacío).
+ * Se usa para estandarizar números de lote y manzana/fracción.
+ * @param {string|number|null|undefined} rawValue - Dato original.
+ * @returns {string|null} Secuencia de dígitos o `null`.
  */
 function cleanNumberOnly(rawValue) {
   if (rawValue === null || rawValue === undefined) return null;
@@ -39,17 +44,22 @@ function cleanNumberOnly(rawValue) {
 }
 
 /**
- * Determina el portal principal por defecto según el rol del usuario.
- * @param {string} role
- * @returns {'resident'|'provider'}
+ * Determina el portal principal por defecto según el rol base del usuario.
+ * @param {string} role - Rol del usuario (`provider`, `owner`, `family`, etc.).
+ * @returns {'resident'|'provider'} Portal inicial sugerido tras el login.
  */
 function getDefaultPrimaryPortal(role) {
   return String(role || '').toLowerCase() === 'provider' ? 'provider' : 'resident';
 }
 
 /**
- * Ejecuta de forma idempotente las migraciones evolutivas de Fase 1
- * alineadas con account.controller.js, passes.controller.js y script-schema.sql.txt.
+ * Ejecuta de forma idempotente y deduplicada las evoluciones de esquema en PostgreSQL
+ * alineadas con `account.controller.js`, `passes.controller.js`, `migrate.js` y `script-schema.sql.txt`.
+ *
+ * Si múltiples peticiones invocan esta función simultáneamente al arrancar, comparten
+ * la misma promesa (`schemaPromise`). Ante un error, limpia la promesa para permitir reintentos.
+ *
+ * @returns {Promise<void>}
  */
 async function ensureEvolutionSchema() {
   if (schemaInitialized) return;

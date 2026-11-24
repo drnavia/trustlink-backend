@@ -1,7 +1,11 @@
 /**
  * @file payments.controller.js
- * @description Lógica de negocio para el Módulo de Pagos y Contratos de TrustLink.
- * Consulta los contratos pendientes reales de la base de datos y procesa la pasarela con Take Rate.
+ * @description Lógica de negocio para el Módulo de Pagos, Contratos, Escrow y Reclamos de TrustLink.
+ * Gestiona el ciclo completo de órdenes de servicio: creación y cotización in situ, cálculo de split
+ * financiero (Take Rate configurable, por defecto 7% plataforma / 93% neto prestador), modo dual de
+ * pasarela (`mock` local y `mercadopago` Checkout Pro), validación de webhooks firmados (secreto
+ * compartido, `x-signature` oficial de MP y HMAC-SHA256), conformidad final con liberación de escrow,
+ * generación del Comprobante del Hogar auditable, resumen de ingresos del prestador y disputas post-servicio.
  * @location /trustlink-backend/src/modules/payments/payments.controller.js
  */
 
@@ -16,9 +20,19 @@ const {
   fetchMercadoPagoPayment,
 } = require('./mercadopago.service');
 
+// Estados válidos aceptados para transiciones de pago en `transactions`
 const ALLOWED_PAYMENT_STATUSES = ['pending', 'approved', 'released', 'refunded'];
+// Estados válidos del ciclo de vida de un reclamo/garantía en `service_disputes`
 const ALLOWED_DISPUTE_STATUSES = ['open', 'in_review', 'resolved', 'rejected'];
 
+/**
+ * Asegura de forma idempotente que la tabla `transactions` disponga de las columnas necesarias
+ * para operar en modo dual (`mock` / `mercadopago`): identificador de preferencia (`preference_id`),
+ * URL de redirección (`checkout_url`), modo de pasarela (`gateway_mode`), estado crudo devuelto por
+ * el proveedor externo (`gateway_raw_status`) y marca de actualización (`updated_at`).
+ *
+ * @returns {Promise<void>}
+ */
 const ensureTransactionGatewayColumns = async () => {
   await db.query(`
     ALTER TABLE public.transactions
@@ -30,6 +44,13 @@ const ensureTransactionGatewayColumns = async () => {
   `);
 };
 
+/**
+ * Asegura de forma idempotente el esquema requerido para el cierre con conformidad del residente
+ * (`completed_at`, `completion_notes` en `service_contracts`) y la tabla `service_disputes`
+ * destinada a registrar reclamos/garantías post-servicio con evidencias y resolución de Ops.
+ *
+ * @returns {Promise<void>}
+ */
 const ensureCompletionAndDisputesSchema = async () => {
   await db.query(`
     ALTER TABLE public.service_contracts
@@ -54,8 +75,14 @@ const ensureCompletionAndDisputesSchema = async () => {
 };
 
 /**
- * Devuelve la configuración pública de la pasarela activa (modo mock/mercadopago y Take Rate).
+ * Devuelve la configuración pública de la pasarela de pagos activa (`mock` o `mercadopago`),
+ * indicando si Mercado Pago está configurado, si opera en sandbox y el porcentaje de comisión
+ * (Take Rate, por defecto 7%) sin exponer secretos ni tokens privados.
  * GET /api/v1/payments/config
+ *
+ * @param {import('express').Request} req - Solicitud HTTP entrante.
+ * @param {import('express').Response} res - Respuesta HTTP con parámetros públicos de la pasarela.
+ * @returns {Promise<import('express').Response>}
  */
 const getPaymentGatewayPublicConfig = async (req, res) => {
   const config = getGatewayConfig();
@@ -68,12 +95,17 @@ const getPaymentGatewayPublicConfig = async (req, res) => {
 };
 
 /**
- * Valida la autenticidad del webhook de pagos mediante:
- * 1) Secreto compartido (`x-webhook-secret`),
- * 2) Firma oficial de Mercado Pago (`x-signature: ts=...,v1=...`), o
- * 3) Firma HMAC-SHA256 del cuerpo crudo (`x-webhook-signature` / `x-signature`).
+ * Valida la autenticidad de un webhook de pagos mediante comparación segura en tiempo constante
+ * (`safeTimingEqual`) aceptando tres estrategias en orden de prioridad:
+ * 1) Secreto compartido directo en header `x-webhook-secret`,
+ * 2) Firma oficial de Mercado Pago (`x-signature: ts=...,v1=...`) cruzada con `x-request-id` y `data.id`,
+ * 3) Firma HMAC-SHA256 del cuerpo crudo (`req.rawBody`) enviada en `x-webhook-signature` o `x-signature`.
+ *
+ * @param {import('express').Request} req - Solicitud HTTP del webhook entrante.
+ * @returns {{ ok: true, mode: 'shared_secret'|'mp_x_signature'|'hmac_sha256' } | { ok: false, status: number, error: string }}
  */
 const verifyWebhookAuth = (req) => {
+  // Etapa 1: Verificar que exista un secreto de webhook configurado en variables de entorno
   const expectedSecret = String(
     process.env.PAYMENT_WEBHOOK_SECRET || process.env.MP_WEBHOOK_SECRET || ''
   ).trim();
@@ -86,12 +118,13 @@ const verifyWebhookAuth = (req) => {
     };
   }
 
+  // Etapa 2: Estrategia 1 — comparación en tiempo constante del header `x-webhook-secret`
   const providedSecret = String(req.headers['x-webhook-secret'] || '').trim();
   if (providedSecret && safeTimingEqual(providedSecret, expectedSecret)) {
     return { ok: true, mode: 'shared_secret' };
   }
 
-  // Firma oficial Mercado Pago: x-signature: ts=...,v1=...
+  // Etapa 3: Estrategia 2 — firma oficial de Mercado Pago (`x-signature: ts=...,v1=...`)
   const mpSignatureHeader = String(req.headers['x-signature'] || '').trim();
   if (mpSignatureHeader && mpSignatureHeader.includes('v1=')) {
     const dataId =
@@ -112,6 +145,7 @@ const verifyWebhookAuth = (req) => {
     }
   }
 
+  // Etapa 4: Estrategia 3 — verificación HMAC-SHA256 del payload crudo (`req.rawBody` o JSON de respaldo)
   const rawSignatureHeader = String(
     req.headers['x-webhook-signature'] || req.headers['x-signature'] || ''
   ).trim();
@@ -132,6 +166,7 @@ const verifyWebhookAuth = (req) => {
     }
   }
 
+  // Etapa 5: Rechazar cuando ningún método de autenticación coincide
   return {
     ok: false,
     status: 401,
@@ -140,14 +175,21 @@ const verifyWebhookAuth = (req) => {
 };
 
 /**
- * Obtiene todos los contratos de servicio del residente autenticado.
+ * Lista todos los contratos de servicio pertenecientes al residente autenticado (`owner_id`),
+ * enriquecidos con datos del prestador, estado de conformidad y resumen de reclamos/disputas.
  * GET /api/v1/contracts
+ *
+ * @param {import('express').Request} req - Solicitud HTTP del residente autenticado.
+ * @param {import('express').Response} res - Respuesta HTTP con el historial de contratos.
+ * @returns {Promise<import('express').Response>}
  */
 const listMyContracts = async (req, res) => {
   try {
     await ensureCompletionAndDisputesSchema();
     const owner_id = req.user.userId;
 
+    // Consulta principal: une `service_contracts` con `providers` y `users`, e incluye
+    // subconsultas correlacionadas para contar disputas abiertas y conocer el último estado de reclamo
     const query = `
       SELECT
         sc.id,
@@ -199,11 +241,18 @@ const listMyContracts = async (req, res) => {
 };
 
 /**
- * Crea un contrato / orden de servicio a partir de una visita o pase QR.
+ * Crea un nuevo contrato / orden de servicio en estado `'pending'` para el residente autenticado,
+ * pudiendo vincularlo opcionalmente a un pase QR existente (`pass_id`) del cual hereda
+ * `provider_id` y `country_id` si no fueron informados explícitamente.
  * POST /api/v1/contracts
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `description`, `agreed_amount`, `provider_id` y/o `pass_id`.
+ * @param {import('express').Response} res - Respuesta HTTP con el contrato creado (201).
+ * @returns {Promise<import('express').Response>}
  */
 const createContract = async (req, res) => {
   try {
+    // Etapa 1: Validar descripción obligatoria y monto acordado estrictamente mayor a cero
     const ownerId = Number(req.user.userId);
     const userRole = String(req.user.role || '').toLowerCase();
     const { provider_id, pass_id, description, agreed_amount } = req.body || {};
@@ -221,6 +270,7 @@ const createContract = async (req, res) => {
     let resolvedPassId = pass_id ? Number(pass_id) : null;
     let effectiveCountryId = req.user.countryId ? Number(req.user.countryId) : null;
 
+    // Etapa 2: Si se vincula a un pase QR, validar existencia, propiedad del residente y heredar prestador/comunidad
     if (resolvedPassId) {
       const passRes = await db.query(
         'SELECT id, owner_id, provider_id, country_id FROM access_passes WHERE id = $1 LIMIT 1',
@@ -239,6 +289,7 @@ const createContract = async (req, res) => {
       effectiveCountryId = effectiveCountryId || (passRow.country_id ? Number(passRow.country_id) : null);
     }
 
+    // Etapa 3: Validar existencia del prestador y resolver `country_id` de respaldo desde su usuario
     if (!resolvedProviderId || Number.isNaN(resolvedProviderId)) {
       return res.status(400).json({ error: 'Debe indicar un prestador válido.' });
     }
@@ -260,6 +311,7 @@ const createContract = async (req, res) => {
       effectiveCountryId ||
       (providerCheck.rows[0].country_id ? Number(providerCheck.rows[0].country_id) : null);
 
+    // Etapa 4: Insertar la orden de servicio en estado `'pending'` con monto normalizado a 2 decimales
     const insertRes = await db.query(
       `INSERT INTO service_contracts (
          country_id, owner_id, provider_id, pass_id, description, agreed_amount, status
@@ -287,13 +339,20 @@ const createContract = async (req, res) => {
 };
 
 /**
- * Obtiene los contratos pendientes de pago para el residente autenticado.
- * Roles permitidos: 'owner', 'family', 'superadmin'
+ * Obtiene únicamente los contratos en estado `'pending'` (pendientes de pago) del residente autenticado,
+ * ordenados del más reciente al más antiguo para el flujo de checkout.
+ * Roles permitidos: `'owner'`, `'family'`, `'superadmin'`.
+ * GET /api/v1/payments/pending
+ *
+ * @param {import('express').Request} req - Solicitud HTTP del residente autenticado.
+ * @param {import('express').Response} res - Respuesta HTTP con los contratos pendientes de cobro.
+ * @returns {Promise<import('express').Response>}
  */
 const getPendingContracts = async (req, res) => {
   try {
     const owner_id = req.user.userId;
 
+    // Consulta de contratos pendientes del titular con datos visibles del prestador asignado
     const query = `
       SELECT
         sc.id,
@@ -331,14 +390,22 @@ const getPendingContracts = async (req, res) => {
 };
 
 /**
- * Procesa el pago de un contrato pendiente con Take Rate parametrizable (default 7% / Neto Prestador 93%).
- * Soporta modo dual:
- * - `mock`: acreditación instantánea para piloto/tests locales.
- * - `mercadopago`: crea preferencia real de Checkout Pro y devuelve `checkout_url` para redirección.
+ * Procesa el checkout de un contrato pendiente aplicando el split financiero (Take Rate
+ * configurable, por defecto 7% comisión TrustLink / 93% liquidación neta al prestador).
+ * Soporta modo dual de pasarela:
+ * - `mercadopago`: crea una preferencia real en Checkout Pro, guarda la transacción `'pending'`
+ *   con `MP-PREF-<id>` y responde `requires_redirect: true` junto a `checkout_url`.
+ * - `mock`: acredita instantáneamente la transacción como `'approved'` y transiciona el contrato
+ *   a `'in_progress'` para entornos piloto o pruebas locales.
  * Soporta POST /api/v1/payments/checkout y POST /api/v1/contracts/:id/pay.
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.id` o `body.contract_id`.
+ * @param {import('express').Response} res - Respuesta HTTP con transacción y datos de redirección o acreditación.
+ * @returns {Promise<import('express').Response>}
  */
 const checkoutContractPayment = async (req, res) => {
   try {
+    // Etapa 1: Asegurar columnas de pasarela, leer configuración activa y validar ID del contrato
     await ensureTransactionGatewayColumns();
     const userId = Number(req.user.userId);
     const userRole = String(req.user.role || '').toLowerCase();
@@ -350,6 +417,7 @@ const checkoutContractPayment = async (req, res) => {
       return res.status(400).json({ error: 'Debe indicar un contrato válido para abonar.' });
     }
 
+    // Etapa 2: Consultar el contrato y validar existencia, titularidad, estado 'pending' y monto positivo
     const contractRes = await db.query(
       `SELECT id, owner_id, provider_id, agreed_amount, status, description
        FROM service_contracts
@@ -378,11 +446,13 @@ const checkoutContractPayment = async (req, res) => {
       return res.status(400).json({ error: 'El monto del contrato es inválido.' });
     }
 
+    // Etapa 3: Calcular el split financiero (7% comisión TrustLink / 93% neto prestador por defecto)
     const { platformFee, providerPayout, feePercent } = calculateSplit(
       totalAmount,
       config.platformFeePercent
     );
 
+    // Etapa 4A (Modo `mercadopago`): generar preferencia Checkout Pro y persistir transacción 'pending'
     if (config.mode === 'mercadopago') {
       const preference = await createCheckoutPreference(
         {
@@ -426,6 +496,7 @@ const checkoutContractPayment = async (req, res) => {
       });
     }
 
+    // Etapa 4B (Modo `mock`): acreditar instantáneamente la transacción y pasar el contrato a 'in_progress'
     const mockGatewayId = `MP-PAY-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
     const txResult = await db.query(
@@ -463,11 +534,19 @@ const checkoutContractPayment = async (req, res) => {
 };
 
 /**
- * Registra o actualiza el monto acordado in situ y genera la orden de pago (Take Rate configurable).
- * Roles permitidos: 'provider', 'owner', 'family', 'superadmin'
+ * Registra o actualiza el presupuesto acordado in situ (`agreed_amount`) sobre un contrato
+ * existente y genera una nueva orden de pago `'pending'` con split 7%/93% (configurable),
+ * emitiendo enlace simulado (`mock`) o preferencia Checkout Pro (`mercadopago`).
+ * Roles permitidos: `'provider'`, `'owner'`, `'family'`, `'superadmin'`.
+ * POST /api/v1/payments/quote
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `contract_id` y `agreed_amount`.
+ * @param {import('express').Response} res - Respuesta HTTP con `checkout_url` y transacción creada (201).
+ * @returns {Promise<import('express').Response>}
  */
 const createOrUpdateQuote = async (req, res) => {
   try {
+    // Etapa 1: Validar parámetros de cotización y verificar que el usuario sea participante del contrato
     await ensureTransactionGatewayColumns();
     const userId = Number(req.user.userId);
     const userRole = String(req.user.role || '').toLowerCase();
@@ -501,6 +580,7 @@ const createOrUpdateQuote = async (req, res) => {
       return res.status(403).json({ error: 'No tenés permisos para cotizar este contrato.' });
     }
 
+    // Etapa 2: Actualizar monto acordado en `service_contracts` (estado 'pending') y calcular split 7%/93%
     const updateQuery = `
       UPDATE service_contracts
       SET agreed_amount = $1, status = 'pending'
@@ -516,6 +596,7 @@ const createOrUpdateQuote = async (req, res) => {
       config.platformFeePercent
     );
 
+    // Etapa 3: Construir enlace de checkout según modo activo (simulado en mock o preferencia real en MP)
     let gatewayPaymentId = `MP-TX-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     let preferenceId = null;
     let checkoutUrl = `https://checkout.mercadopago.com/simulate/${gatewayPaymentId}`;
@@ -536,6 +617,7 @@ const createOrUpdateQuote = async (req, res) => {
       checkoutUrl = preference.checkoutUrl;
     }
 
+    // Etapa 4: Registrar la orden de pago `'pending'` en `transactions` y retornar URL de checkout
     const insertTx = `
       INSERT INTO transactions (
         contract_id, gateway_provider, gateway_payment_id,
@@ -571,18 +653,27 @@ const createOrUpdateQuote = async (req, res) => {
 };
 
 /**
- * Procesa confirmación de pago por webhook de pasarela con validación HMAC-SHA256 / x-signature oficial de MP
- * y soporte tanto para payloads directos (`{ gateway_payment_id, status }`)
- * como para notificaciones reales de Mercado Pago (`{ type: 'payment', data: { id } }`).
+ * Procesa confirmaciones asíncronas de pago vía webhook firmado (secreto compartido,
+ * `x-signature` oficial de Mercado Pago o HMAC-SHA256).
+ * Soporta tanto payloads directos (`{ gateway_payment_id, status }`) como notificaciones
+ * reales de Mercado Pago (`{ type: 'payment', data: { id } }`), aplicando idempotencia,
+ * protección contra regresión de estados y transición automática de `service_contracts`.
+ * POST /api/v1/payments/webhook
+ *
+ * @param {import('express').Request} req - Solicitud HTTP firmada desde la pasarela de pagos.
+ * @param {import('express').Response} res - Respuesta HTTP confirmando procesamiento o idempotencia.
+ * @returns {Promise<import('express').Response>}
  */
 const confirmPayment = async (req, res) => {
   try {
+    // Etapa 1: Asegurar columnas de pasarela y autenticar la firma/secreto del webhook
     await ensureTransactionGatewayColumns();
     const authCheck = verifyWebhookAuth(req);
     if (!authCheck.ok) {
       return res.status(authCheck.status).json({ error: authCheck.error });
     }
 
+    // Etapa 2: Extraer datos del evento; si es notificación oficial de MP, consultar detalle real vía API
     const eventType = String(req.body?.type || req.query?.type || '').trim().toLowerCase();
     const mpDataId = req.body?.data?.id || req.query?.['data.id'] || null;
 
@@ -602,6 +693,7 @@ const confirmPayment = async (req, res) => {
       resolvedContractId = mpPayment.contractId;
     }
 
+    // Etapa 3: Validar obligatoriedad de identificador/estado y pertenencia a la lista blanca
     if (!gatewayPaymentId || !normalizedStatus) {
       return res.status(400).json({ error: 'Faltan datos de la pasarela de pagos.' });
     }
@@ -612,6 +704,7 @@ const confirmPayment = async (req, res) => {
       });
     }
 
+    // Etapa 4: Localizar la transacción por `gateway_payment_id` o por último registro del `contract_id`
     let existingTxRes = await db.query(
       'SELECT id, contract_id, status, gateway_payment_id FROM transactions WHERE gateway_payment_id = $1 LIMIT 1',
       [gatewayPaymentId]
@@ -633,6 +726,7 @@ const confirmPayment = async (req, res) => {
       return res.status(404).json({ error: 'Transacción no encontrada.' });
     }
 
+    // Etapa 5: Garantizar idempotencia ante reintentos y bloquear regresiones inválidas de estado
     const currentTx = existingTxRes.rows[0];
     const currentStatus = String(currentTx.status || '').toLowerCase();
 
@@ -651,6 +745,7 @@ const confirmPayment = async (req, res) => {
       });
     }
 
+    // Etapa 6: Actualizar la transacción y propagar la transición correspondiente al contrato
     const updateTx = `
       UPDATE transactions
       SET status = $1::payment_status,
@@ -669,6 +764,9 @@ const confirmPayment = async (req, res) => {
     ]);
     const transaction = txResult.rows[0];
 
+    // Reglas de sincronización contrato <-> pago:
+    // - `approved` (fondos acreditados/en escrow) -> pasa contrato de 'pending' a 'in_progress'
+    // - `released` (fondos liberados al prestador) -> marca contrato como 'completed'
     if (normalizedStatus === 'approved') {
       await db.query(
         `UPDATE service_contracts
@@ -697,11 +795,18 @@ const confirmPayment = async (req, res) => {
 };
 
 /**
- * Registra la conformidad final del residente sobre un contrato (cierre formal + liberación escrow).
+ * Registra la conformidad final del residente titular sobre un contrato de servicio:
+ * marca el contrato como `'completed'` con timestamp y notas de cierre, y libera
+ * automáticamente los fondos en escrow pasando transacciones `'approved'` a `'released'`.
  * PATCH /api/v1/contracts/:id/complete
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.id` y `body.completion_notes` opcional.
+ * @param {import('express').Response} res - Respuesta HTTP con el contrato cerrado y cantidad de pagos liberados.
+ * @returns {Promise<import('express').Response>}
  */
 const completeContract = async (req, res) => {
   try {
+    // Etapa 1: Asegurar esquemas dependientes, validar `contractId` y normalizar notas de conformidad
     await Promise.all([ensureTransactionGatewayColumns(), ensureCompletionAndDisputesSchema()]);
     const contractId = Number(req.params.id);
     const userId = Number(req.user.userId);
@@ -714,6 +819,7 @@ const completeContract = async (req, res) => {
       return res.status(400).json({ error: 'ID de contrato inválido.' });
     }
 
+    // Etapa 2: Validar existencia, titularidad del residente (o superadmin) y reglas de estado
     const contractRes = await db.query(
       'SELECT id, owner_id, provider_id, status, completed_at, completion_notes FROM service_contracts WHERE id = $1 LIMIT 1',
       [contractId]
@@ -732,6 +838,7 @@ const completeContract = async (req, res) => {
       return res.status(400).json({ error: 'No se puede completar un contrato cancelado.' });
     }
 
+    // Respuesta idempotente si la conformidad ya había sido registrada previamente
     if (currentStatus === 'completed') {
       return res.status(200).json({
         message: `El contrato #${contractId} ya se encontraba completado con conformidad.`,
@@ -741,6 +848,7 @@ const completeContract = async (req, res) => {
       });
     }
 
+    // Etapa 3: Cerrar formalmente el contrato registrando `completed_at` y notas de conformidad
     const updatedRes = await db.query(
       `UPDATE service_contracts
        SET status = 'completed'::contract_status,
@@ -751,6 +859,7 @@ const completeContract = async (req, res) => {
       [completionNotes, contractId]
     );
 
+    // Etapa 4: Liberación de escrow — pasar todas las transacciones acreditadas ('approved') a 'released'
     const releasedTxRes = await db.query(
       `UPDATE transactions
        SET status = 'released'::payment_status,
@@ -772,11 +881,20 @@ const completeContract = async (req, res) => {
 };
 
 /**
- * Devuelve el Comprobante del Hogar auditable (contrato + compliance del prestador + pase QR + finanzas + disputas).
+ * Genera y devuelve el Comprobante del Hogar auditable para un contrato específico,
+ * consolidando los datos de la comunidad, el residente, el prestador (con estado de compliance
+ * y vigencias documentales), el pase QR enmascarado, el desglose financiero (real o proyectado
+ * si aún no tiene transacción) y el historial de disputas/garantías.
+ * Acceso permitido: residente titular, prestador asignado, `admin` o `superadmin`.
  * GET /api/v1/contracts/:id/receipt
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.id`.
+ * @param {import('express').Response} res - Respuesta HTTP con el objeto `receipt` auditable.
+ * @returns {Promise<import('express').Response>}
  */
 const getContractReceipt = async (req, res) => {
   try {
+    // Etapa 1: Asegurar esquemas dependientes y validar `contractId`
     await Promise.all([ensureTransactionGatewayColumns(), ensureCompletionAndDisputesSchema()]);
     const contractId = Number(req.params.id);
     const userId = Number(req.user.userId);
@@ -786,6 +904,7 @@ const getContractReceipt = async (req, res) => {
       return res.status(400).json({ error: 'ID de contrato inválido.' });
     }
 
+    // Etapa 2: Consultar vista integral del contrato (comunidad, titular, prestador/compliance y pase QR)
     const detailRes = await db.query(
       `SELECT
          sc.id,
@@ -834,6 +953,7 @@ const getContractReceipt = async (req, res) => {
       return res.status(404).json({ error: 'Contrato no encontrado.' });
     }
 
+    // Etapa 3: Validar permisos de lectura (solo participantes del contrato o equipo administrativo)
     const row = detailRes.rows[0];
     const isAuthorized =
       ['admin', 'superadmin'].includes(userRole) ||
@@ -844,6 +964,7 @@ const getContractReceipt = async (req, res) => {
       return res.status(403).json({ error: 'No tenés permisos para consultar el comprobante de este contrato.' });
     }
 
+    // Etapa 4: Consultar en paralelo la transacción más reciente y todas las disputas del contrato
     const [txRes, disputesRes] = await Promise.all([
       db.query(
         `SELECT id, gateway_provider, gateway_payment_id, gateway_mode,
@@ -863,6 +984,8 @@ const getContractReceipt = async (req, res) => {
       ),
     ]);
 
+    // Etapa 5: Calcular split de respaldo (para acuerdos sin transacción registrada), enmascarar token QR
+    // y ensamblar el Comprobante del Hogar con código identificador `TLK-REC-XXXXXX`
     const config = getGatewayConfig();
     const tx = txRes.rows[0] || null;
     const fallbackSplit = calculateSplit(Number(row.agreed_amount || 0), config.platformFeePercent);
@@ -945,11 +1068,18 @@ const getContractReceipt = async (req, res) => {
 };
 
 /**
- * Abre un reclamo / garantía post-servicio sobre un contrato.
+ * Abre un reclamo o solicitud de garantía post-servicio sobre un contrato existente.
+ * Solo puede iniciarlo el residente titular (o `superadmin`), admite hasta 5 URLs de evidencia
+ * y bloquea duplicados si ya existe una disputa activa (`open` o `in_review`) en el mismo contrato.
  * POST /api/v1/contracts/:id/dispute
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.id`, `reason`, `details` y `evidence_urls`.
+ * @param {import('express').Response} res - Respuesta HTTP con el reclamo creado (201).
+ * @returns {Promise<import('express').Response>}
  */
 const createContractDispute = async (req, res) => {
   try {
+    // Etapa 1: Asegurar esquema, sanitizar entradas (hasta 5 evidencias) y validar campos obligatorios
     await ensureCompletionAndDisputesSchema();
     const contractId = Number(req.params.id);
     const userId = Number(req.user.userId);
@@ -967,6 +1097,7 @@ const createContractDispute = async (req, res) => {
       return res.status(400).json({ error: 'Indicá el motivo y el detalle del reclamo o garantía.' });
     }
 
+    // Etapa 2: Validar existencia del contrato y que el solicitante sea su residente titular
     const contractRes = await db.query(
       'SELECT id, owner_id, status FROM service_contracts WHERE id = $1 LIMIT 1',
       [contractId]
@@ -978,6 +1109,7 @@ const createContractDispute = async (req, res) => {
       return res.status(403).json({ error: 'Solo el residente titular puede abrir un reclamo sobre este contrato.' });
     }
 
+    // Etapa 3: Prevenir disputas concurrentes sobre un mismo contrato (409 Conflict)
     const openCheck = await db.query(
       `SELECT id FROM public.service_disputes
        WHERE contract_id = $1 AND status IN ('open', 'in_review')
@@ -990,6 +1122,7 @@ const createContractDispute = async (req, res) => {
       });
     }
 
+    // Etapa 4: Persistir el reclamo en `service_disputes` con estado inicial `'open'`
     const insertRes = await db.query(
       `INSERT INTO public.service_disputes (
          contract_id, opened_by_user_id, reason, details, evidence_urls, status
@@ -1010,13 +1143,19 @@ const createContractDispute = async (req, res) => {
 };
 
 /**
- * Lista reclamos/disputas.
- * - admin / superadmin: ve todos los reclamos (con filtro opcional ?status=).
- * - owner / provider: ve los reclamos de los contratos donde participa.
+ * Lista reclamos/disputas de contratos priorizando casos activos (`open` -> `in_review` -> cerrados),
+ * con visibilidad segmentada según rol:
+ * - `admin` / `superadmin`: visualiza todos los reclamos del sistema (con filtro opcional `?status=`).
+ * - `owner` / `provider`: visualiza únicamente reclamos de contratos donde participa.
  * GET /api/v1/contracts/disputes
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con filtro opcional `query.status`.
+ * @param {import('express').Response} res - Respuesta HTTP con hasta 100 reclamos enriquecidos.
+ * @returns {Promise<import('express').Response>}
  */
 const listContractDisputes = async (req, res) => {
   try {
+    // Etapa 1: Construir condiciones dinámicas por rol y filtro de estado (`ALLOWED_DISPUTE_STATUSES`)
     await ensureCompletionAndDisputesSchema();
     const userId = Number(req.user.userId);
     const userRole = String(req.user.role || '').toLowerCase();
@@ -1037,6 +1176,7 @@ const listContractDisputes = async (req, res) => {
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
+    // Etapa 2: Consultar disputas con contexto de contrato, residente y prestador, priorizando casos abiertos
     const result = await db.query(
       `SELECT
          sd.id,
@@ -1081,11 +1221,18 @@ const listContractDisputes = async (req, res) => {
 };
 
 /**
- * Resuelve o actualiza el estado de un reclamo desde Operaciones (admin / superadmin).
+ * Actualiza el estado de un reclamo desde Operaciones (`admin` / `superadmin`):
+ * permite pasarlo a `'in_review'` o cerrarlo como `'resolved'` / `'rejected'` (exigiendo
+ * obligatoriamente `resolution_notes` y registrando auditoría `resolved_by` y `resolved_at`).
  * PATCH /api/v1/contracts/disputes/:disputeId/resolve
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.disputeId`, `status` y `resolution_notes`.
+ * @param {import('express').Response} res - Respuesta HTTP con la disputa actualizada.
+ * @returns {Promise<import('express').Response>}
  */
 const resolveContractDispute = async (req, res) => {
   try {
+    // Etapa 1: Validar ID de reclamo, transición permitida y obligatoriedad de nota en cierres definitivos
     await ensureCompletionAndDisputesSchema();
     const disputeId = Number(req.params.disputeId);
     const resolverId = Number(req.user.userId);
@@ -1106,6 +1253,7 @@ const resolveContractDispute = async (req, res) => {
       });
     }
 
+    // Etapa 2: Persistir estado, nota y sello de cierre (`resolved_by` / `resolved_at` solo si cierra)
     const isClosed = ['resolved', 'rejected'].includes(nextStatus);
     const updatedRes = await db.query(
       `UPDATE public.service_disputes
@@ -1133,11 +1281,19 @@ const resolveContractDispute = async (req, res) => {
 };
 
 /**
- * Lista todos los contratos asignados al prestador autenticado junto con resumen de ingresos netos (93%).
+ * Lista todos los contratos asignados a los perfiles del prestador autenticado junto con
+ * su estado de pago, disputas abiertas y un resumen consolidado (`summary`) de ingresos brutos
+ * y liquidaciones netas estimadas/reales (93% por defecto tras descontar el Take Rate de TrustLink).
  * GET /api/v1/contracts/provider
+ *
+ * @param {import('express').Request} req - Solicitud HTTP del prestador autenticado.
+ * @param {import('express').Response} res - Respuesta HTTP con `summary` financiero y detalle de contratos.
+ * @returns {Promise<import('express').Response>}
  */
 const listProviderContracts = async (req, res) => {
   try {
+    // Etapa 1: Consultar contratos del prestador con `LEFT JOIN LATERAL` hacia su última transacción
+    // y conteo de reclamos activos para el tablero de ingresos del prestador
     await Promise.all([ensureTransactionGatewayColumns(), ensureCompletionAndDisputesSchema()]);
     const userId = Number(req.user.userId);
     const config = getGatewayConfig();
@@ -1183,6 +1339,7 @@ const listProviderContracts = async (req, res) => {
       ORDER BY sc.created_at DESC, sc.id DESC;
     `;
 
+    // Etapa 2: Normalizar importes y proyectar split 7%/93% cuando aún no existe transacción registrada
     const result = await db.query(query, [userId]);
     const contracts = result.rows.map((row) => {
       const agreed = Number(row.agreed_amount || 0);
@@ -1196,6 +1353,7 @@ const listProviderContracts = async (req, res) => {
       };
     });
 
+    // Etapa 3: Consolidar KPIs operativos y totales brutos/netos (excluyendo contratos cancelados)
     const summary = contracts.reduce(
       (acc, c) => {
         acc.total_contracts += 1;

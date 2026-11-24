@@ -9,6 +9,7 @@
 const db = require('../../config/db');
 const { ensureEvolutionSchema } = require('../../config/ensureEvolutionSchema');
 
+// Catálogo oficial de planes B2C "Socio Verificado" disponibles para prestadores (duración, precio en ARS y beneficios)
 const MEMBERSHIP_PLANS = [
   {
     code: 'verified_monthly',
@@ -48,8 +49,16 @@ const MEMBERSHIP_PLANS = [
   },
 ];
 
+// Índice en memoria para búsqueda O(1) de metadatos de plan por `code`
 const PLANS_BY_CODE = Object.fromEntries(MEMBERSHIP_PLANS.map((p) => [p.code, p]));
 
+/**
+ * Asegura de forma idempotente el esquema evolutivo base y la tabla `public.provider_subscriptions`.
+ * Registra cada período de suscripción (plan, vigencia `starts_at`/`ends_at`, estado,
+ * identificador externo para futura integración con pasarela de pagos y notas operativas).
+ *
+ * @returns {Promise<void>}
+ */
 const ensureProviderSubscriptionsTable = async () => {
   await ensureEvolutionSchema();
   await db.query(`
@@ -70,9 +79,16 @@ const ensureProviderSubscriptionsTable = async () => {
 };
 
 /**
- * Formatea una fila de `provider_subscriptions` en un objeto de membresía consistente.
+ * Formatea una fila de `provider_subscriptions` en un snapshot de membresía consistente.
+ * Evalúa si la suscripción está realmente vigente comparando `ends_at > Date.now()`,
+ * degrada el estado efectivo a `'expired'` cuando una suscripción `active`/`trialing` ya venció
+ * y calcula los días restantes y la insignia correspondiente al plan.
+ *
+ * @param {Record<string, any>|null} row - Fila proveniente de `provider_subscriptions` o `null`.
+ * @returns {Record<string, any>} Snapshot normalizado de la membresía.
  */
 function formatMembershipSnapshot(row) {
+  // Si el prestador nunca tuvo suscripciones, devolver snapshot vacío consistente
   if (!row) {
     return {
       is_verified_member: false,
@@ -88,6 +104,7 @@ function formatMembershipSnapshot(row) {
     };
   }
 
+  // Calcular vigencia real contra reloj actual y determinar días restantes redondeados hacia arriba
   const nowMs = Date.now();
   const endsAtMs = row.ends_at ? new Date(row.ends_at).getTime() : 0;
   const rawStatus = String(row.status || '').toLowerCase();
@@ -120,10 +137,15 @@ function formatMembershipSnapshot(row) {
 }
 
 /**
- * Devuelve la membresía vigente (o la más reciente) de un usuario prestador.
+ * Devuelve la membresía vigente (o, en su defecto, la más reciente del historial)
+ * de un usuario prestador, ya formateada con `formatMembershipSnapshot`.
+ *
+ * @param {number|string} userId - Identificador del usuario prestador en `users`.
+ * @returns {Promise<Record<string, any>>} Snapshot de membresía del prestador.
  */
 const getActiveMembershipForUser = async (userId) => {
   await ensureProviderSubscriptionsTable();
+  // Prioriza registros activos/en prueba cuya fecha `ends_at` sea futura; si no hay, toma el último histórico
   const res = await db.query(
     `SELECT
        id, user_id, plan_code, status, starts_at, ends_at,
@@ -142,13 +164,19 @@ const getActiveMembershipForUser = async (userId) => {
 
 /**
  * GET /api/v1/billing/provider/me
- * Consulta el estado actual de la membresía "Socio Verificado" y los planes disponibles.
+ * Consulta el estado actual de la membresía "Socio Verificado", el catálogo completo de planes
+ * disponibles y el historial de las últimas 10 suscripciones del prestador autenticado.
+ *
+ * @param {import('express').Request} req - Petición HTTP autenticada del prestador.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ membership, plans, history }`.
+ * @returns {Promise<import('express').Response>}
  */
 const getMyProviderMembership = async (req, res) => {
   try {
     await ensureProviderSubscriptionsTable();
     const userId = Number(req.user.userId);
 
+    // Ejecutar en paralelo el snapshot vigente y el historial reciente (máx. 10 registros)
     const [membership, historyRes] = await Promise.all([
       getActiveMembershipForUser(userId),
       db.query(
@@ -175,10 +203,17 @@ const getMyProviderMembership = async (req, res) => {
 /**
  * POST /api/v1/billing/provider/subscribe
  * Activa o renueva una membresía "Socio Verificado" para el prestador autenticado.
+ * Si el prestador ya posee días vigentes, el nuevo período se acumula a partir de `ends_at`
+ * para no perder tiempo previamente acreditado.
  * (En piloto/MVP acredita el período inmediatamente y queda listo para conectar Mercado Pago Suscripciones).
+ *
+ * @param {import('express').Request} req - Petición HTTP con `{ plan_code?, auto_renew? }`.
+ * @param {import('express').Response} res - Respuesta HTTP `201` con la membresía activada.
+ * @returns {Promise<import('express').Response>}
  */
 const subscribeProviderMembership = async (req, res) => {
   try {
+    // 1. Asegurar tabla y validar que el `plan_code` solicitado exista en el catálogo
     await ensureProviderSubscriptionsTable();
     const userId = Number(req.user.userId);
     const planCode = String(req.body?.plan_code || 'verified_monthly').trim();
@@ -191,6 +226,7 @@ const subscribeProviderMembership = async (req, res) => {
       });
     }
 
+    // 2. Consultar suscripción vigente actual para acumular días desde su fecha de fin (`ends_at`)
     const currentRes = await db.query(
       `SELECT id, ends_at
        FROM public.provider_subscriptions
@@ -209,7 +245,7 @@ const subscribeProviderMembership = async (req, res) => {
         : now;
     const nextEndsAt = new Date(baseStart.getTime() + plan.duration_days * 24 * 60 * 60 * 1000);
 
-    // Marcamos suscripciones activas previas como reemplazadas para conservar historial limpio
+    // 3. Marcar suscripciones activas previas como reemplazadas (`superseded`) para conservar historial limpio
     await db.query(
       `UPDATE public.provider_subscriptions
        SET status = 'superseded', updated_at = NOW()
@@ -217,6 +253,7 @@ const subscribeProviderMembership = async (req, res) => {
       [userId]
     );
 
+    // 4. Insertar nuevo período activo con referencia externa interna y devolver snapshot formateado
     const externalSubId = `TLK-SUB-${userId}-${Date.now()}`;
     const insertRes = await db.query(
       `INSERT INTO public.provider_subscriptions (
@@ -251,10 +288,17 @@ const subscribeProviderMembership = async (req, res) => {
 
 /**
  * PATCH /api/v1/billing/provider/:userId
- * Administración centralizada por Superadmin: activar, extender o cancelar la membresía de un prestador.
+ * Administración centralizada por Superadmin: permite activar, extender o cancelar/revocar
+ * la membresía "Socio Verificado" de un prestador específico con duración personalizada (1 a 730 días)
+ * y registro de notas de auditoría operativa.
+ *
+ * @param {import('express').Request} req - Petición HTTP con `:userId` y `{ action?, plan_code?, status?, days?, notes? }`.
+ * @param {import('express').Response} res - Respuesta HTTP con el estado actualizado de la membresía.
+ * @returns {Promise<import('express').Response>}
  */
 const adminManageProviderMembership = async (req, res) => {
   try {
+    // 1. Asegurar tabla, validar `userId` numérico positivo y comprobar existencia del usuario
     await ensureProviderSubscriptionsTable();
     const targetUserId = Number(req.params.userId);
     if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
@@ -274,6 +318,7 @@ const adminManageProviderMembership = async (req, res) => {
     const rawDays = Number(req.body?.days);
     const notes = req.body?.notes ? String(req.body.notes).trim() : null;
 
+    // 2. Rama de cancelación/revocación: desactiva renovación y recorta `ends_at` al instante actual
     if (action === 'cancel' || action === 'revoke') {
       await db.query(
         `UPDATE public.provider_subscriptions
@@ -293,6 +338,7 @@ const adminManageProviderMembership = async (req, res) => {
       });
     }
 
+    // 3. Rama de activación/extensión: resolver plan, duración acotada (1..730 días) y estado válido
     const plan = PLANS_BY_CODE[planCode] || PLANS_BY_CODE.verified_monthly;
     const durationDays =
       Number.isInteger(rawDays) && rawDays >= 1 && rawDays <= 730
@@ -302,6 +348,7 @@ const adminManageProviderMembership = async (req, res) => {
       ? requestedStatus
       : 'active';
 
+    // Consultar suscripción vigente para decidir si se acumula tiempo (`extend`) o se reinicia desde hoy
     const currentRes = await db.query(
       `SELECT id, ends_at
        FROM public.provider_subscriptions
@@ -320,6 +367,7 @@ const adminManageProviderMembership = async (req, res) => {
         : now;
     const endsAt = new Date(baseDate.getTime() + durationDays * 24 * 60 * 60 * 1000);
 
+    // 4. Reemplazar registros activos previos e insertar la nueva suscripción gestionada por Ops
     await db.query(
       `UPDATE public.provider_subscriptions
        SET status = 'superseded', updated_at = NOW()
@@ -359,11 +407,17 @@ const adminManageProviderMembership = async (req, res) => {
 
 /**
  * GET /api/v1/billing/providers
- * Resumen global de suscripciones "Socio Verificado" para Superadmin.
+ * Devuelve el resumen global de suscripciones "Socio Verificado" (hasta 200 registros)
+ * para el panel de Superadmin, ordenando primero los miembros actualmente vigentes.
+ *
+ * @param {import('express').Request} req - Petición HTTP autenticada de Superadmin.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ summary, plans, subscriptions }`.
+ * @returns {Promise<import('express').Response>}
  */
 const listProviderMembershipsForOps = async (req, res) => {
   try {
     await ensureProviderSubscriptionsTable();
+    // Cruza suscripciones con datos de usuario y calcula en SQL si la membresía está vigente hoy
     const result = await db.query(`
       SELECT
         ps.id,
@@ -384,6 +438,7 @@ const listProviderMembershipsForOps = async (req, res) => {
       LIMIT 200
     `);
 
+    // Calcular total de miembros activos sobre el conjunto consultado para KPIs del panel Ops
     const activeCount = result.rows.filter((r) => r.is_verified_member).length;
     return res.status(200).json({
       summary: {

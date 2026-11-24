@@ -1,6 +1,8 @@
 /**
  * @file auth.routes.js
- * @description Enrutador para autenticación y gestión maestra de usuarios privilegiados.
+ * @description Enrutador montado en `/api/v1/auth` para catálogo público de comunidades,
+ * registro, inicio de sesión, recuperación de contraseña con rate limiting y gestión
+ * maestra de usuarios privilegiados (`admin`, `security`, `superadmin`).
  * @location /trustlink-backend/src/modules/auth/auth.routes.js
  */
 
@@ -20,6 +22,10 @@ const { createRateLimiter } = require('../../middlewares/security.middleware');
 
 const router = Router();
 
+// ============================================================================
+// LIMITADORES DE TASA (PROTECCIÓN ANTI FUERZA BRUTA POR IP)
+// ============================================================================
+// Máximo 25 intentos de login cada 15 minutos por IP
 const loginLimiter = createRateLimiter({
   windowMs: 15 * 60 * 1000,
   max: 25,
@@ -27,6 +33,7 @@ const loginLimiter = createRateLimiter({
   message: 'Demasiados intentos de inicio de sesión. Esperá unos minutos.',
 });
 
+// Máximo 15 registros cada 15 minutos por IP
 const registerLimiter = createRateLimiter({
   windowMs: 15 * 60 * 1000,
   max: 15,
@@ -34,6 +41,7 @@ const registerLimiter = createRateLimiter({
   message: 'Demasiados intentos de registro desde esta dirección. Esperá unos minutos.',
 });
 
+// Máximo 10 solicitudes de recuperación/restablecimiento cada 15 minutos por IP
 const resetLimiter = createRateLimiter({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -41,16 +49,22 @@ const resetLimiter = createRateLimiter({
   message: 'Demasiadas solicitudes de recuperación de contraseña. Esperá unos minutos.',
 });
 
-// Catálogo público de comunidades activas para el formulario de registro
+// ============================================================================
+// ENDPOINTS PÚBLICOS DE ONBOARDING Y AUTENTICACIÓN
+// ============================================================================
+// Catálogo público de comunidades activas para el selector del formulario de registro
 router.get('/countries', listPublicCountries);
 
-// Registro público (solo roles no administrativos), inicio de sesión y recuperación
+// Registro público (solo roles estándar), inicio de sesión JWT y flujo de recuperación
 router.post('/register', registerLimiter, register);
 router.post('/login', loginLimiter, login);
 router.post('/forgot-password', resetLimiter, forgotPassword);
 router.post('/reset-password', resetLimiter, resetPassword);
 
-// Gestión de usuarios privilegiados (Exclusivo superadmin)
+// ============================================================================
+// GESTIÓN DE USUARIOS PRIVILEGIADOS (Exclusivo Superadmin)
+// ============================================================================
+// Alta, listado y actualización de cuentas administrativas y de seguridad perimetral
 router.get('/users/privileged', verifyToken, verifyRole(['superadmin']), getPrivilegedUsers);
 router.post('/users/privileged', verifyToken, verifyRole(['superadmin']), createPrivilegedUser);
 router.patch('/users/privileged/:id', verifyToken, verifyRole(['superadmin']), updatePrivilegedUser);

@@ -1,10 +1,11 @@
 /**
  * @file providers.controller.js
  * @description Controlador completo del módulo de prestadores en TrustLink.
- * Gestiona credenciales/especialidades, historial de versiones documentales sin sobrescribir
- * registros anteriores, flota vehicular con seguro automotor, auditoría central,
- * directorio unificado para residentes (incluyendo la flota vehicular de cada prestador)
- * y suspensiones operativas locales.
+ * Gestiona perfiles de compliance y especialidades (con control de visibilidad en el directorio),
+ * historial inmutable de versiones documentales sin sobrescribir registros previos, flota vehicular
+ * con seguro automotor, cuadrilla de ayudantes con póliza ART, alertas proactivas de vencimiento,
+ * auditoría centralizada para Ops, directorio público unificado con ranking Socio Verificado
+ * y suspensiones operativas locales por comunidad.
  * @location /trustlink-backend/src/modules/providers/providers.controller.js
  */
 
@@ -17,8 +18,12 @@ const {
 } = require('../billing/billing.controller');
 
 /**
- * Asegura la existencia de la tabla provider_document_versions de forma idempotente
- * para conservar todas las versiones cargadas (vigentes, vencidas o históricas).
+ * Asegura de forma idempotente la existencia de la tabla `provider_document_versions`.
+ * Permite almacenar un historial append-only de todas las versiones documentales cargadas
+ * (antecedentes penales `'criminal'` y pólizas `'insurance'`), conservando registros
+ * vigentes, vencidos e históricos para auditoría.
+ *
+ * @returns {Promise<void>}
  */
 const ensureDocumentVersionsTable = async () => {
   await db.query(`
@@ -37,7 +42,11 @@ const ensureDocumentVersionsTable = async () => {
 };
 
 /**
- * Asegura que provider_vehicles cuente con los campos de seguro vehicular y vigencia.
+ * Asegura de forma idempotente que la tabla `provider_vehicles` cuente con las columnas
+ * necesarias para registrar la póliza de seguro automotor (`vehicle_insurance_url`)
+ * y su ventana de vigencia (`vehicle_insurance_from`, `vehicle_insurance_expiry`).
+ *
+ * @returns {Promise<void>}
  */
 const ensureVehicleInsuranceColumns = async () => {
   await db.query(`
@@ -49,7 +58,13 @@ const ensureVehicleInsuranceColumns = async () => {
 };
 
 /**
- * Asegura que provider_employees cuente con columnas para ayudantes/cuadrilla directa.
+ * Asegura de forma idempotente la tabla `provider_employees` y sus columnas extendidas
+ * para gestionar ayudantes / integrantes de cuadrilla directa.
+ * Soporta tanto ayudantes vinculados a un usuario registrado (`employee_user_id`)
+ * como altas directas con datos nominales (`full_name`, `dni`, `phone`, `role_label`),
+ * póliza ART y bandera de actividad (`is_active`).
+ *
+ * @returns {Promise<void>}
  */
 const ensureProviderEmployeesColumns = async () => {
   await db.query(`
@@ -73,7 +88,19 @@ const ensureProviderEmployeesColumns = async () => {
 };
 
 /**
- * Inserta una versión documental en el historial sin eliminar versiones previas.
+ * Inserta una nueva versión documental en `provider_document_versions` sin modificar ni eliminar
+ * versiones anteriores, garantizando trazabilidad histórica de compliance.
+ * Si `documentUrl` viene vacío o solo con espacios, omite el registro y devuelve `null`.
+ *
+ * @param {Object} params - Datos de la versión documental a persistir.
+ * @param {number} params.userId - ID del usuario prestador propietario del documento.
+ * @param {number|null} [params.providerId=null] - ID del perfil/especialidad asociado en `providers`.
+ * @param {'criminal'|'insurance'} params.docType - Tipo de documento (`criminal` o `insurance`).
+ * @param {string} params.documentUrl - URL o referencia del archivo respaldatorio.
+ * @param {string|null} [params.validFrom=null] - Fecha de inicio de vigencia (YYYY-MM-DD).
+ * @param {string|null} [params.validTo=null] - Fecha de vencimiento (YYYY-MM-DD).
+ * @param {string} [params.status='pending'] - Estado inicial de revisión documental.
+ * @returns {Promise<Object|null>} Registro insertado o `null` si no se proveyó URL.
  */
 const recordDocumentVersion = async ({
   userId,
@@ -117,11 +144,18 @@ const recordDocumentVersion = async ({
 };
 
 /**
- * Registra un nuevo perfil/especialidad para el prestador y guarda su versión documental
- * en el historial sin pisar cargas anteriores.
+ * Registra un nuevo perfil/especialidad para el prestador autenticado en estado `'pending'`
+ * y guarda las versiones documentales asociadas (antecedentes y/o seguro ART) en el historial
+ * sin sobrescribir cargas anteriores.
+ * POST /api/v1/providers/profile
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con usuario autenticado y datos de especialidad/documentación.
+ * @param {import('express').Response} res - Respuesta HTTP con el perfil creado (201).
+ * @returns {Promise<import('express').Response>}
  */
 const updateProviderProfile = async (req, res) => {
   try {
+    // Etapa 1: Extracción y validación de la especialidad obligatoria
     const userId = req.user.userId;
     const {
       specialty,
@@ -137,6 +171,7 @@ const updateProviderProfile = async (req, res) => {
       return res.status(400).json({ error: 'La especialidad del prestador es obligatoria.' });
     }
 
+    // Etapa 2: Inserción del nuevo perfil en `providers` con estado inicial 'pending' para auditoría Ops
     const insertQuery = `
       INSERT INTO providers (
         user_id,
@@ -173,6 +208,7 @@ const updateProviderProfile = async (req, res) => {
     const providerResult = await db.query(insertQuery, values);
     const createdProvider = providerResult.rows[0];
 
+    // Etapa 3: Registro append-only de versiones documentales (antecedentes y póliza ART) si fueron informadas
     if (criminal_record_url || criminal_record_expiry) {
       await recordDocumentVersion({
         userId,
@@ -208,11 +244,18 @@ const updateProviderProfile = async (req, res) => {
 };
 
 /**
- * Edita un registro específico de compliance por su ID de provider
- * y registra la nueva versión documental en el historial sin borrar las anteriores.
+ * Edita un perfil/especialidad existente perteneciente al prestador autenticado (`id` + `user_id`),
+ * devuelve su estado de compliance a `'pending'` para una nueva auditoría y agrega al historial
+ * las nuevas versiones documentales sin borrar las anteriores.
+ * PUT /api/v1/providers/profile/:id
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.id` y campos a actualizar.
+ * @param {import('express').Response} res - Respuesta HTTP con el perfil actualizado.
+ * @returns {Promise<import('express').Response>}
  */
 const editProviderProfile = async (req, res) => {
   try {
+    // Etapa 1: Lectura de parámetros y actualización parcial (COALESCE) restringida al usuario dueño
     const userId = req.user.userId;
     const { id } = req.params;
     const {
@@ -225,6 +268,7 @@ const editProviderProfile = async (req, res) => {
       insurance_expiry
     } = req.body;
 
+    // Regla de compliance: cualquier modificación documental o de especialidad reinicia `status = 'pending'`
     const updateQuery = `
       UPDATE providers
       SET specialty = COALESCE($1, specialty),
@@ -257,12 +301,14 @@ const editProviderProfile = async (req, res) => {
       userId
     ]);
 
+    // Etapa 2: Validar existencia y propiedad del perfil modificado
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Perfil de prestador no encontrado o no autorizado.' });
     }
 
     const updatedProvider = result.rows[0];
 
+    // Etapa 3: Persistir nuevas versiones en el historial documental si se actualizaron URLs o vigencias
     if (criminal_record_url || criminal_record_expiry) {
       await recordDocumentVersion({
         userId,
@@ -298,10 +344,18 @@ const editProviderProfile = async (req, res) => {
 };
 
 /**
- * Agrega un vehículo asociado al prestador logueado, incluyendo su seguro automotor y fechas de vigencia.
+ * Registra un nuevo vehículo en la flota del prestador autenticado, incluyendo los datos
+ * de su seguro automotor y fechas de vigencia. Si el usuario aún no posee un registro en
+ * `providers`, crea automáticamente un perfil base `'Servicios Generales'` en estado `'pending'`.
+ * POST /api/v1/providers/vehicles
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con datos del vehículo y póliza automotor.
+ * @param {import('express').Response} res - Respuesta HTTP con el vehículo creado (201).
+ * @returns {Promise<import('express').Response>}
  */
 const addVehicle = async (req, res) => {
   try {
+    // Etapa 1: Asegurar columnas de seguro vehicular y validar patente obligatoria
     await ensureVehicleInsuranceColumns();
 
     const userId = req.user.userId;
@@ -320,6 +374,7 @@ const addVehicle = async (req, res) => {
       return res.status(400).json({ error: 'La patente del vehículo es obligatoria.' });
     }
 
+    // Etapa 2: Resolver el `provider_id` más reciente del usuario o crear un perfil base si no existe
     const providerRes = await db.query(
       'SELECT id FROM providers WHERE user_id = $1 ORDER BY id DESC LIMIT 1',
       [userId]
@@ -340,6 +395,7 @@ const addVehicle = async (req, res) => {
       providerId = providerRes.rows[0].id;
     }
 
+    // Etapa 3: Insertar el vehículo en `provider_vehicles` normalizando patente en mayúsculas
     const vehicleQuery = `
       INSERT INTO provider_vehicles (
         provider_id,
@@ -390,10 +446,18 @@ const addVehicle = async (req, res) => {
 };
 
 /**
- * Edita un vehículo existente del prestador, incluyendo seguro automotor y fechas de vigencia.
+ * Actualiza los datos de un vehículo existente de la flota del prestador autenticado,
+ * incluyendo seguro automotor y fechas de vigencia. Valida propiedad verificando que el vehículo
+ * pertenezca a alguno de los perfiles (`provider_id`) del usuario logueado.
+ * PUT /api/v1/providers/vehicles/:id
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.id` y campos del vehículo.
+ * @param {import('express').Response} res - Respuesta HTTP con el vehículo actualizado.
+ * @returns {Promise<import('express').Response>}
  */
 const editVehicle = async (req, res) => {
   try {
+    // Etapa 1: Asegurar columnas de seguro y validar que la patente no quede vacía si se informó
     await ensureVehicleInsuranceColumns();
 
     const userId = req.user.userId;
@@ -413,12 +477,14 @@ const editVehicle = async (req, res) => {
       return res.status(400).json({ error: 'La patente del vehículo no puede quedar vacía.' });
     }
 
+    // Etapa 2: Obtener todos los perfiles del prestador para restringir la edición solo a su flota
     const providerRes = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
     if (providerRes.rows.length === 0) {
       return res.status(404).json({ error: 'Prestador no encontrado.' });
     }
     const providerIds = providerRes.rows.map((p) => p.id);
 
+    // Etapa 3: Actualizar vehículo (COALESCE en datos básicos; reemplazo directo en campos de seguro)
     const updateQuery = `
       UPDATE provider_vehicles
       SET vehicle_type = COALESCE($1, vehicle_type),
@@ -472,14 +538,21 @@ const editVehicle = async (req, res) => {
 };
 
 /**
- * Calcula alertas de vencimiento (vencidos o próximos a vencer dentro de `windowDays` días)
- * para documentación personal, flota vehicular y cuadrilla de ayudantes.
+ * Evalúa una fecha de vencimiento respecto al día calendario actual y determina
+ * si requiere alerta por documento vencido (`expired`) o próximo a vencer (`expiring_soon`)
+ * dentro de la ventana de anticipación configurada.
+ *
+ * @param {string|Date|null|undefined} rawDate - Fecha de vencimiento a evaluar.
+ * @param {number} [windowDays=30] - Ventana en días hacia adelante para alertar vencimientos próximos.
+ * @returns {{ severity: 'expired'|'expiring_soon', days_remaining: number, expiry_date: string }|null}
+ *          Objeto de evaluación de alerta o `null` si la fecha es inválida o aún tiene vigencia holgada.
  */
 const evaluateExpiryDate = (rawDate, windowDays = 30) => {
   if (!rawDate) return null;
   const parsed = new Date(rawDate);
   if (Number.isNaN(parsed.getTime())) return null;
 
+  // Normaliza ambas fechas a medianoche local para calcular la diferencia exacta en días calendario
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const target = new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
@@ -502,6 +575,19 @@ const evaluateExpiryDate = (rawDate, windowDays = 30) => {
   return null;
 };
 
+/**
+ * Consolida todas las alertas proactivas de vencimiento (vencidos y próximos a vencer)
+ * a partir de perfiles/especialidades, flota vehicular y cuadrilla activa de ayudantes,
+ * ordenándolas de mayor a menor urgencia (`days_remaining` ascendente).
+ *
+ * @param {Object} params - Conjuntos de entidades y parámetros de evaluación.
+ * @param {Array<Object>} [params.providers=[]] - Perfiles de prestador con fechas de antecedentes y ART.
+ * @param {Array<Object>} [params.vehicles=[]] - Vehículos con fecha de vencimiento de seguro automotor.
+ * @param {Array<Object>} [params.employees=[]] - Ayudantes de cuadrilla con fecha de vencimiento de ART.
+ * @param {number} [params.windowDays=30] - Cantidad de días de anticipación para alertas preventivas.
+ * @param {Object<number, Object>} [params.providerMetaById={}] - Mapa auxiliar de contacto (nombre, teléfono, email) por `provider_id`.
+ * @returns {Array<Object>} Lista de alertas normalizadas y ordenadas por urgencia.
+ */
 const buildProviderExpiryAlerts = ({
   providers = [],
   vehicles = [],
@@ -511,6 +597,7 @@ const buildProviderExpiryAlerts = ({
 }) => {
   const alerts = [];
 
+  // Etapa 1: Evaluar documentación personal de cada perfil (Antecedentes Penales y Póliza ART)
   providers.forEach((p) => {
     const meta = providerMetaById[p.id] || {};
     const ownerLabel = meta.provider_name || p.specialty || `Perfil #${p.id}`;
@@ -548,6 +635,7 @@ const buildProviderExpiryAlerts = ({
     }
   });
 
+  // Etapa 2: Evaluar vencimientos de seguro automotor en toda la flota vehicular registrada
   vehicles.forEach((v) => {
     const meta = providerMetaById[v.provider_id] || {};
     const vehEval = evaluateExpiryDate(v.vehicle_insurance_expiry, windowDays);
@@ -567,6 +655,7 @@ const buildProviderExpiryAlerts = ({
     }
   });
 
+  // Etapa 3: Evaluar vencimientos de póliza ART solo para ayudantes activos de la cuadrilla
   employees
     .filter((e) => e.is_active !== false)
     .forEach((emp) => {
@@ -588,20 +677,24 @@ const buildProviderExpiryAlerts = ({
       }
     });
 
+  // Etapa 4: Ordenar de más crítico (negativos / vencidos hace más días) a menos urgente
   alerts.sort((a, b) => a.days_remaining - b.days_remaining);
   return alerts;
 };
 
 /**
- * Obtiene especialidades, historial completo de versiones documentales
- * y flota vehicular del prestador logueado.
- */
-/**
- * Activa u oculta una especialidad en el directorio de residentes sin modificar su estado de compliance.
+ * Activa u oculta temporalmente una especialidad del prestador en el directorio público
+ * de residentes (`is_visible_in_directory`), sin alterar su estado de compliance ni requerir
+ * una nueva auditoría documental.
  * PATCH /api/v1/providers/profile/:id/visibility
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.id` y booleano opcional `body.is_visible_in_directory`.
+ * @param {import('express').Response} res - Respuesta HTTP con el nuevo estado de visibilidad.
+ * @returns {Promise<import('express').Response>}
  */
 const toggleSpecialtyVisibility = async (req, res) => {
   try {
+    // Etapa 1: Asegurar columna de visibilidad y validar ID numérico de especialidad
     await ensureEvolutionSchema();
     const userId = Number(req.user.userId);
     const providerId = Number(req.params.id);
@@ -609,6 +702,7 @@ const toggleSpecialtyVisibility = async (req, res) => {
       return res.status(400).json({ error: 'ID de especialidad inválido.' });
     }
 
+    // Etapa 2: Verificar existencia y propiedad de la especialidad para el usuario autenticado
     const existing = await db.query(
       `SELECT id, specialty, status, COALESCE(is_visible_in_directory, TRUE) AS is_visible_in_directory
        FROM providers
@@ -620,11 +714,13 @@ const toggleSpecialtyVisibility = async (req, res) => {
       return res.status(404).json({ error: 'Especialidad no encontrada o sin permisos.' });
     }
 
+    // Si el cliente envía un booleano explícito se aplica; en caso contrario se invierte el valor actual
     const nextVisible =
       typeof req.body?.is_visible_in_directory === 'boolean'
         ? req.body.is_visible_in_directory
         : !existing.rows[0].is_visible_in_directory;
 
+    // Etapa 3: Persistir el nuevo estado de visibilidad manteniendo intacto el `status` de compliance
     const updated = await db.query(
       `UPDATE providers
        SET is_visible_in_directory = $1
@@ -645,13 +741,26 @@ const toggleSpecialtyVisibility = async (req, res) => {
   }
 };
 
+/**
+ * Obtiene la vista consolidada del portal del prestador autenticado:
+ * todas sus especialidades/perfiles (con estado de compliance y visibilidad),
+ * el historial completo de versiones documentales, su flota vehicular, su cuadrilla de ayudantes,
+ * las alertas proactivas de vencimiento a 30 días y su membresía Socio Verificado activa.
+ * GET /api/v1/providers/me
+ *
+ * @param {import('express').Request} req - Solicitud HTTP del prestador autenticado.
+ * @param {import('express').Response} res - Respuesta HTTP con el perfil integral y planes disponibles.
+ * @returns {Promise<import('express').Response>}
+ */
 const getMyProviderProfile = async (req, res) => {
   try {
+    // Etapa 1: Asegurar de forma idempotente todas las tablas y columnas requeridas por el portal
     await ensureEvolutionSchema();
     await ensureDocumentVersionsTable();
     await ensureVehicleInsuranceColumns();
     await ensureProviderEmployeesColumns();
 
+    // Etapa 2: Consultar perfiles/especialidades e historial inmutable de versiones documentales del usuario
     const userId = req.user.userId;
     const providersRes = await db.query(
       `
@@ -691,10 +800,12 @@ const getMyProviderProfile = async (req, res) => {
       [userId]
     );
 
+    // Etapa 3: Si el prestador tiene al menos un perfil, cargar en paralelo flota vehicular y cuadrilla de ayudantes
     let vehicles = [];
     let employees = [];
     if (providersRes.rows.length > 0) {
       const providerIds = providersRes.rows.map((p) => p.id);
+      // Para ayudantes vinculados a un usuario registrado, `COALESCE` completa nombre/DNI/teléfono desde `users`
       const [vehiclesRes, employeesRes] = await Promise.all([
         db.query(
           `
@@ -742,6 +853,7 @@ const getMyProviderProfile = async (req, res) => {
       employees = employeesRes.rows;
     }
 
+    // Etapa 4: Calcular alertas de vencimiento (ventana 30 días) y consultar membresía activa en paralelo
     const [expiryAlerts, membership] = await Promise.all([
       Promise.resolve(
         buildProviderExpiryAlerts({
@@ -770,11 +882,30 @@ const getMyProviderProfile = async (req, res) => {
 };
 
 /**
- * Lista TODOS los prestadores registrados para auditoría centralizada en Ops TrustLink.
+ * Lista todos los prestadores registrados (incluyendo cuentas habilitadas como prestador
+ * que aún no completaron perfil, etiquetadas como `'sin_perfil'`) para el panel de
+ * auditoría centralizada de Operaciones TrustLink.
+ * GET /api/v1/providers/ops/all
+ *
+ * @param {import('express').Request} req - Solicitud HTTP de usuario Ops/Superadmin.
+ * @param {import('express').Response} res - Respuesta HTTP con la nómina priorizada de prestadores.
+ * @returns {Promise<import('express').Response>}
  */
 const listAllProvidersForOps = async (req, res) => {
   try {
     await ensureProviderSubscriptionsTable();
+
+    /*
+     * Consulta consolidada para auditoría Ops:
+     * - LEFT JOIN `providers`: conserva usuarios con rol 'provider' o flag `can_use_provider = TRUE`
+     *   aun cuando todavía no hayan dado de alta ninguna especialidad (`status = 'sin_perfil'`).
+     * - LEFT JOIN LATERAL `provider_subscriptions`: adjunta la suscripción vigente (o más reciente)
+     *   para mostrar si es Socio Verificado (`is_verified_member`), su tier y vencimiento.
+     * - WHERE: excluye cuentas puramente internas (`superadmin`, `admin`, `security`) que no tengan
+     *   un perfil explícito en `providers`.
+     * - ORDER BY: prioriza pendientes de revisión (`pending`), luego aprobados, rechazados y sin perfil;
+     *   desempata por membresía verificada y calificación promedio.
+     */
     const query = `
       SELECT
         u.id AS user_id,
@@ -836,10 +967,18 @@ const listAllProvidersForOps = async (req, res) => {
 };
 
 /**
- * Actualiza el estado de compliance de un prestador y sincroniza versiones documentales asociadas.
+ * Actualiza el estado global de compliance (`approved`, `rejected` o `pending`) de un prestador
+ * desde Operaciones TrustLink y sincroniza ese mismo estado en todas sus versiones documentales
+ * registradas en `provider_document_versions`.
+ * PATCH /api/v1/providers/compliance
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `provider_id` o `user_id` y el nuevo `status`.
+ * @param {import('express').Response} res - Respuesta HTTP con el perfil actualizado.
+ * @returns {Promise<import('express').Response>}
  */
 const updateComplianceStatus = async (req, res) => {
   try {
+    // Etapa 1: Asegurar tabla de historial documental y validar que el estado solicitado sea permitido
     await ensureDocumentVersionsTable();
 
     const { provider_id, user_id, status } = req.body;
@@ -847,6 +986,7 @@ const updateComplianceStatus = async (req, res) => {
       return res.status(400).json({ error: 'Estado de compliance inválido.' });
     }
 
+    // Etapa 2: Resolver `targetProviderId` cuando Ops actúa por `user_id` (crea perfil base si faltaba)
     let targetProviderId = provider_id;
     if (!targetProviderId && user_id) {
       const existing = await db.query(
@@ -868,6 +1008,7 @@ const updateComplianceStatus = async (req, res) => {
       }
     }
 
+    // Etapa 3: Actualizar el estado en `providers` y propagarlo a `provider_document_versions`
     const updateQuery = `
       UPDATE providers
       SET status = $1
@@ -901,16 +1042,40 @@ const updateComplianceStatus = async (req, res) => {
 };
 
 /**
- * Lista los prestadores verificados unificados por usuario (u.id) para el Portal Residente,
- * incluyendo la flota vehicular registrada (`vehicles`) de cada prestador para seleccionarla al emitir QR.
+ * Lista los prestadores verificados y visibles en el directorio público del Portal Residente,
+ * unificados por usuario (`u.id`) y rankeados priorizando miembros Socio Verificado (`verified_pro`),
+ * luego membresía activa y finalmente mejor calificación promedio (`rating_avg`).
+ * Incluye flota vehicular (`vehicles`) y ayudantes activos (`employees`) listos para emitir pases QR.
+ * GET /api/v1/providers/verified
+ *
+ * @param {import('express').Request} req - Solicitud HTTP del residente autenticado.
+ * @param {import('express').Response} res - Respuesta HTTP con el directorio unificado y ordenado.
+ * @returns {Promise<import('express').Response>}
  */
 const listVerifiedProviders = async (req, res) => {
   try {
+    // Etapa 1: Asegurar de forma idempotente todas las tablas/columnas consultadas por el directorio
     await ensureEvolutionSchema();
     await ensureProviderSubscriptionsTable();
     await ensureVehicleInsuranceColumns();
     await ensureProviderEmployeesColumns();
 
+    /*
+     * Etapa 2: Consulta consolidada del directorio público con ranking Socio Verificado:
+     * 1) CTE `approved_profiles`: selecciona únicamente perfiles con compliance aprobado (`approved`),
+     *    visibles en directorio (`is_visible_in_directory = TRUE`), usuario activo (`is_active = TRUE`)
+     *    y permiso de prestador habilitado (`can_use_provider = TRUE`); además cuenta los contratos
+     *    (`service_contracts`) ejecutados por cada perfil.
+     * 2) Agregación principal (`GROUP BY ap.user_id`): unifica las distintas especialidades de una misma
+     *    persona en `specialties` / `specialties_label`, promedia su `rating_avg`, suma `total_jobs`
+     *    y calcula `has_expired_docs` si alguna credencial personal ya venció respecto a `CURRENT_DATE`.
+     * 3) Subconsultas `JSON_AGG`: embebe toda la flota vehicular (`vehicles`) y la cuadrilla activa
+     *    (`employees`, resolviendo nombre/DNI desde `users` si aplica) para selección al generar QR.
+     * 4) `LEFT JOIN LATERAL` sobre `provider_subscriptions`: detecta membresía activa o en prueba
+     *    (`status IN ('active', 'trialing') AND ends_at > NOW()`), priorizando el plan `verified_pro`.
+     * 5) Ranking `ORDER BY`: 1° Socio Verificado activo, 2° plan `verified_pro`, 3° mayor rating promedio,
+     *    4° `user_id` ascendente como desempate determinista.
+     */
     const query = `
       WITH approved_profiles AS (
         SELECT
@@ -1043,7 +1208,11 @@ const listVerifiedProviders = async (req, res) => {
 };
 
 /**
- * Asegura la existencia de la tabla de suspensiones operativas locales por comunidad.
+ * Asegura de forma idempotente la tabla `provider_local_suspensions`.
+ * Permite a cada comunidad/country aplicar bloqueos operativos locales a un prestador
+ * (por incidentes o normativa interna) sin alterar su estado de compliance global en TrustLink.
+ *
+ * @returns {Promise<void>}
  */
 const ensureLocalSuspensionsTable = async () => {
   await db.query(`
@@ -1061,10 +1230,19 @@ const ensureLocalSuspensionsTable = async () => {
 };
 
 /**
- * Lista suspensiones locales por comunidad.
+ * Lista las suspensiones operativas locales junto con los catálogos auxiliares de comunidades
+ * y prestadores necesarios para la consola de administración.
+ * - `superadmin`: puede consultar todas las comunidades o filtrar por `?country_id=`.
+ * - `admin` local: queda restringido automáticamente a su `req.user.countryId`.
+ * GET /api/v1/providers/local-suspensions
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con filtro opcional `query.country_id`.
+ * @param {import('express').Response} res - Respuesta HTTP con suspensiones, comunidades y prestadores.
+ * @returns {Promise<import('express').Response>}
  */
 const listLocalSuspensions = async (req, res) => {
   try {
+    // Etapa 1: Asegurar tabla y determinar la comunidad efectiva según el rol (aislamiento multi-tenant)
     await ensureLocalSuspensionsTable();
     const countryIdParam = req.query.country_id ? parseInt(req.query.country_id, 10) : null;
     const isSuperadmin = req.user.role === 'superadmin';
@@ -1078,6 +1256,7 @@ const listLocalSuspensions = async (req, res) => {
       whereClause = 'WHERE pls.country_id = $1';
     }
 
+    // Etapa 2: Preparar la consulta de suspensiones (priorizando activas) y catálogos para el panel
     const query = `
       SELECT
         pls.id,
@@ -1124,6 +1303,7 @@ const listLocalSuspensions = async (req, res) => {
       ORDER BY u.first_name ASC, u.last_name ASC, p.id ASC
     `);
 
+    // Etapa 3: Ejecutar las tres consultas en paralelo y responder al panel de administración
     const [result, countriesRes, providersRes] = await Promise.all([
       db.query(query, params),
       countriesQuery,
@@ -1144,10 +1324,17 @@ const listLocalSuspensions = async (req, res) => {
 };
 
 /**
- * Crea una suspensión operativa local en la comunidad.
+ * Registra una suspensión operativa local activa (`active = TRUE`) para un prestador dentro de
+ * una comunidad específica, dejando auditoría del usuario emisor (`created_by_user_id`) y motivo.
+ * POST /api/v1/providers/local-suspensions
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `provider_id`, `reason` y `country_id` opcional (superadmin).
+ * @param {import('express').Response} res - Respuesta HTTP con la suspensión creada (201).
+ * @returns {Promise<import('express').Response>}
  */
 const createLocalSuspension = async (req, res) => {
   try {
+    // Etapa 1: Asegurar tabla, resolver comunidad según rol y validar campos obligatorios
     await ensureLocalSuspensionsTable();
     const { provider_id, reason, country_id } = req.body;
     const effectiveCountryId =
@@ -1159,6 +1346,7 @@ const createLocalSuspension = async (req, res) => {
       return res.status(400).json({ error: 'Debe indicar el prestador y el motivo del reporte.' });
     }
 
+    // Etapa 2: Insertar la suspensión operativa local en estado activo
     const insertRes = await db.query(
       `
         INSERT INTO public.provider_local_suspensions (
@@ -1185,7 +1373,14 @@ const createLocalSuspension = async (req, res) => {
 };
 
 /**
- * Levanta una suspensión operativa local activa.
+ * Levanta una suspensión operativa local (`active = FALSE`, `lifted_at = NOW()`).
+ * Los administradores locales solo pueden levantar suspensiones pertenecientes a su propia comunidad;
+ * `superadmin` puede levantar suspensiones de cualquier comunidad.
+ * PATCH /api/v1/providers/local-suspensions/:id/lift
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.id`.
+ * @param {import('express').Response} res - Respuesta HTTP con el registro actualizado.
+ * @returns {Promise<import('express').Response>}
  */
 const liftLocalSuspension = async (req, res) => {
   try {
@@ -1193,6 +1388,7 @@ const liftLocalSuspension = async (req, res) => {
     const { id } = req.params;
     const isAdminLocal = req.user.role === 'admin' && req.user.countryId;
 
+    // Aislamiento multi-tenant: si es admin de comunidad, filtra obligatoriamente por su `country_id`
     const updated = isAdminLocal
       ? await db.query(
           `
@@ -1228,11 +1424,17 @@ const liftLocalSuspension = async (req, res) => {
 };
 
 /**
- * Lista los ayudantes / integrantes de cuadrilla del prestador autenticado.
+ * Lista todos los ayudantes / integrantes de cuadrilla asociados a cualquiera de los perfiles
+ * del prestador autenticado, resolviendo nombre, DNI y teléfono desde `users` cuando corresponda.
  * GET /api/v1/providers/employees
+ *
+ * @param {import('express').Request} req - Solicitud HTTP del prestador autenticado.
+ * @param {import('express').Response} res - Respuesta HTTP con la lista de ayudantes y su conteo.
+ * @returns {Promise<import('express').Response>}
  */
 const listProviderEmployees = async (req, res) => {
   try {
+    // Etapa 1: Asegurar columnas de cuadrilla y recuperar todos los `provider_id` del usuario
     await ensureProviderEmployeesColumns();
     const userId = req.user.userId;
     const provRes = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
@@ -1241,6 +1443,7 @@ const listProviderEmployees = async (req, res) => {
       return res.status(200).json({ count: 0, employees: [] });
     }
 
+    // Etapa 2: Consultar integrantes de cuadrilla con fallback de datos personales hacia `users`
     const empRes = await db.query(
       `SELECT
          pe.id,
@@ -1269,11 +1472,18 @@ const listProviderEmployees = async (req, res) => {
 };
 
 /**
- * Registra un ayudante / integrante de cuadrilla para el prestador autenticado.
+ * Registra un nuevo ayudante / integrante de cuadrilla para el prestador autenticado,
+ * incluyendo sus datos identificatorios y cobertura ART. Si el prestador todavía no tiene
+ * perfil en `providers`, crea uno base `'Servicios Generales'` en estado `'pending'`.
  * POST /api/v1/providers/employees
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con nombre, DNI, rol y datos de póliza ART.
+ * @param {import('express').Response} res - Respuesta HTTP con el ayudante creado (201).
+ * @returns {Promise<import('express').Response>}
  */
 const addProviderEmployee = async (req, res) => {
   try {
+    // Etapa 1: Asegurar columnas de cuadrilla y validar campos obligatorios (nombre completo y DNI)
     await ensureProviderEmployeesColumns();
     const userId = req.user.userId;
     const {
@@ -1289,6 +1499,7 @@ const addProviderEmployee = async (req, res) => {
       return res.status(400).json({ error: 'Nombre completo y DNI del ayudante son obligatorios.' });
     }
 
+    // Etapa 2: Resolver el `provider_id` más reciente del usuario o crear un perfil base si aún no existe
     const provRes = await db.query(
       'SELECT id FROM providers WHERE user_id = $1 ORDER BY id DESC LIMIT 1',
       [userId]
@@ -1307,6 +1518,7 @@ const addProviderEmployee = async (req, res) => {
       providerId = provRes.rows[0].id;
     }
 
+    // Etapa 3: Insertar el ayudante en `provider_employees` activo por defecto
     const insertRes = await db.query(
       `INSERT INTO public.provider_employees (
          provider_id, full_name, dni, phone, role_label,
@@ -1337,11 +1549,17 @@ const addProviderEmployee = async (req, res) => {
 };
 
 /**
- * Actualiza datos o estado de un ayudante del prestador autenticado.
+ * Actualiza los datos personales, póliza ART o estado de actividad (`is_active`)
+ * de un ayudante perteneciente a la cuadrilla del prestador autenticado.
  * PATCH /api/v1/providers/employees/:id
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.id` y campos a modificar.
+ * @param {import('express').Response} res - Respuesta HTTP con el ayudante actualizado.
+ * @returns {Promise<import('express').Response>}
  */
 const updateProviderEmployee = async (req, res) => {
   try {
+    // Etapa 1: Validar ID de ayudante y obtener los `provider_id` propiedad del prestador
     await ensureProviderEmployeesColumns();
     const userId = req.user.userId;
     const empId = Number(req.params.id);
@@ -1355,6 +1573,7 @@ const updateProviderEmployee = async (req, res) => {
       return res.status(404).json({ error: 'Prestador no encontrado.' });
     }
 
+    // Etapa 2: Ejecutar actualización parcial controlada por propiedad (`provider_id = ANY(...)`)
     const {
       full_name,
       dni,
@@ -1405,11 +1624,17 @@ const updateProviderEmployee = async (req, res) => {
 };
 
 /**
- * Elimina un ayudante de la cuadrilla del prestador autenticado.
+ * Elimina definitivamente un ayudante de la cuadrilla del prestador autenticado,
+ * validando previamente que pertenezca a alguno de sus perfiles (`provider_id`).
  * DELETE /api/v1/providers/employees/:id
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `params.id`.
+ * @param {import('express').Response} res - Respuesta HTTP confirmando la eliminación.
+ * @returns {Promise<import('express').Response>}
  */
 const deleteProviderEmployee = async (req, res) => {
   try {
+    // Etapa 1: Validar ID de ayudante y obtener perfiles propiedad del usuario autenticado
     await ensureProviderEmployeesColumns();
     const userId = req.user.userId;
     const empId = Number(req.params.id);
@@ -1420,6 +1645,7 @@ const deleteProviderEmployee = async (req, res) => {
     const provRes = await db.query('SELECT id FROM providers WHERE user_id = $1', [userId]);
     const providerIds = provRes.rows.map((r) => r.id);
 
+    // Etapa 2: Eliminar registro solo si coincide con la cuadrilla del prestador
     const deleted = await db.query(
       `DELETE FROM public.provider_employees
        WHERE id = $1 AND provider_id = ANY($2::int[])
@@ -1439,12 +1665,18 @@ const deleteProviderEmployee = async (req, res) => {
 };
 
 /**
- * Lista alertas proactivas de vencimiento (vencidos o próximos a vencer en N días)
- * para administración local o central de TrustLink.
+ * Genera el tablero proactivo de alertas de vencimiento (documentos vencidos o próximos a vencer
+ * dentro de una ventana configurable entre 1 y 180 días, default 30) para administración local
+ * o central de TrustLink, abarcando credenciales personales, seguros vehiculares y ART de cuadrillas.
  * GET /api/v1/providers/expiry-alerts?days=30
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con parámetro opcional `query.days`.
+ * @param {import('express').Response} res - Respuesta HTTP con resumen cuantitativo y alertas ordenadas.
+ * @returns {Promise<import('express').Response>}
  */
 const listExpiryAlertsForAdmin = async (req, res) => {
   try {
+    // Etapa 1: Asegurar columnas dependientes y normalizar ventana `days` (1..180, default 30)
     await Promise.all([
       ensureVehicleInsuranceColumns(),
       ensureProviderEmployeesColumns(),
@@ -1453,6 +1685,7 @@ const listExpiryAlertsForAdmin = async (req, res) => {
     const rawDays = parseInt(req.query.days, 10);
     const windowDays = Number.isInteger(rawDays) && rawDays >= 1 && rawDays <= 180 ? rawDays : 30;
 
+    // Etapa 2: Consultar en paralelo prestadores (con contacto), vehículos con seguro y ayudantes activos con ART
     const [provRes, vehRes, empRes] = await Promise.all([
       db.query(`
         SELECT
@@ -1489,6 +1722,7 @@ const listExpiryAlertsForAdmin = async (req, res) => {
       `),
     ]);
 
+    // Etapa 3: Indexar metadatos de contacto por `provider_id` y calcular alertas consolidadas
     const providerMetaById = {};
     provRes.rows.forEach((p) => {
       providerMetaById[p.id] = {
@@ -1506,6 +1740,7 @@ const listExpiryAlertsForAdmin = async (req, res) => {
       providerMetaById,
     });
 
+    // Etapa 4: Calcular métricas agregadas por severidad y responder al panel administrativo
     const expiredCount = alerts.filter((a) => a.severity === 'expired').length;
     const expiringSoonCount = alerts.filter((a) => a.severity === 'expiring_soon').length;
 

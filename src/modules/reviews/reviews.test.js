@@ -1,7 +1,9 @@
 /**
  * @file reviews.test.js
- * @description Script de pruebas de integración para verificar el funcionamiento 
- * 100% del módulo de contratos, completado de servicios y calificaciones cruzadas (reputación).
+ * @description Script manual de pruebas de integración para el módulo de contratos y calificaciones.
+ * Requiere el servidor backend activo en `http://localhost:4000` y acceso a PostgreSQL.
+ * Verifica alta de contrato, bloqueo de reseñas prematuras sobre contratos pendientes,
+ * cierre del contrato y emisión de calificación con recálculo de reputación.
  * @location /trustlink-backend/src/modules/reviews/reviews.test.js
  */
 
@@ -11,6 +13,17 @@ require('dotenv').config();
 
 const BASE_URL = 'http://localhost:4000/api/v1/reviews';
 
+/**
+ * Ejecuta el circuito de pruebas de integración de contratos y reputación:
+ * - Paso 0: siembra country, residente y prestador aprobado en DB y firma JWT de residente.
+ * - Prueba 1: creación de contrato de servicio (`POST /reviews/contract`).
+ * - Prueba 2: bloqueo de calificación prematura sobre contrato pendiente (`400`).
+ * - Prueba 3: marcado del contrato como completado (`PATCH /reviews/contract/complete`).
+ * - Prueba 4: emisión de reseña y recálculo de reputación del prestador (`POST /reviews/review`).
+ * - Limpieza: elimina el country temporal en cascada dentro del bloque `finally`.
+ *
+ * @returns {Promise<void>} Finaliza tras comprobar todos los escenarios y limpiar la DB.
+ */
 async function runReviewsTests() {
   console.log('🧪 Iniciando pruebas automatizadas para el Módulo de Calificaciones y Reputación...\n');
 
@@ -19,6 +32,7 @@ async function runReviewsTests() {
   try {
     // ----------------------------------------------------
     // PASO 0: Configurar entorno de prueba en la Base de Datos
+    // Precondiciones: barrio de prueba, residente y prestador aprobado con JWT de residente.
     // ----------------------------------------------------
     console.log('0️⃣ Preparando datos de prueba (Country, Owner, Provider)...');
 
@@ -62,6 +76,8 @@ async function runReviewsTests() {
 
     // ----------------------------------------------------
     // PRUEBA 1: Crear contrato de servicio
+    // Escenario: un residente acuerda un trabajo de plomería con un prestador aprobado.
+    // Resultado esperado: HTTP 201 con objeto `contract` persistido y su `id`.
     // ----------------------------------------------------
     console.log('1️⃣ Probando creación de contrato de servicio (/reviews/contract)...');
     const contractRes = await fetch(`${BASE_URL}/contract`, {
@@ -88,6 +104,8 @@ async function runReviewsTests() {
 
     // ----------------------------------------------------
     // PRUEBA 2: Intentar calificar un contrato pendiente (Debe fallar por regla de negocio)
+    // Precondición: contrato recién creado aún no finalizado.
+    // Resultado esperado: HTTP 400 impidiendo calificar servicios inconclusos.
     // ----------------------------------------------------
     console.log('\n2️⃣ Probando restricción: Intentar calificar un contrato pendiente...');
     const prematureReviewRes = await fetch(`${BASE_URL}/review`, {
@@ -113,6 +131,8 @@ async function runReviewsTests() {
 
     // ----------------------------------------------------
     // PRUEBA 3: Marcar contrato como completado
+    // Escenario: el residente confirma la finalización del trabajo para habilitar la reseña.
+    // Resultado esperado: HTTP 200 y `contract.status === 'completed'`.
     // ----------------------------------------------------
     console.log('\n3️⃣ Probando marcar contrato como completado (/reviews/contract/complete)...');
     const completeRes = await fetch(`${BASE_URL}/contract/complete`, {
@@ -134,6 +154,8 @@ async function runReviewsTests() {
 
     // ----------------------------------------------------
     // PRUEBA 4: Emitir calificación y reseña (Ahora sí permitido)
+    // Precondición: contrato en estado `completed` tras la Prueba 3.
+    // Resultado esperado: HTTP 201 con la reseña guardada y el promedio actualizado del prestador.
     // ----------------------------------------------------
     console.log('\n4️⃣ Probando emisión de reseña y actualización de reputación (/reviews/review)...');
     const reviewRes = await fetch(`${BASE_URL}/review`, {
@@ -171,4 +193,5 @@ async function runReviewsTests() {
   }
 }
 
+// Punto de entrada al invocar el script directamente
 runReviewsTests();

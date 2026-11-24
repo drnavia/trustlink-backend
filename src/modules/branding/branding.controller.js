@@ -77,11 +77,14 @@ const normalizeBoolean = (value, fallback) => {
 };
 
 /**
- * Valida y normaliza logo_url (SVG, PNG, JPG o URL/ruta segura, o null para usar emblema por defecto).
- * @param {unknown} value
+ * Valida y normaliza `logo_url` admitiendo imágenes embebidas en base64 (SVG, PNG, JPG),
+ * URLs/rutas relativas con extensión de imagen permitida o `null` (para usar el emblema por defecto).
+ *
+ * @param {unknown} value - Valor recibido en el payload.
  * @returns {{ valid: boolean, value: string|null, error?: string }}
  */
 const normalizeLogoUrl = (value) => {
+  // 1. Valores vacíos o nulos restauran el emblema vectorial por defecto de la plataforma
   if (value === null || value === undefined || String(value).trim() === '') {
     return { valid: true, value: null };
   }
@@ -92,6 +95,7 @@ const normalizeLogoUrl = (value) => {
 
   const trimmed = value.trim();
 
+  // 2. Evitar cargas excesivas en base de datos limitando el tamaño del data URL
   if (trimmed.length > MAX_LOGO_DATA_URL_LENGTH) {
     return {
       valid: false,
@@ -100,6 +104,7 @@ const normalizeLogoUrl = (value) => {
     };
   }
 
+  // 3. Validar Data URLs base64 restringidos únicamente a PNG, JPEG/JPG o SVG
   const allowedDataPrefixRegex =
     /^data:image\/(png|jpeg|jpg|svg\+xml);base64,[A-Za-z0-9+/=]+$/i;
   if (trimmed.startsWith('data:image/')) {
@@ -113,6 +118,7 @@ const normalizeLogoUrl = (value) => {
     return { valid: true, value: trimmed };
   }
 
+  // 4. Validar URLs HTTP(S) o rutas internas seguras terminadas en .svg, .png, .jpg o .jpeg
   const allowedUrlRegex =
     /^(https?:\/\/[^\s"'<>]+|\/[^\s"'<>]+)\.(svg|png|jpe?g)(\?[^\s"'<>]*)?$/i;
   if (allowedUrlRegex.test(trimmed)) {
@@ -127,10 +133,14 @@ const normalizeLogoUrl = (value) => {
 };
 
 /**
- * Crea o actualiza de forma idempotente la tabla platform_branding con zonas 1 a 6
- * y campos opcionales de identidad del menú.
+ * Crea o migra de forma idempotente la tabla singleton `platform_branding` con los colores
+ * de las Zonas 1 a 6, campos opcionales de identidad del menú, logo y modo oscuro.
+ * Si la tabla no posee filas aún, inserta el registro inicial usando `DEFAULT_BRANDING`.
+ *
+ * @returns {Promise<void>}
  */
 const ensureBrandingSchema = async () => {
+  // 1. Crear la tabla principal si todavía no existe en PostgreSQL
   await db.query(`
     CREATE TABLE IF NOT EXISTS platform_branding (
       id SERIAL PRIMARY KEY,
@@ -155,6 +165,7 @@ const ensureBrandingSchema = async () => {
     );
   `);
 
+  // 2. Migración incremental idempotente para entornos creados con versiones anteriores del esquema
   await db.query(`
     ALTER TABLE platform_branding
       ADD COLUMN IF NOT EXISTS brand_name VARCHAR(60) NOT NULL DEFAULT 'TrustLink',
@@ -177,6 +188,7 @@ const ensureBrandingSchema = async () => {
       ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW();
   `);
 
+  // 3. Verificar existencia del registro único de configuración; si no existe, sembrar `DEFAULT_BRANDING`
   const existing = await db.query(
     'SELECT id FROM platform_branding ORDER BY id ASC LIMIT 1'
   );
@@ -226,8 +238,11 @@ const ensureBrandingSchema = async () => {
 };
 
 /**
- * Formatea una fila de base de datos al objeto estándar de respuesta.
- * @param {Record<string, any>} row
+ * Formatea una fila de base de datos al objeto estándar de respuesta aplicando fallbacks seguros
+ * desde `DEFAULT_BRANDING` (y heredando `menu_bg_color` para el footer si faltara).
+ *
+ * @param {Record<string, any>} row - Fila obtenida de `platform_branding`.
+ * @returns {Record<string, any>} Objeto de branding normalizado para el cliente.
  */
 const formatBrandingRow = (row) => ({
   brand_name: row.brand_name || DEFAULT_BRANDING.brand_name,
@@ -251,10 +266,18 @@ const formatBrandingRow = (row) => ({
 });
 
 /**
+ * Obtiene la configuración activa de apariencia (branding) de la plataforma junto con
+ * `DEFAULT_BRANDING` (`defaults`), que el frontend también utiliza para ejecutar el reset
+ * a los valores de fábrica.
  * GET /api/v1/branding
+ *
+ * @param {import('express').Request} req - Petición HTTP.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ branding, defaults }`.
+ * @returns {Promise<import('express').Response>}
  */
 const getBranding = async (req, res) => {
   try {
+    // 1. Asegurar esquema/seed y consultar la fila única de configuración global
     await ensureBrandingSchema();
 
     const result = await db.query(
@@ -283,6 +306,7 @@ const getBranding = async (req, res) => {
        LIMIT 1`
     );
 
+    // 2. Formatear fila obtenida (con respaldo en `DEFAULT_BRANDING`) y devolver junto a los defaults de fábrica
     const row = result.rows[0] || DEFAULT_BRANDING;
 
     return res.status(200).json({
@@ -298,10 +322,19 @@ const getBranding = async (req, res) => {
 };
 
 /**
+ * Actualiza (o restablece enviando los valores de `defaults`) la configuración global de
+ * apariencia de TrustLink. Soporta payloads en `snake_case` o `camelCase`, valida los 12
+ * colores hexadecimales de las Zonas 1 a 6, valida `logo_url`, normaliza textos de identidad
+ * y persiste los cambios sobre la fila única de `platform_branding`.
  * PUT /api/v1/branding (exclusivo superadmin)
+ *
+ * @param {import('express').Request} req - Petición HTTP con campos de apariencia en `req.body`.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ message, branding, defaults }`.
+ * @returns {Promise<import('express').Response>}
  */
 const updateBranding = async (req, res) => {
   try {
+    // 1. Asegurar esquema y leer el registro vigente para soportar actualizaciones parciales
     await ensureBrandingSchema();
 
     const currentResult = await db.query(
@@ -332,12 +365,22 @@ const updateBranding = async (req, res) => {
     const current = formatBrandingRow(currentResult.rows[0] || DEFAULT_BRANDING);
     const currentId = currentResult.rows[0]?.id;
 
+    /**
+     * Extrae un campo del cuerpo de la petición admitiendo tanto nomenclatura `snake_case`
+     * como `camelCase`, devolviendo `fallbackValue` si ninguna clave fue enviada.
+     *
+     * @param {string} snakeKey - Nombre del campo en `snake_case`.
+     * @param {string} camelKey - Nombre equivalente en `camelCase`.
+     * @param {any} fallbackValue - Valor actual o por defecto a conservar si se omite.
+     * @returns {any}
+     */
     const pick = (snakeKey, camelKey, fallbackValue) => {
       if (req.body[snakeKey] !== undefined) return req.body[snakeKey];
       if (req.body[camelKey] !== undefined) return req.body[camelKey];
       return fallbackValue;
     };
 
+    // 2. Normalizar textos de identidad del encabezado/menú respetando longitudes máximas de columna
     const brandName = normalizeIdentityText(
       pick('brand_name', 'brandName', current.brand_name),
       DEFAULT_BRANDING.brand_name,
@@ -354,6 +397,7 @@ const updateBranding = async (req, res) => {
       100
     );
 
+    // 3. Normalizar y validar formato hexadecimal #RRGGBB para fondo y texto de las Zonas 1 a 6
     const menuBgColor = normalizeHexColor(
       pick('menu_bg_color', 'menuBgColor', current.menu_bg_color)
     );
@@ -411,6 +455,7 @@ const updateBranding = async (req, res) => {
       });
     }
 
+    // 4. Validar imagen del logo (base64 o URL/ruta segura) y normalizar modo oscuro/claro
     const rawLogo = pick('logo_url', 'logoUrl', current.logo_url);
     const logoCheck = normalizeLogoUrl(rawLogo);
     if (!logoCheck.valid) {
@@ -422,6 +467,7 @@ const updateBranding = async (req, res) => {
     const rawDarkMode = pick('dark_mode', 'darkMode', current.dark_mode);
     const darkMode = normalizeBoolean(rawDarkMode, current.dark_mode);
 
+    // 5. Persistir toda la configuración validada en la fila singleton y devolver estado actualizado
     const updatedResult = await db.query(
       `UPDATE platform_branding
        SET brand_name = $1,
