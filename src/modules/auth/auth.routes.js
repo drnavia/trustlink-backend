@@ -6,6 +6,7 @@
 
 const { Router } = require('express');
 const {
+  listPublicCountries,
   register,
   login,
   createPrivilegedUser,
@@ -15,6 +16,9 @@ const {
 const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
 
 const router = Router();
+
+// Catálogo público de comunidades activas para el formulario de registro
+router.get('/countries', listPublicCountries);
 
 // Registro público (solo roles no administrativos) e inicio de sesión
 router.post('/register', register);

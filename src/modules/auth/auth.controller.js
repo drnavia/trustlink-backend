@@ -15,6 +15,21 @@ const {
 const PUBLIC_ALLOWED_ROLES = ['owner', 'family', 'provider'];
 const PRIVILEGED_ALLOWED_ROLES = ['admin', 'superadmin', 'security'];
 
+const listPublicCountries = async (_req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, name
+       FROM countries
+       WHERE is_active = TRUE
+       ORDER BY id ASC`
+    );
+    return res.status(200).json({ countries: result.rows });
+  } catch (error) {
+    console.error('Error al listar comunidades públicas:', error);
+    return res.status(500).json({ error: 'Error interno al consultar comunidades activas.' });
+  }
+};
+
 const register = async (req, res) => {
   try {
     await ensureEvolutionSchema();
@@ -327,6 +342,7 @@ const updatePrivilegedUser = async (req, res) => {
 };
 
 module.exports = {
+  listPublicCountries,
   register,
   login,
   createPrivilegedUser,
