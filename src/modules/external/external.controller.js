@@ -14,9 +14,43 @@ const {
   hydrateAuthorizedEmployeesExpiry,
 } = require('../../utils/complianceExpiry');
 
+const COMMUNITY_B2B_PLANS = [
+  {
+    code: 'pilot',
+    name: 'Piloto Comunidad',
+    price_ars: 0,
+    default_monthly_quota: 300,
+    description: 'Plan inicial de prueba con Consola Garita y 1 integración API.',
+  },
+  {
+    code: 'starter',
+    name: 'Barrio Esencial',
+    price_ars: 89000,
+    default_monthly_quota: 1000,
+    description: 'Validación QR en tiempo real, trazabilidad y alertas de vencimiento.',
+  },
+  {
+    code: 'pro',
+    name: 'Country Pro',
+    price_ars: 189000,
+    default_monthly_quota: 5000,
+    description: 'Múltiples garitas/API Keys, auditoría completa y suspensiones locales.',
+  },
+  {
+    code: 'enterprise',
+    name: 'Red Enterprise',
+    price_ars: 320000,
+    default_monthly_quota: null,
+    description: 'Validaciones QR ilimitadas para complejos y consorcios de alto tráfico.',
+  },
+];
+
+const B2B_PLANS_BY_CODE = Object.fromEntries(COMMUNITY_B2B_PLANS.map((p) => [p.code, p]));
+const ALLOWED_B2B_BILLING_STATUSES = ['trial', 'active', 'grace', 'suspended'];
+
 /**
  * Asegura de forma idempotente que la tabla `countries` cuente con las columnas
- * address, postal_code, city y province (migrando datos desde locality/location si existen).
+ * de ubicación y licenciamiento B2B (plan_code, billing_status, subscription_ends_at, monthly_pass_quota).
  */
 const ensureCountriesColumns = async () => {
   await db.query(`
@@ -24,7 +58,11 @@ const ensureCountriesColumns = async () => {
       ADD COLUMN IF NOT EXISTS address VARCHAR(255) NULL,
       ADD COLUMN IF NOT EXISTS postal_code VARCHAR(30) NULL,
       ADD COLUMN IF NOT EXISTS city VARCHAR(120) NULL,
-      ADD COLUMN IF NOT EXISTS province VARCHAR(120) NULL;
+      ADD COLUMN IF NOT EXISTS province VARCHAR(120) NULL,
+      ADD COLUMN IF NOT EXISTS plan_code VARCHAR(40) NOT NULL DEFAULT 'pilot',
+      ADD COLUMN IF NOT EXISTS billing_status VARCHAR(20) NOT NULL DEFAULT 'active',
+      ADD COLUMN IF NOT EXISTS subscription_ends_at TIMESTAMP WITHOUT TIME ZONE NULL,
+      ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL;
   `);
 
   const colsRes = await db.query(`
@@ -52,7 +90,8 @@ const ensureCountriesColumns = async () => {
 };
 
 /**
- * Asegura la existencia de la tabla country_integrations de forma idempotente.
+ * Asegura la existencia de la tabla country_integrations y migra columnas legacy (`api_key`)
+ * hacia `api_key_hash` y `api_key_prefix` de forma idempotente.
  */
 const ensureIntegrationsTable = async () => {
   await db.query(`
@@ -67,6 +106,47 @@ const ensureIntegrationsTable = async () => {
       created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
     );
   `);
+
+  await db.query(`
+    ALTER TABLE country_integrations
+      ADD COLUMN IF NOT EXISTS api_key_hash VARCHAR(128) NULL,
+      ADD COLUMN IF NOT EXISTS api_key_prefix VARCHAR(24) NULL;
+  `);
+
+  const legacyColRes = await db.query(`
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'country_integrations'
+      AND column_name = 'api_key'
+    LIMIT 1
+  `);
+
+  if (legacyColRes.rows.length > 0) {
+    await db
+      .query('ALTER TABLE country_integrations ALTER COLUMN api_key DROP NOT NULL;')
+      .catch(() => {});
+
+    const legacyRows = await db.query(
+      `SELECT id, api_key
+       FROM country_integrations
+       WHERE api_key IS NOT NULL
+         AND (api_key_hash IS NULL OR api_key_prefix IS NULL)`
+    );
+    for (const row of legacyRows.rows) {
+      const raw = String(row.api_key).trim();
+      if (!raw) continue;
+      const hashed = crypto.createHash('sha256').update(raw).digest('hex');
+      const pref = raw.length > 18 ? `${raw.slice(0, 14)}...${raw.slice(-4)}` : raw;
+      await db.query(
+        `UPDATE country_integrations
+         SET api_key_hash = COALESCE(api_key_hash, $1),
+             api_key_prefix = COALESCE(api_key_prefix, $2)
+         WHERE id = $3`,
+        [hashed, pref, row.id]
+      );
+    }
+  }
 };
 
 /**
@@ -183,6 +263,56 @@ const recordGateAccessLog = async ({
   }
 };
 
+const getMonthlyQrUsedForCountry = async (countryId) => {
+  if (!countryId) return 0;
+  await ensureAuditLogsTable();
+  const res = await db.query(
+    `SELECT COUNT(*)::int AS used
+     FROM gate_access_logs
+     WHERE country_id = $1
+       AND authorized = TRUE
+       AND created_at >= date_trunc('month', NOW())`,
+    [Number(countryId)]
+  );
+  return Number(res.rows[0]?.used || 0);
+};
+
+const evaluateCountryB2BStatus = (countryRow, monthlyUsed = 0) => {
+  const status = String(countryRow?.billing_status || 'active').toLowerCase();
+  if (status === 'suspended') {
+    return {
+      ok: false,
+      code: 'COUNTRY_SUBSCRIPTION_SUSPENDED',
+      error: 'La licencia B2B de la comunidad se encuentra suspendida. Contacte a TrustLink.',
+    };
+  }
+
+  if (countryRow?.subscription_ends_at && status !== 'grace') {
+    const endsAtMs = new Date(countryRow.subscription_ends_at).getTime();
+    if (!Number.isNaN(endsAtMs) && endsAtMs < Date.now()) {
+      return {
+        ok: false,
+        code: 'COUNTRY_SUBSCRIPTION_EXPIRED',
+        error: 'La suscripción B2B de la comunidad se encuentra vencida. Renueve el abono para continuar operando.',
+      };
+    }
+  }
+
+  const quota =
+    countryRow?.monthly_pass_quota !== null && countryRow?.monthly_pass_quota !== undefined
+      ? Number(countryRow.monthly_pass_quota)
+      : null;
+  if (quota !== null && !Number.isNaN(quota) && quota > 0 && Number(monthlyUsed) >= quota) {
+    return {
+      ok: false,
+      code: 'COUNTRY_QUOTA_EXCEEDED',
+      error: `La comunidad alcanzó su cuota mensual de ${quota} validaciones QR autorizadas.`,
+    };
+  }
+
+  return { ok: true };
+};
+
 /**
  * Autentica la llamada externa mediante API key por comunidad (country_integrations)
  * o clave global de respaldo (EXTERNAL_GATE_API_KEY), o bien vía JWT interno.
@@ -195,7 +325,7 @@ const resolveExternalAuth = async (req) => {
   );
 
   if (providedKey) {
-    await ensureIntegrationsTable();
+    await Promise.all([ensureCountriesColumns(), ensureIntegrationsTable()]);
     const keyHash = hashApiKey(providedKey);
     const integrationRes = await db.query(
       `
@@ -205,7 +335,11 @@ const resolveExternalAuth = async (req) => {
           ci.label,
           ci.is_active,
           c.name AS country_name,
-          c.is_active AS country_is_active
+          c.is_active AS country_is_active,
+          c.plan_code,
+          c.billing_status,
+          c.subscription_ends_at,
+          c.monthly_pass_quota
         FROM country_integrations ci
         JOIN countries c ON ci.country_id = c.id
         WHERE ci.api_key_hash = $1
@@ -233,6 +367,20 @@ const resolveExternalAuth = async (req) => {
           status: 403,
           code: 'COUNTRY_INACTIVE',
           error: 'La comunidad asociada a la clave API se encuentra inactiva.',
+          authMode: 'community_api_key',
+          countryId: integ.country_id,
+          integrationLabel: integ.label
+        };
+      }
+
+      const monthlyUsed = await getMonthlyQrUsedForCountry(integ.country_id);
+      const b2bCheck = evaluateCountryB2BStatus(integ, monthlyUsed);
+      if (!b2bCheck.ok) {
+        return {
+          ok: false,
+          status: 403,
+          code: b2bCheck.code,
+          error: b2bCheck.error,
           authMode: 'community_api_key',
           countryId: integ.country_id,
           integrationLabel: integ.label
@@ -319,8 +467,11 @@ const getExternalDiagnostics = async (req, res) => {
         (SELECT COUNT(*)::int FROM providers WHERE status = 'approved'::provider_status) AS approved_providers,
         (SELECT COUNT(*)::int FROM countries) AS total_countries,
         (SELECT COUNT(*)::int FROM countries WHERE is_active = TRUE) AS active_countries,
+        (SELECT COUNT(*)::int FROM countries WHERE billing_status IN ('active', 'trial', 'grace')) AS b2b_active_countries,
+        (SELECT COUNT(*)::int FROM countries WHERE billing_status = 'suspended') AS b2b_suspended_countries,
         (SELECT COUNT(*)::int FROM country_integrations WHERE is_active = TRUE) AS active_integrations,
-        (SELECT COUNT(*)::int FROM gate_access_logs) AS total_access_logs
+        (SELECT COUNT(*)::int FROM gate_access_logs) AS total_access_logs,
+        (SELECT COUNT(*)::int FROM gate_access_logs WHERE authorized = TRUE AND created_at >= date_trunc('month', NOW())) AS monthly_qr_validations
     `);
 
     const envKey = String(process.env.EXTERNAL_GATE_API_KEY || '').trim();
@@ -373,7 +524,7 @@ const getExternalDiagnostics = async (req, res) => {
  */
 const listCountries = async (req, res) => {
   try {
-    await Promise.all([ensureCountriesColumns(), ensureIntegrationsTable()]);
+    await Promise.all([ensureCountriesColumns(), ensureIntegrationsTable(), ensureAuditLogsTable()]);
 
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 4, 1), 100);
@@ -419,8 +570,19 @@ const listCountries = async (req, res) => {
           c.city,
           c.province,
           c.is_active,
+          c.plan_code,
+          c.billing_status,
+          c.subscription_ends_at,
+          c.monthly_pass_quota,
           c.created_at,
-          (SELECT COUNT(*)::int FROM country_integrations ci WHERE ci.country_id = c.id AND ci.is_active = TRUE) AS active_keys_count
+          (SELECT COUNT(*)::int FROM country_integrations ci WHERE ci.country_id = c.id AND ci.is_active = TRUE) AS active_keys_count,
+          (
+            SELECT COUNT(*)::int
+            FROM gate_access_logs gal
+            WHERE gal.country_id = c.id
+              AND gal.authorized = TRUE
+              AND gal.created_at >= date_trunc('month', NOW())
+          ) AS monthly_qr_used
         FROM countries c
         ${whereClause}
         ORDER BY c.id ASC
@@ -429,8 +591,14 @@ const listCountries = async (req, res) => {
       listParams
     );
 
+    const enrichedCountries = result.rows.map((row) => ({
+      ...row,
+      plan_name: B2B_PLANS_BY_CODE[row.plan_code]?.name || row.plan_code || 'Piloto Comunidad',
+    }));
+
     return res.status(200).json({
-      countries: result.rows,
+      countries: enrichedCountries,
+      b2b_plans: COMMUNITY_B2B_PLANS,
       pagination: {
         page: safePage,
         limit,
@@ -601,6 +769,185 @@ const toggleCountryStatus = async (req, res) => {
   } catch (error) {
     console.error('Error al cambiar estado de comunidad:', error);
     return res.status(500).json({ error: 'Error al actualizar el estado de la comunidad.' });
+  }
+};
+
+/**
+ * Actualiza el plan B2B, estado de facturación, vigencia y cuota mensual de QR de una comunidad.
+ * PATCH /api/v1/external/countries/:id/billing (Exclusivo superadmin)
+ */
+const updateCountryBilling = async (req, res) => {
+  try {
+    await Promise.all([ensureCountriesColumns(), ensureAuditLogsTable()]);
+    const countryId = parseInt(req.params.id, 10);
+    if (Number.isNaN(countryId)) {
+      return res.status(400).json({ error: 'ID de comunidad inválido.' });
+    }
+
+    const existingRes = await db.query('SELECT * FROM countries WHERE id = $1 LIMIT 1', [countryId]);
+    if (existingRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Comunidad no encontrada.' });
+    }
+    const current = existingRes.rows[0];
+
+    const requestedPlan =
+      req.body?.plan_code !== undefined ? String(req.body.plan_code).trim().toLowerCase() : current.plan_code || 'pilot';
+    if (!B2B_PLANS_BY_CODE[requestedPlan]) {
+      return res.status(400).json({
+        error: `Plan B2B inválido. Valores permitidos: ${Object.keys(B2B_PLANS_BY_CODE).join(', ')}.`,
+      });
+    }
+
+    const requestedStatus =
+      req.body?.billing_status !== undefined
+        ? String(req.body.billing_status).trim().toLowerCase()
+        : current.billing_status || 'active';
+    if (!ALLOWED_B2B_BILLING_STATUSES.includes(requestedStatus)) {
+      return res.status(400).json({
+        error: `Estado comercial inválido. Valores permitidos: ${ALLOWED_B2B_BILLING_STATUSES.join(', ')}.`,
+      });
+    }
+
+    const planMeta = B2B_PLANS_BY_CODE[requestedPlan];
+    let nextQuota = current.monthly_pass_quota;
+    if (req.body?.monthly_pass_quota !== undefined) {
+      if (req.body.monthly_pass_quota === null || req.body.monthly_pass_quota === '') {
+        nextQuota = null;
+      } else {
+        const parsedQuota = parseInt(req.body.monthly_pass_quota, 10);
+        if (Number.isNaN(parsedQuota) || parsedQuota < 0) {
+          return res.status(400).json({ error: 'La cuota mensual de pases debe ser un entero positivo o vacía (ilimitada).' });
+        }
+        nextQuota = parsedQuota === 0 ? null : parsedQuota;
+      }
+    } else if (req.body?.plan_code !== undefined && requestedPlan !== current.plan_code) {
+      nextQuota = planMeta.default_monthly_quota;
+    }
+
+    let nextEndsAt = current.subscription_ends_at || null;
+    if (req.body?.extend_days !== undefined && req.body.extend_days !== null) {
+      const extendDays = parseInt(req.body.extend_days, 10);
+      if (Number.isNaN(extendDays) || extendDays < 1 || extendDays > 730) {
+        return res.status(400).json({ error: 'extend_days debe estar entre 1 y 730.' });
+      }
+      const now = new Date();
+      const base =
+        current.subscription_ends_at && new Date(current.subscription_ends_at) > now
+          ? new Date(current.subscription_ends_at)
+          : now;
+      nextEndsAt = new Date(base.getTime() + extendDays * 24 * 60 * 60 * 1000).toISOString();
+    } else if (req.body?.subscription_ends_at !== undefined) {
+      if (req.body.subscription_ends_at === null || req.body.subscription_ends_at === '') {
+        nextEndsAt = null;
+      } else {
+        const parsed = new Date(req.body.subscription_ends_at);
+        if (Number.isNaN(parsed.getTime())) {
+          return res.status(400).json({ error: 'Fecha de vencimiento de licencia inválida.' });
+        }
+        nextEndsAt = parsed.toISOString();
+      }
+    }
+
+    const updatedRes = await db.query(
+      `
+        UPDATE countries
+        SET plan_code = $1,
+            billing_status = $2,
+            subscription_ends_at = $3,
+            monthly_pass_quota = $4
+        WHERE id = $5
+        RETURNING
+          id, name, address, postal_code, city, province, is_active,
+          plan_code, billing_status, subscription_ends_at, monthly_pass_quota, created_at
+      `,
+      [requestedPlan, requestedStatus, nextEndsAt, nextQuota, countryId]
+    );
+
+    const monthlyUsed = await getMonthlyQrUsedForCountry(countryId);
+    const updatedCountry = {
+      ...updatedRes.rows[0],
+      plan_name: planMeta.name,
+      monthly_qr_used: monthlyUsed,
+    };
+
+    return res.status(200).json({
+      message: `Licencia B2B de "${updatedCountry.name}" actualizada (${planMeta.name} · ${requestedStatus}).`,
+      country: updatedCountry,
+    });
+  } catch (error) {
+    console.error('Error al actualizar licencia B2B de comunidad:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar la licencia B2B de la comunidad.' });
+  }
+};
+
+/**
+ * Devuelve el resumen de licencia B2B y consumo mensual de QR para la comunidad del admin local
+ * (o la comunidad seleccionada por superadmin).
+ * GET /api/v1/external/my-community/billing
+ */
+const getMyCommunityBilling = async (req, res) => {
+  try {
+    await Promise.all([ensureCountriesColumns(), ensureIntegrationsTable(), ensureAuditLogsTable()]);
+    const isSuperadmin = req.user?.role === 'superadmin';
+    const requestedCountryId = req.query.country_id ? parseInt(req.query.country_id, 10) : null;
+    let targetCountryId = isSuperadmin && requestedCountryId ? requestedCountryId : req.user?.countryId;
+
+    if (!targetCountryId && isSuperadmin) {
+      const firstCountry = await db.query('SELECT id FROM countries ORDER BY id ASC LIMIT 1');
+      targetCountryId = firstCountry.rows[0]?.id || null;
+    }
+
+    if (!targetCountryId) {
+      return res.status(404).json({ error: 'No se encontró una comunidad asociada a la cuenta.' });
+    }
+
+    const countryRes = await db.query(
+      `
+        SELECT
+          c.id,
+          c.name,
+          c.city,
+          c.province,
+          c.is_active,
+          c.plan_code,
+          c.billing_status,
+          c.subscription_ends_at,
+          c.monthly_pass_quota,
+          (SELECT COUNT(*)::int FROM country_integrations ci WHERE ci.country_id = c.id AND ci.is_active = TRUE) AS active_keys_count
+        FROM countries c
+        WHERE c.id = $1
+        LIMIT 1
+      `,
+      [Number(targetCountryId)]
+    );
+
+    if (countryRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Comunidad no encontrada.' });
+    }
+
+    const community = countryRes.rows[0];
+    const monthlyUsed = await getMonthlyQrUsedForCountry(community.id);
+    const plan = B2B_PLANS_BY_CODE[community.plan_code] || COMMUNITY_B2B_PLANS[0];
+    const quota =
+      community.monthly_pass_quota !== null && community.monthly_pass_quota !== undefined
+        ? Number(community.monthly_pass_quota)
+        : null;
+    const usagePercent =
+      quota && quota > 0 ? Math.min(100, Math.round((monthlyUsed / quota) * 100)) : null;
+
+    return res.status(200).json({
+      community: {
+        ...community,
+        plan_name: plan.name,
+        monthly_qr_used: monthlyUsed,
+        usage_percent: usagePercent,
+      },
+      plan,
+      b2b_plans: COMMUNITY_B2B_PLANS,
+    });
+  } catch (error) {
+    console.error('Error al consultar licencia B2B de la comunidad:', error);
+    return res.status(500).json({ error: 'Error interno al consultar la licencia de la comunidad.' });
   }
 };
 
@@ -1633,11 +1980,14 @@ const verifyExternalPassByQR = async (req, res) => {
 };
 
 module.exports = {
+  COMMUNITY_B2B_PLANS,
   getExternalDiagnostics,
   listCountries,
   createCountry,
   updateCountry,
   toggleCountryStatus,
+  updateCountryBilling,
+  getMyCommunityBilling,
   listCommunityIntegrations,
   createCommunityIntegration,
   rotateCommunityIntegrationKey,

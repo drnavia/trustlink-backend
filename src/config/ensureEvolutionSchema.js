@@ -136,6 +136,15 @@ async function ensureEvolutionSchema() {
         ON public.provider_subscriptions (user_id, status, ends_at DESC)
       `);
 
+      // 5. Asegurar columnas de licenciamiento B2B en `countries`
+      await db.query(`
+        ALTER TABLE public.countries
+        ADD COLUMN IF NOT EXISTS plan_code VARCHAR(40) NOT NULL DEFAULT 'pilot',
+        ADD COLUMN IF NOT EXISTS billing_status VARCHAR(20) NOT NULL DEFAULT 'active',
+        ADD COLUMN IF NOT EXISTS subscription_ends_at TIMESTAMP WITHOUT TIME ZONE NULL,
+        ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL
+      `);
+
       schemaInitialized = true;
     } catch (err) {
       schemaPromise = null;

@@ -933,4 +933,153 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(opsRow.is_verified_member, true);
     assert.equal(opsRow.membership_tier, 'verified_pro');
   });
+
+  it('gestiona licenciamiento B2B por comunidad y bloquea API externa si está suspendida o vencida (Fase 2)', async () => {
+    const prevBillingRes = await db.query(
+      'SELECT plan_code, billing_status, subscription_ends_at, monthly_pass_quota FROM countries WHERE id = $1 LIMIT 1',
+      [countryId]
+    );
+    const prevBilling = prevBillingRes.rows[0] || {
+      plan_code: 'pilot',
+      billing_status: 'active',
+      subscription_ends_at: null,
+      monthly_pass_quota: null,
+    };
+
+    let tempIntegrationId = null;
+    try {
+      // 1. Crear una API Key temporal para la comunidad
+      const keyRes = await req(
+        'POST',
+        '/api/v1/external/integrations',
+        { country_id: countryId, label: `E2E B2B Gate ${ts}` },
+        superToken
+      );
+      assert.equal(keyRes.status, 201);
+      const rawApiKey = keyRes.data.api_key;
+      tempIntegrationId = keyRes.data.integration.id;
+
+      // 2. Configurar plan B2B 'pro' activo por 30 días y cuota 5000
+      const updRes = await req(
+        'PATCH',
+        `/api/v1/external/countries/${countryId}/billing`,
+        {
+          plan_code: 'pro',
+          billing_status: 'active',
+          extend_days: 30,
+          monthly_pass_quota: 5000,
+        },
+        superToken
+      );
+      assert.equal(updRes.status, 200);
+      assert.equal(updRes.data.country.plan_code, 'pro');
+      assert.equal(updRes.data.country.billing_status, 'active');
+      assert.equal(updRes.data.country.monthly_pass_quota, 5000);
+      assert.ok(updRes.data.country.subscription_ends_at);
+
+      // 3. Consultar resumen B2B desde /my-community/billing y /countries
+      const myBill = await req(
+        'GET',
+        `/api/v1/external/my-community/billing?country_id=${countryId}`,
+        undefined,
+        superToken
+      );
+      assert.equal(myBill.status, 200);
+      assert.equal(myBill.data.community.plan_code, 'pro');
+      assert.equal(typeof myBill.data.community.monthly_qr_used, 'number');
+
+      const countriesList = await req(
+        'GET',
+        '/api/v1/external/countries?page=1&limit=20',
+        undefined,
+        superToken
+      );
+      assert.equal(countriesList.status, 200);
+      assert.ok(Array.isArray(countriesList.data.b2b_plans) && countriesList.data.b2b_plans.length >= 3);
+
+      // 4. Suspender licencia B2B y verificar bloqueo COUNTRY_SUBSCRIPTION_SUSPENDED en API externa
+      const suspRes = await req(
+        'PATCH',
+        `/api/v1/external/countries/${countryId}/billing`,
+        { billing_status: 'suspended' },
+        superToken
+      );
+      assert.equal(suspRes.status, 200);
+
+      const blockedSusp = await req(
+        'POST',
+        '/api/v1/external/passes/verify',
+        { qr_token: 'dummy-token-for-b2b-check' },
+        null,
+        { 'x-api-key': rawApiKey }
+      );
+      assert.equal(blockedSusp.status, 403);
+      assert.equal(blockedSusp.data.code, 'COUNTRY_SUBSCRIPTION_SUSPENDED');
+
+      // 5. Vencer fecha de suscripción en estado 'active' -> COUNTRY_SUBSCRIPTION_EXPIRED
+      const expRes = await req(
+        'PATCH',
+        `/api/v1/external/countries/${countryId}/billing`,
+        {
+          billing_status: 'active',
+          subscription_ends_at: '2020-01-01T00:00:00.000Z',
+        },
+        superToken
+      );
+      assert.equal(expRes.status, 200);
+
+      const blockedExp = await req(
+        'POST',
+        '/api/v1/external/passes/verify',
+        { qr_token: 'dummy-token-for-b2b-check' },
+        null,
+        { 'x-api-key': rawApiKey }
+      );
+      assert.equal(blockedExp.status, 403);
+      assert.equal(blockedExp.data.code, 'COUNTRY_SUBSCRIPTION_EXPIRED');
+
+      // 6. Pasar a 'grace' (período de gracia) -> supera el control B2B y llega a PASS_NOT_FOUND (404)
+      const graceRes = await req(
+        'PATCH',
+        `/api/v1/external/countries/${countryId}/billing`,
+        { billing_status: 'grace' },
+        superToken
+      );
+      assert.equal(graceRes.status, 200);
+
+      const allowedGrace = await req(
+        'POST',
+        '/api/v1/external/passes/verify',
+        { qr_token: 'dummy-token-for-b2b-check' },
+        null,
+        { 'x-api-key': rawApiKey }
+      );
+      assert.equal(allowedGrace.status, 404);
+      assert.equal(allowedGrace.data.code, 'PASS_NOT_FOUND');
+    } finally {
+      await db
+        .query(
+          `UPDATE countries
+           SET plan_code = $1,
+               billing_status = $2,
+               subscription_ends_at = $3,
+               monthly_pass_quota = $4
+           WHERE id = $5`,
+          [
+            prevBilling.plan_code || 'pilot',
+            prevBilling.billing_status || 'active',
+            prevBilling.subscription_ends_at || null,
+            prevBilling.monthly_pass_quota ?? null,
+            countryId,
+          ]
+        )
+        .catch(() => {});
+      if (tempIntegrationId) {
+        await db.query('DELETE FROM country_integrations WHERE id = $1', [tempIntegrationId]).catch(() => {});
+      }
+      await db
+        .query("DELETE FROM gate_access_logs WHERE qr_token LIKE 'dummy-to%'")
+        .catch(() => {});
+    }
+  });
 });

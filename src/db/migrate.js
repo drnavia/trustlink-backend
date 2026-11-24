@@ -270,6 +270,27 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    id: '013_countries_b2b_licensing',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.countries
+          ADD COLUMN IF NOT EXISTS plan_code VARCHAR(40) NOT NULL DEFAULT 'pilot',
+          ADD COLUMN IF NOT EXISTS billing_status VARCHAR(20) NOT NULL DEFAULT 'active',
+          ADD COLUMN IF NOT EXISTS subscription_ends_at TIMESTAMP WITHOUT TIME ZONE NULL,
+          ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL;
+      `);
+      await db.query(`
+        ALTER TABLE public.country_integrations
+          ADD COLUMN IF NOT EXISTS api_key_hash VARCHAR(128) NULL,
+          ADD COLUMN IF NOT EXISTS api_key_prefix VARCHAR(24) NULL;
+      `).catch(() => {});
+      await db.query(`
+        ALTER TABLE public.country_integrations
+          ALTER COLUMN api_key DROP NOT NULL;
+      `).catch(() => {});
+    },
+  },
 ];
 
 async function runMigrations() {
