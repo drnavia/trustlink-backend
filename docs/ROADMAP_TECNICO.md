@@ -118,8 +118,23 @@ Para respaldar la promesa de "garantía post-servicio y trazabilidad" frente a l
 
 ---
 
-## Criterio de Ejecución Recomendado
+## Fase 5 (P2): Marketplace, Scoring y Conversión (Completada)
 
-1. **Sprint 1:** Fase 1.1 (bloqueo por vencimiento en QR) + Fase 1.2 (base de datos y ranking de *Socio Verificado* con alta desde Superadmin).
-2. **Sprint 2:** Fase 2 (campos B2B en comunidades y métricas de uso por barrio) + Fase 3 en Sandbox de Mercado Pago.
-3. **Sprint 3:** Salida a producción de Mercado Pago + Fase 4 (conformidad formal y gestión de reclamos).
+- **Migración `017_marketplace_favorites_and_review_tags`:** crea `resident_favorite_providers` (relación única residente → prestador) y agrega `tags JSONB` en `provider_reviews`.
+- **Motor de reputación (`src/utils/providerReputation.js`):** calcula puntaje `/100`, termómetro visual de 5 niveles (`1..5`), medallas por mérito (*Nuevo Verificado*, *Confiable*, *Destacado Oro*, *TrustLink Platino*), degradación por vencimiento/suspensión local y `next_milestone` anti-leakage.
+- **Directorio y Portal Prestador:** prueba social hiper-local (*"X servicios/ingresos verificados en tu barrio"*), filtro *Disponible hoy* conectado a `provider_schedule_blocks`, endpoints de Favoritos (`/api/v1/providers/favorites`), botón *Volver a contratar* en 1 clic, micro-tags tocables en reseñas, sello UX **Hogar Protegido** (`HomeProtectedBadge.jsx`) y tablero *Mi Reputación*.
+
+---
+
+## Fase 5.2 (P2): Ficha Comercial Rápida, Q&A y Buscador Inteligente (Completada)
+
+- **Migración `018_provider_commercial_profile_and_qa`:** agrega `accepts_emergencies`, `quote_visit_policy`, `invoice_type`, `accepted_payment_methods` y `service_bio` a `providers`, y crea `provider_public_questions`.
+- **Backend:** endpoint `PATCH /api/v1/providers/commercial-profile`, cálculo automático de tiempo promedio de respuesta (`computeResponseTimeStats` sobre `visit_requests`) y endpoints de Q&A comunitario (`GET/POST /api/v1/providers/:providerUserId/questions` y `PATCH /api/v1/providers/questions/:questionId/answer`).
+- **Frontend:** buscador inteligente por síntomas y sinónimos (`src/utils/serviceSearchMatcher.js`) en Landing y Directorio, filtro *Urgencias 24h*, ficha comercial rápida en tarjetas, modal Q&A público, panel Q&A/Ficha Comercial en `ProviderDashboard.jsx` y filtros por estrellas y micro-tag en el modal de reseñas.
+
+---
+
+## Estado de Ejecución y Siguiente Etapa
+
+1. **Sprints 1–4 (Completados):** Fases 1, 2, 3 (modo dual), 4, 5 mejoras evolutivas, Fase 5 (Marketplace/Scoring) y Fase 5.2 (Ficha Comercial, Q&A y Buscador Inteligente), con **18/18 tests E2E**, **15/15 unitarios backend** y **6/6 unitarios frontend**.
+2. **Siguiente Etapa (Salida Comercial — Externos):** ver checklist vivo en [PENDIENTES.md](./PENDIENTES.md) (Smoke Test en nube, credenciales reales Mercado Pago, Supabase Storage para documentos + galería *Antes y después*, y Resend/SMTP para emails transaccionales).

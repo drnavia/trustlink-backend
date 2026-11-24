@@ -7,7 +7,7 @@
 ## Resumen de Archivos Clave
 
 - **Script SQL único consolidado (recomendado para arrancar desde cero):** [trustlink-production-init.sql](../database/trustlink-production-init.sql)  
-  Incluye las **21 tablas**, **5 tipos ENUM**, **índices**, **restricciones**, semillas mínimas (`platform_branding` y comunidad inicial), registro de las **16 migraciones (`001`–`016`)** en `schema_migrations`, sincronización de secuencias, plantilla de Superadmin y bloque opcional de blindaje RLS.
+  Incluye las **23 tablas**, **5 tipos ENUM**, **índices**, **restricciones**, semillas mínimas (`platform_branding` y comunidad inicial), registro de las **18 migraciones (`001`–`018`)** en `schema_migrations`, sincronización de secuencias, plantilla de Superadmin y bloque opcional de blindaje RLS.
 - **Migrador incremental CLI (para evoluciones futuras):** [migrate.js](../src/db/migrate.js) (`npm run migrate`).
 - **Configuración de conexión y SSL:** [db.js](../src/config/db.js).
 
@@ -31,12 +31,12 @@
 ### Opción A — Script único consolidado *(Recomendada)*
 1. Abrí el **SQL Editor** en Supabase.
 2. Copiá y ejecutá completo [trustlink-production-init.sql](../database/trustlink-production-init.sql).
-3. Verificá en **Table Editor** que existan las 21 tablas (incluyendo `countries`, `users`, `providers`, `access_passes`, `service_contracts`, `transactions`, `service_disputes`, `provider_subscriptions`, `country_integrations`, `gate_access_logs`, `platform_branding` y `schema_migrations`).
+3. Verificá en **Table Editor** que existan las **23 tablas** (incluyendo `countries`, `users`, `providers`, `access_passes`, `service_contracts`, `transactions`, `service_disputes`, `provider_subscriptions`, `resident_favorite_providers`, `provider_public_questions`, `country_integrations`, `gate_access_logs`, `platform_branding` y `schema_migrations`).
 
 ### Opción B — Vía tradicional en 2 pasos (esquema base + `npm run migrate`)
 Solo si preferís aplicar el histórico por separado:
 1. Ejecutá [script-schema.sql.txt](../database/script-schema.sql.txt) en el SQL Editor (reemplazando el placeholder de `password_hash` y corriendo `SELECT setval(pg_get_serial_sequence('countries', 'id'), COALESCE((SELECT MAX(id) FROM countries), 1));`).
-2. Desde `c:\development\trustlink-backend` en PowerShell, corré las 16 migraciones:
+2. Desde `c:\development\trustlink-backend` en PowerShell, corré las **18 migraciones**:
    ```powershell
    cd c:\development\trustlink-backend
    $env:DATABASE_URL="postgresql://postgres.<PROJECT_REF>:<PASSWORD>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require"
@@ -122,7 +122,7 @@ pg_dump --no-owner --no-privileges -h localhost -U postgres -d trustlink_db -f t
 # 2. Importar en Supabase (Session Pooler)
 psql "postgresql://postgres.<PROJECT_REF>:<PASSWORD>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require" -f trustlink_dump.sql
 
-# 3. Asegurar que las 16 migraciones evolutivas estén aplicadas
+# 3. Asegurar que las 18 migraciones evolutivas estén aplicadas
 $env:DATABASE_URL="postgresql://postgres.<PROJECT_REF>:<PASSWORD>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require"
 $env:DB_SSL="true"
 npm run migrate
