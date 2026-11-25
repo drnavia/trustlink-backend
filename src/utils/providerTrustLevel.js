@@ -122,6 +122,17 @@ function computeProviderTrustLevel({
   const artOk = Boolean(hasArtDoc) && !Boolean(artExpired);
   const hasExpiredDocs = Boolean(criminalExpired) || Boolean(artExpired);
   const effectiveIdentity = Boolean(identityVerified) || Boolean(complianceApproved);
+  const baseChecks = {
+    identity_ok: effectiveIdentity,
+    specialty_ok: Boolean(hasVisibleSpecialty),
+    criminal_ok: criminalOk,
+    criminal_expired: Boolean(criminalExpired),
+    art_ok: artOk,
+    art_expired: Boolean(artExpired),
+    compliance_ok: false,
+    pass_qr_ok: false,
+    member_ok: false,
+  };
 
   // Caso bloqueado: cuenta suspendida o rechazada
   if (!userIsActive || isAllRejected) {
@@ -138,6 +149,7 @@ function computeProviderTrustLevel({
       can_issue_pass: false,
       can_subscribe_verified_partner: false,
       has_expired_docs: hasExpiredDocs,
+      checks: { ...baseChecks },
       next_step_hint: isAllRejected
         ? 'Actualizá tus documentos o especialidad para solicitar una nueva revisión.'
         : 'Contactá a Administración Central para reactivar tu cuenta.',
@@ -160,6 +172,7 @@ function computeProviderTrustLevel({
       can_issue_pass: false,
       can_subscribe_verified_partner: false,
       has_expired_docs: hasExpiredDocs,
+      checks: { ...baseChecks },
       next_step_hint: !hasVisibleSpecialty
         ? 'Agregá al menos 1 especialidad visible para comenzar a figurar al validar tu identidad.'
         : 'Tu identidad (DNI) está pendiente de validación por Administración para habilitar tu Perfil Básico.',
@@ -179,6 +192,7 @@ function computeProviderTrustLevel({
       can_issue_pass: false,
       can_subscribe_verified_partner: false,
       has_expired_docs: true,
+      checks: { ...baseChecks },
       next_step_hint: 'Renová tu documentación vencida para recuperar tu insignia Verificado y Pases QR.',
     };
   }
@@ -196,6 +210,7 @@ function computeProviderTrustLevel({
       can_issue_pass: true,
       can_subscribe_verified_partner: true,
       has_expired_docs: false,
+      checks: { ...baseChecks, compliance_ok: true, pass_qr_ok: true, member_ok: true },
       next_step_hint: 'Nivel máximo alcanzado: tenés prioridad destacada y respaldo completo en garita.',
     };
   }
@@ -213,6 +228,7 @@ function computeProviderTrustLevel({
       can_issue_pass: true,
       can_subscribe_verified_partner: true,
       has_expired_docs: false,
+      checks: { ...baseChecks, compliance_ok: true, pass_qr_ok: true },
       next_step_hint: 'Ya sos Verificado. Podés activar Socio Verificado para obtener prioridad máxima e insignia dorada.',
     };
   }
@@ -230,6 +246,7 @@ function computeProviderTrustLevel({
       can_issue_pass: false,
       can_subscribe_verified_partner: false,
       has_expired_docs: false,
+      checks: { ...baseChecks },
       next_step_hint: 'Cargaste toda tu documentación. Al aprobarse por TrustLink subirás a Nivel 4 (Verificado).',
     };
   }
@@ -247,6 +264,7 @@ function computeProviderTrustLevel({
       can_issue_pass: false,
       can_subscribe_verified_partner: false,
       has_expired_docs: hasExpiredDocs,
+      checks: { ...baseChecks },
       next_step_hint: criminalOk
         ? 'Cargá tu Póliza ART vigente para alcanzar Nivel 3 y pasar a verificación.'
         : 'Cargá tus Antecedentes Penales vigentes para alcanzar Nivel 3 y pasar a verificación.',
@@ -265,6 +283,7 @@ function computeProviderTrustLevel({
     can_issue_pass: false,
     can_subscribe_verified_partner: false,
     has_expired_docs: hasExpiredDocs,
+    checks: { ...baseChecks },
     next_step_hint: 'Cargá tus Antecedentes Penales y Póliza ART vigentes para subir de nivel y habilitar Pases QR.',
   };
 }

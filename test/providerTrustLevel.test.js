@@ -39,6 +39,10 @@ test('Nivel 1 (Perfil Básico): visible en directorio con identidad validada + r
   assert.equal(res.is_verified, false);
   assert.equal(res.can_issue_pass, false);
   assert.equal(res.can_subscribe_verified_partner, false);
+  assert.equal(res.checks.identity_ok, true);
+  assert.equal(res.checks.criminal_ok, false);
+  assert.equal(res.checks.art_ok, false);
+  assert.equal(res.checks.pass_qr_ok, false);
 });
 
 test('Nivel 2 (Respaldo Parcial): reconoce Antecedentes o ART por separado', () => {

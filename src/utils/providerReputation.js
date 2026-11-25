@@ -187,13 +187,13 @@ function computeProviderReputation(metrics = {}) {
     };
   }
 
-  // Etapa 2: Prestador recién aprobado sin historial de trabajos ni reseñas todavía
+  // Etapa 2: Prestador recién registrado sin historial de trabajos ni reseñas todavía
   if (completedJobs === 0 && reviewsCount === 0 && disputesCount === 0) {
     return {
       score: 70,
       thermometer: 3,
       level: 'new',
-      level_label: 'Nuevo Verificado',
+      level_label: 'Nuevo en TrustLink',
       tone: 'sky',
       dispute_rate: 0,
       next_milestone:

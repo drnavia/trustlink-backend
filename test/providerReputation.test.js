@@ -33,8 +33,8 @@ describe('providerReputation helper', () => {
     assert.equal(REVIEW_MICRO_TAGS.length, 6);
   });
 
-  // Caso 2: Prestador recién aprobado sin historial previo recibe etiqueta "Nuevo Verificado"
-  it('clasifica como Nuevo Verificado a un prestador sin trabajos ni reclamos', () => {
+  // Caso 2: Prestador recién registrado sin historial previo recibe etiqueta "Nuevo en TrustLink"
+  it('clasifica como Nuevo en TrustLink a un prestador sin trabajos ni reclamos', () => {
     const rep = computeProviderReputation({
       ratingAvg: 0,
       reviewsCount: 0,
@@ -44,7 +44,7 @@ describe('providerReputation helper', () => {
     });
     assert.equal(rep.level, 'new');
     assert.equal(rep.thermometer, 3);
-    assert.equal(rep.level_label, 'Nuevo Verificado');
+    assert.equal(rep.level_label, 'Nuevo en TrustLink');
   });
 
   // Caso 3: Escalado a Confiable, Destacado Oro y TrustLink Platino según mérito

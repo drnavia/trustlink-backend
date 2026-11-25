@@ -2173,5 +2173,16 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     const meL5 = await req('GET', '/api/v1/providers/me', undefined, p6Token);
     assert.equal(meL5.data.trust_level, 5);
     assert.equal(meL5.data.trust_badge.label, 'Socio Verificado');
+    assert.equal(meL5.data.trust_badge.checks.pass_qr_ok, true);
+    assert.equal(meL5.data.trust_badge.checks.member_ok, true);
+
+    // 8. Limpieza: desactivar cuenta efímera de prueba para no ensuciar el directorio local
+    const cleanupRes = await req(
+      'PATCH',
+      `/api/v1/auth/users/community/${p6UserId}/toggle`,
+      { is_active: false },
+      superToken
+    );
+    assert.equal(cleanupRes.status, 200);
   });
 });
