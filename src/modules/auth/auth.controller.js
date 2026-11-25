@@ -962,6 +962,247 @@ const resetPassword = async (req, res) => {
   }
 };
 
+/**
+ * Lista con paginación y filtros las cuentas generales de la comunidad (Residentes, Prestadores y Duales),
+ * excluyendo roles privilegiados internos (`superadmin`, `admin`, `security`).
+ * Expone tanto el origen inmutable de registro (`initial_origin`) como el perfil activo actual (`current_profile`)
+ * para trazabilidad directa con el tablero de métricas.
+ * GET /api/v1/auth/users/community
+ *
+ * @param {import('express').Request} req - Petición HTTP autenticada de Superadmin con filtros opcionales en query.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ users, summary, pagination }`.
+ * @returns {Promise<import('express').Response>}
+ */
+const getCommunityUsers = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+
+    const page = Math.max(1, Number.parseInt(req.query?.page, 10) || 1);
+    const limit = Math.min(50, Math.max(1, Number.parseInt(req.query?.limit, 10) || 10));
+    const offset = (page - 1) * limit;
+
+    const search = String(req.query?.search || '').trim();
+    const rawCountryId = req.query?.country_id;
+    const countryId =
+      rawCountryId !== undefined && rawCountryId !== '' && rawCountryId !== 'all'
+        ? Number(rawCountryId)
+        : null;
+    if (countryId !== null && (!Number.isInteger(countryId) || countryId <= 0)) {
+      return res.status(400).json({ error: 'country_id inválido.' });
+    }
+
+    const initialOrigin = String(req.query?.initial_origin || 'all').trim().toLowerCase();
+    const currentProfile = String(req.query?.current_profile || 'all').trim().toLowerCase();
+    const statusFilter = String(req.query?.status || 'all').trim().toLowerCase();
+
+    // Base siempre restringida a usuarios comunitarios (excluye operadores internos)
+    const baseClauses = [`LOWER(u.role::text) NOT IN ('superadmin', 'admin', 'security')`];
+    const baseParams = [];
+    if (countryId !== null) {
+      baseParams.push(countryId);
+      baseClauses.push(`u.country_id = $${baseParams.length}`);
+    }
+
+    // Resumen rápido de composición sobre la comunidad filtrada (para los chips del directorio)
+    const summaryRes = await db.query(
+      `
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (
+          WHERE COALESCE(u.can_use_resident, FALSE) = TRUE AND COALESCE(u.can_use_provider, FALSE) = FALSE
+        )::int AS only_resident,
+        COUNT(*) FILTER (
+          WHERE COALESCE(u.can_use_resident, FALSE) = FALSE AND COALESCE(u.can_use_provider, FALSE) = TRUE
+        )::int AS only_provider,
+        COUNT(*) FILTER (
+          WHERE COALESCE(u.can_use_resident, FALSE) = TRUE AND COALESCE(u.can_use_provider, FALSE) = TRUE
+        )::int AS dual,
+        COUNT(*) FILTER (WHERE u.is_active = FALSE)::int AS inactive
+      FROM users u
+      WHERE ${baseClauses.join(' AND ')}
+      `,
+      baseParams
+    );
+
+    // Filtros dinámicos del listado paginado
+    const clauses = [...baseClauses];
+    const params = [...baseParams];
+
+    if (search) {
+      params.push(`%${search}%`);
+      const p = `$${params.length}`;
+      clauses.push(
+        `(
+          u.first_name ILIKE ${p}
+          OR u.last_name ILIKE ${p}
+          OR (u.first_name || ' ' || u.last_name) ILIKE ${p}
+          OR u.email ILIKE ${p}
+          OR u.dni ILIKE ${p}
+          OR COALESCE(u.lot_number, '') ILIKE ${p}
+          OR COALESCE(u.fraction_number, '') ILIKE ${p}
+          OR COALESCE(c.name, '') ILIKE ${p}
+        )`
+      );
+    }
+
+    if (initialOrigin === 'resident') {
+      clauses.push(
+        `COALESCE(NULLIF(LOWER(u.initial_role), ''), LOWER(u.role::text)) IN ('owner', 'family', 'resident')`
+      );
+    } else if (initialOrigin === 'provider') {
+      clauses.push(
+        `COALESCE(NULLIF(LOWER(u.initial_role), ''), LOWER(u.role::text)) = 'provider'`
+      );
+    }
+
+    if (currentProfile === 'only_resident') {
+      clauses.push(
+        `COALESCE(u.can_use_resident, FALSE) = TRUE AND COALESCE(u.can_use_provider, FALSE) = FALSE`
+      );
+    } else if (currentProfile === 'only_provider') {
+      clauses.push(
+        `COALESCE(u.can_use_resident, FALSE) = FALSE AND COALESCE(u.can_use_provider, FALSE) = TRUE`
+      );
+    } else if (currentProfile === 'dual') {
+      clauses.push(
+        `COALESCE(u.can_use_resident, FALSE) = TRUE AND COALESCE(u.can_use_provider, FALSE) = TRUE`
+      );
+    }
+
+    if (statusFilter === 'active') {
+      clauses.push(`u.is_active = TRUE`);
+    } else if (statusFilter === 'inactive') {
+      clauses.push(`u.is_active = FALSE`);
+    }
+
+    const whereSql = clauses.join(' AND ');
+
+    const countRes = await db.query(
+      `SELECT COUNT(*)::int AS total
+       FROM users u
+       LEFT JOIN countries c ON c.id = u.country_id
+       WHERE ${whereSql}`,
+      params
+    );
+    const totalFiltered = Number(countRes.rows[0]?.total || 0);
+    const totalPages = Math.max(1, Math.ceil(totalFiltered / limit));
+
+    const dataParams = [...params, limit, offset];
+    const limitIdx = dataParams.length - 1;
+    const offsetIdx = dataParams.length;
+
+    const listRes = await db.query(
+      `
+      SELECT
+        u.id,
+        u.first_name,
+        u.last_name,
+        u.email,
+        u.dni,
+        u.phone,
+        u.role,
+        COALESCE(NULLIF(LOWER(u.initial_role), ''), LOWER(u.role::text)) AS initial_role,
+        CASE
+          WHEN COALESCE(NULLIF(LOWER(u.initial_role), ''), LOWER(u.role::text)) = 'provider' THEN 'provider'
+          ELSE 'resident'
+        END AS initial_origin,
+        CASE
+          WHEN COALESCE(u.can_use_resident, FALSE) = TRUE AND COALESCE(u.can_use_provider, FALSE) = TRUE THEN 'dual'
+          WHEN COALESCE(u.can_use_provider, FALSE) = TRUE THEN 'only_provider'
+          ELSE 'only_resident'
+        END AS current_profile,
+        COALESCE(u.can_use_resident, FALSE) AS can_use_resident,
+        COALESCE(u.can_use_provider, FALSE) AS can_use_provider,
+        COALESCE(u.primary_portal, 'resident') AS primary_portal,
+        u.country_id,
+        c.name AS country_name,
+        COALESCE(u.fraction_type, 'na') AS fraction_type,
+        u.fraction_number,
+        u.lot_number,
+        u.is_active,
+        u.created_at,
+        (SELECT COUNT(*)::int FROM providers p WHERE p.user_id = u.id) AS provider_specialties_count,
+        EXISTS (
+          SELECT 1 FROM providers p WHERE p.user_id = u.id AND p.status = 'approved'::provider_status
+        ) AS provider_approved
+      FROM users u
+      LEFT JOIN countries c ON c.id = u.country_id
+      WHERE ${whereSql}
+      ORDER BY u.created_at DESC, u.id DESC
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}
+      `,
+      dataParams
+    );
+
+    const sRaw = summaryRes.rows[0] || {};
+    return res.status(200).json({
+      users: listRes.rows,
+      summary: {
+        total: Number(sRaw.total || 0),
+        only_resident: Number(sRaw.only_resident || 0),
+        only_provider: Number(sRaw.only_provider || 0),
+        dual: Number(sRaw.dual || 0),
+        inactive: Number(sRaw.inactive || 0),
+      },
+      pagination: {
+        page,
+        limit,
+        total: totalFiltered,
+        totalPages,
+      },
+    });
+  } catch (error) {
+    console.error('Error al listar cuentas generales de comunidad:', error);
+    return res.status(500).json({ error: 'Error interno al consultar las cuentas de comunidad.' });
+  }
+};
+
+/**
+ * Activa o suspende de forma segura una cuenta comunitaria (Residente, Prestador o Dual)
+ * sin alterar su historial ni permitir operar sobre cuentas privilegiadas.
+ * PATCH /api/v1/auth/users/community/:id/toggle
+ *
+ * @param {import('express').Request} req - Petición HTTP con `:id` en params y `{ is_active }` en body.
+ * @param {import('express').Response} res - Respuesta HTTP con la cuenta actualizada.
+ * @returns {Promise<import('express').Response>}
+ */
+const toggleCommunityUserStatus = async (req, res) => {
+  try {
+    const userId = Number(req.params?.id);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'ID de usuario inválido.' });
+    }
+    if (typeof req.body?.is_active !== 'boolean') {
+      return res.status(400).json({ error: 'Debe indicar el campo booleano is_active.' });
+    }
+
+    const result = await db.query(
+      `
+      UPDATE users
+      SET is_active = $1
+      WHERE id = $2
+        AND LOWER(role::text) NOT IN ('superadmin', 'admin', 'security')
+      RETURNING id, first_name, last_name, email, is_active
+      `,
+      [req.body.is_active, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Cuenta comunitaria no encontrada.' });
+    }
+
+    return res.status(200).json({
+      message: req.body.is_active
+        ? 'Cuenta reactivada correctamente.'
+        : 'Cuenta suspendida correctamente.',
+      user: result.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al actualizar estado de cuenta comunitaria:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar el estado de la cuenta.' });
+  }
+};
+
 module.exports = {
   listPublicCountries,
   register,
@@ -972,4 +1213,6 @@ module.exports = {
   getPrivilegedUsers,
   updatePrivilegedUser,
   getUsersAnalytics,
+  getCommunityUsers,
+  toggleCommunityUserStatus,
 };

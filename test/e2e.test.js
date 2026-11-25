@@ -1978,5 +1978,45 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.ok(b2.providers_registered >= 1 && b2.residents_registered >= 1);
     assert.ok(b3.growth.last_7d_total >= 1);
     assert.ok(Array.isArray(b3.by_community) && b3.by_community.length >= 1);
+
+    // 5. Directorio nominal de cuentas generales (comunidad): filtro por origen + perfil dual y toggle seguro
+    const commForbidden = await req(
+      'GET',
+      '/api/v1/auth/users/community',
+      undefined,
+      switchPrimary.data.token || dualToken
+    );
+    assert.equal(commForbidden.status, 403);
+
+    const commListRes = await req(
+      'GET',
+      `/api/v1/auth/users/community?search=${encodeURIComponent(dualEmail)}&initial_origin=resident&current_profile=dual`,
+      undefined,
+      superToken
+    );
+    assert.equal(commListRes.status, 200);
+    assert.equal(commListRes.data.users.length, 1);
+    const listedDual = commListRes.data.users[0];
+    assert.equal(listedDual.initial_origin, 'resident');
+    assert.equal(listedDual.current_profile, 'dual');
+    assert.equal(listedDual.is_active, true);
+
+    const suspendRes = await req(
+      'PATCH',
+      `/api/v1/auth/users/community/${listedDual.id}/toggle`,
+      { is_active: false },
+      superToken
+    );
+    assert.equal(suspendRes.status, 200);
+    assert.equal(suspendRes.data.user.is_active, false);
+
+    const reactivateRes = await req(
+      'PATCH',
+      `/api/v1/auth/users/community/${listedDual.id}/toggle`,
+      { is_active: true },
+      superToken
+    );
+    assert.equal(reactivateRes.status, 200);
+    assert.equal(reactivateRes.data.user.is_active, true);
   });
 });
