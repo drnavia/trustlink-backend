@@ -22,6 +22,7 @@ const {
   listAllProvidersForOps,
   updateComplianceStatus,
   updateUserComplianceStatus,
+  updateMyIdentityDocument,
   updateUserIdentityVerification,
   listVerifiedProviders,
   listFavoriteProviders,
@@ -54,6 +55,9 @@ router.patch('/profile/:id', verifyToken, verifyRoleOrPortal(['provider', 'super
 
 // Mostrar u ocultar una especialidad en el directorio sin afectar el estado de compliance aprobado
 router.patch('/profile/:id/visibility', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), toggleSpecialtyVisibility);
+
+// Cargar o actualizar el enlace/archivo del documento de identidad (DNI) del prestador autenticado
+router.patch('/identity/document', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), updateMyIdentityDocument);
 
 // Actualizar ficha comercial rápida del prestador (urgencias 24h, presupuesto, facturación, medios de pago y bio)
 router.patch('/commercial-profile', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), updateCommercialProfile);

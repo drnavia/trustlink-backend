@@ -2064,7 +2064,23 @@ describe('TrustLink Backend — E2E Core Suite', () => {
       'Sin identidad validada (Nivel 0) no debe aparecer en el directorio'
     );
 
-    // 2. Superadmin valida identidad básica (DNI) -> pasa a Nivel 1 (Perfil Básico), visible en directorio pero sin Pase QR
+    // 1.5. Prestador carga su archivo/enlace de DNI y verifica que /me y /all lo expongan
+    const dniDocUrl = 'https://docs.test/dni-progresivo-p61.pdf';
+    const uploadDniRes = await req(
+      'PATCH',
+      '/api/v1/providers/identity/document',
+      { dni_document_url: dniDocUrl },
+      p6Token
+    );
+    assert.equal(uploadDniRes.status, 200);
+    assert.equal(uploadDniRes.data.user.dni_document_url, dniDocUrl);
+
+    const meWithDni = await req('GET', '/api/v1/providers/me', undefined, p6Token);
+    assert.equal(meWithDni.status, 200);
+    assert.equal(meWithDni.data.dni_document_url, dniDocUrl);
+    assert.equal(meWithDni.data.trust_level, 0);
+
+    // 2. Superadmin valida DNI -> pasa a Nivel 1 (Perfil Básico), visible en directorio pero sin Pase QR
     const verifyId = await req(
       'PATCH',
       '/api/v1/providers/identity/verify',

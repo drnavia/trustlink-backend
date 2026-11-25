@@ -77,7 +77,8 @@ async function ensureEvolutionSchema() {
         ADD COLUMN IF NOT EXISTS portals_configured BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS initial_role VARCHAR(30) NULL,
         ADD COLUMN IF NOT EXISTS identity_verified BOOLEAN NOT NULL DEFAULT FALSE,
-        ADD COLUMN IF NOT EXISTS identity_verified_at TIMESTAMP WITHOUT TIME ZONE NULL
+        ADD COLUMN IF NOT EXISTS identity_verified_at TIMESTAMP WITHOUT TIME ZONE NULL,
+        ADD COLUMN IF NOT EXISTS dni_document_url TEXT NULL
       `);
 
       // Backfill idempotente de `initial_role` para cuentas creadas antes de la migración 022

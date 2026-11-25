@@ -639,6 +639,21 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 024: Documento de identidad (DNI) adjunto del prestador en `users` (MVP 6.1)
+  // Permite que el prestador cargue el enlace/archivo de su DNI para que Administración
+  // pueda revisarlo antes de aprobar la validación de DNI (Nivel 1).
+  // ---------------------------------------------------------------------------
+  {
+    id: '024_provider_dni_document_url',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.users
+          ADD COLUMN IF NOT EXISTS dni_document_url TEXT NULL;
+      `);
+    },
+  },
 ];
 
 /**

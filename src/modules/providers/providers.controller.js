@@ -1304,9 +1304,9 @@ const getMyProviderProfile = async (req, res) => {
       response_label: responseStats.response_label,
     };
 
-    // Consultar estado de validación de identidad del usuario para calcular nivel progresivo 0..5 (Fase 6.1)
+    // Consultar estado de validación de identidad y archivo DNI del usuario para calcular nivel progresivo 0..5 (Fase 6.1)
     const userIdentityRes = await db.query(
-      'SELECT COALESCE(identity_verified, FALSE) AS identity_verified, identity_verified_at, COALESCE(is_active, TRUE) AS is_active FROM users WHERE id = $1 LIMIT 1',
+      'SELECT dni, dni_document_url, COALESCE(identity_verified, FALSE) AS identity_verified, identity_verified_at, COALESCE(is_active, TRUE) AS is_active FROM users WHERE id = $1 LIMIT 1',
       [userId]
     );
     const userIdentityRow = userIdentityRes.rows[0] || {};
@@ -1318,9 +1318,15 @@ const getMyProviderProfile = async (req, res) => {
         r.is_visible_in_directory !== false
     );
     const meHasCriminalDoc = meRows.some((r) => Boolean(r.criminal_record_url)) ||
-      (versionsRes.rows || []).some((v) => !String(v.doc_type || '').toLowerCase().includes('art') && !String(v.doc_type || '').toLowerCase().includes('seguro'));
+      (versionsRes.rows || []).some((v) => {
+        const dt = String(v.doc_type || '').toLowerCase();
+        return dt.includes('criminal') || dt.includes('anteced');
+      });
     const meHasArtDoc = meRows.some((r) => Boolean(r.insurance_policy_url)) ||
-      (versionsRes.rows || []).some((v) => String(v.doc_type || '').toLowerCase().includes('art') || String(v.doc_type || '').toLowerCase().includes('seguro'));
+      (versionsRes.rows || []).some((v) => {
+        const dt = String(v.doc_type || '').toLowerCase();
+        return dt.includes('art') || dt.includes('seguro') || dt.includes('insurance');
+      });
     const meCrimExpired = meRows.some((r) => isExpiryDatePast(r.criminal_record_expiry));
     const meArtExpired = meRows.some((r) => isExpiryDatePast(r.insurance_expiry));
     const meComplianceApproved = meRows.some((r) => r.status === 'approved');
@@ -1359,6 +1365,8 @@ const getMyProviderProfile = async (req, res) => {
         };
 
     return res.status(200).json({
+      dni: userIdentityRow.dni || null,
+      dni_document_url: userIdentityRow.dni_document_url || null,
       identity_verified: Boolean(userIdentityRow.identity_verified) || meComplianceApproved,
       identity_verified_at: userIdentityRow.identity_verified_at || null,
       trust_level: trustBadge.level,
@@ -1417,6 +1425,7 @@ const listAllProvidersForOps = async (req, res) => {
         u.first_name,
         u.last_name,
         u.dni,
+        u.dni_document_url,
         u.email,
         u.phone,
         COALESCE(u.identity_verified, FALSE) AS identity_verified,
@@ -1676,6 +1685,52 @@ const updateUserComplianceStatus = async (req, res) => {
 };
 
 /**
+ * Registra o actualiza el enlace/archivo del documento de identidad (DNI) del prestador autenticado
+ * para que Administración TrustLink pueda revisarlo y aprobar su validación de DNI (Nivel 1).
+ * PATCH /api/v1/providers/identity/document
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `{ dni_document_url }`.
+ * @param {import('express').Response} res - Respuesta HTTP con el registro actualizado.
+ * @returns {Promise<import('express').Response>}
+ */
+const updateMyIdentityDocument = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const userId = Number(req.user.userId);
+    const rawUrl = String(req.body?.dni_document_url || '').trim();
+
+    if (!rawUrl || rawUrl.length < 4) {
+      return res.status(400).json({
+        error: 'Ingresá el enlace o URL válida de tu documento de identidad (DNI).',
+      });
+    }
+
+    const cleanUrl = rawUrl.slice(0, 1000);
+    const upd = await db.query(
+      `UPDATE users
+       SET dni_document_url = $1
+       WHERE id = $2
+       RETURNING id, first_name, last_name, dni, dni_document_url, identity_verified, identity_verified_at`,
+      [cleanUrl, userId]
+    );
+
+    if (upd.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario no encontrado.' });
+    }
+
+    return res.status(200).json({
+      message: upd.rows[0].identity_verified
+        ? 'Documento de identidad (DNI) actualizado correctamente.'
+        : 'Documento de identidad (DNI) cargado. Administración TrustLink ya puede revisarlo para validar tu DNI.',
+      user: upd.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al cargar documento de identidad (DNI):', error);
+    return res.status(500).json({ error: 'Error interno al guardar el documento de identidad.' });
+  }
+};
+
+/**
  * Valida o revoca la identidad básica (DNI) de un prestador para habilitar o pausar
  * su visibilidad progresiva de Nivel 1 (Perfil Básico) en el directorio de residentes (Fase 6.1).
  * PATCH /api/v1/providers/identity/verify
@@ -1699,7 +1754,7 @@ const updateUserIdentityVerification = async (req, res) => {
        SET identity_verified = $1,
            identity_verified_at = CASE WHEN $1 THEN COALESCE(identity_verified_at, NOW()) ELSE NULL END
        WHERE id = $2
-       RETURNING id, first_name, last_name, dni, email, identity_verified, identity_verified_at`,
+       RETURNING id, first_name, last_name, dni, dni_document_url, email, identity_verified, identity_verified_at`,
       [verified, targetUserId]
     );
 
@@ -1709,13 +1764,13 @@ const updateUserIdentityVerification = async (req, res) => {
 
     return res.status(200).json({
       message: verified
-        ? 'Identidad (DNI) validada correctamente. El prestador ya puede figurar en el directorio si tiene especialidad activa.'
-        : 'Validación de identidad revocada.',
+        ? 'DNI validado correctamente. El prestador ya puede figurar en el directorio si tiene especialidad activa.'
+        : 'Validación de DNI revocada.',
       user: upd.rows[0],
     });
   } catch (error) {
-    console.error('Error al actualizar validación de identidad:', error);
-    return res.status(500).json({ error: 'Error interno al actualizar validación de identidad.' });
+    console.error('Error al actualizar validación de DNI:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar validación de DNI.' });
   }
 };
 
@@ -3032,6 +3087,7 @@ module.exports = {
   listAllProvidersForOps,
   updateComplianceStatus,
   updateUserComplianceStatus,
+  updateMyIdentityDocument,
   updateUserIdentityVerification,
   listVerifiedProviders,
   listFavoriteProviders,
