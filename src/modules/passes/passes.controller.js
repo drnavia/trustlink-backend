@@ -189,6 +189,7 @@ const ensureVisitRequestsTable = async () => {
       fraction_number VARCHAR(100) NULL,
       lot_number VARCHAR(100) NULL,
       preferred_date VARCHAR(50) NULL,
+      preferred_end_date VARCHAR(40) NULL,
       notes TEXT NULL,
       messages JSONB NOT NULL DEFAULT '[]'::jsonb,
       status VARCHAR(30) NOT NULL DEFAULT 'pending_provider',
@@ -201,9 +202,35 @@ const ensureVisitRequestsTable = async () => {
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS fraction_number VARCHAR(100) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS lot_number VARCHAR(100) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS preferred_date VARCHAR(50) NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS preferred_end_date VARCHAR(40) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS notes TEXT NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS messages JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'pending_provider';`);
+};
+
+/**
+ * Calcula una fecha/hora de fin válida para una solicitud de visita asegurando un mínimo
+ * obligatorio de 60 minutos desde el inicio (contemplando visita y traslado entre barrios).
+ *
+ * @param {string|null|undefined} startRaw - Fecha/hora de inicio propuesta.
+ * @param {string|null|undefined} endRaw - Fecha/hora de fin opcional enviada por el cliente.
+ * @param {number} [durationMinutes=60] - Duración deseada en minutos (mínimo 60).
+ * @returns {string|null} ISO UTC de fin o `null` si no hay fecha de inicio válida.
+ */
+const resolveVisitEndDate = (startRaw, endRaw = null, durationMinutes = 60) => {
+  if (!startRaw) return null;
+  const startDate = new Date(startRaw);
+  if (Number.isNaN(startDate.getTime())) return null;
+
+  const minEndMs = startDate.getTime() + 60 * 60 * 1000; // Mínimo 1 hora
+  if (endRaw) {
+    const parsedEnd = new Date(endRaw);
+    if (!Number.isNaN(parsedEnd.getTime()) && parsedEnd.getTime() >= minEndMs) {
+      return parsedEnd.toISOString();
+    }
+  }
+  const safeDuration = Math.max(60, Number(durationMinutes) || 60);
+  return new Date(startDate.getTime() + safeDuration * 60 * 1000).toISOString();
 };
 
 /**
@@ -549,6 +576,7 @@ const getProviderSchedule = async (req, res) => {
   try {
     await ensureScheduleBlocksTable();
     await ensureAvailabilityRulesTable();
+    await ensureVisitRequestsTable();
     await expireOverduePasses();
 
     // Etapa 1: Resolver todos los perfiles de prestador y parámetros de proyección del calendario
@@ -579,6 +607,7 @@ const getProviderSchedule = async (req, res) => {
         days: daysParam,
         rules: mergedRules,
         blocks: [],
+        tentativeVisits: [],
         tzOffsetMinutes: tzOffsetParam,
         includeBlockDetails: true,
       });
@@ -588,12 +617,13 @@ const getProviderSchedule = async (req, res) => {
         slot_minutes: emptyCalendar.slot_minutes,
         calendar_days: emptyCalendar.days,
         blocks: [],
+        tentative_visits: [],
         passes: [],
       });
     }
 
-    // Etapa 2: Consultar bloqueos de agenda (formateados en UTC ISO explícito para evitar desfases locales) y pases QR
-    const [blocksRes, passesRes] = await Promise.all([
+    // Etapa 2: Consultar bloqueos confirmados, potenciales visitas pendientes y pases QR en paralelo
+    const [blocksRes, tentativeVisitsRes, passesRes] = await Promise.all([
       db.query(
         `SELECT
            id,
@@ -607,6 +637,25 @@ const getProviderSchedule = async (req, res) => {
          FROM provider_schedule_blocks
          WHERE provider_id = ANY($1::int[])
          ORDER BY start_at ASC, id DESC`,
+        [providerIds]
+      ),
+      db.query(
+        `SELECT
+           vr.id,
+           vr.provider_id,
+           vr.status,
+           vr.fraction_number,
+           vr.lot_number,
+           vr.preferred_date,
+           vr.preferred_end_date,
+           vr.notes,
+           TRIM(CONCAT(COALESCE(u_owner.first_name, ''), ' ', COALESCE(u_owner.last_name, ''))) AS owner_name
+         FROM visit_requests vr
+         LEFT JOIN users u_owner ON vr.owner_id = u_owner.id
+         WHERE vr.provider_id = ANY($1::int[])
+           AND vr.status IN ('pending_provider', 'pending_resident')
+           AND vr.preferred_date IS NOT NULL
+         ORDER BY vr.id DESC`,
         [providerIds]
       ),
       db.query(
@@ -628,12 +677,13 @@ const getProviderSchedule = async (req, res) => {
       ),
     ]);
 
-    // Etapa 3: Construir la proyección de calendario vivo (con detalle completo de bloques para el prestador)
+    // Etapa 3: Construir la proyección de calendario vivo (incluyendo potenciales visitas para el prestador)
     const calendar = buildMultiDayAvailability({
       startDateStr: startDateParam,
       days: daysParam,
       rules: mergedRules,
       blocks: blocksRes.rows,
+      tentativeVisits: tentativeVisitsRes.rows,
       tzOffsetMinutes: tzOffsetParam,
       includeBlockDetails: true,
     });
@@ -644,6 +694,7 @@ const getProviderSchedule = async (req, res) => {
       slot_minutes: calendar.slot_minutes,
       calendar_days: calendar.days,
       blocks: blocksRes.rows,
+      tentative_visits: tentativeVisitsRes.rows,
       passes: passesRes.rows,
     });
   } catch (error) {
@@ -925,6 +976,8 @@ const createVisitCoordination = async (req, res) => {
       fraction_number,
       lot_number,
       preferred_date,
+      preferred_end_date,
+      duration_minutes,
       notes,
     } = req.body;
 
@@ -973,12 +1026,19 @@ const createVisitCoordination = async (req, res) => {
       },
     ];
 
+    const cleanPreferredDate = preferred_date ? String(preferred_date).trim() : null;
+    const cleanPreferredEndDate = resolveVisitEndDate(
+      cleanPreferredDate,
+      preferred_end_date,
+      duration_minutes || 60
+    );
+
     const inserted = await db.query(
       `INSERT INTO visit_requests (
          country_id, owner_id, provider_id, fraction_number, lot_number,
-         preferred_date, notes, messages, status
+         preferred_date, preferred_end_date, notes, messages, status
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'pending_provider')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'pending_provider')
        RETURNING *`,
       [
         effectiveCountryId,
@@ -986,7 +1046,8 @@ const createVisitCoordination = async (req, res) => {
         Number(provider_id),
         locationResult.fractionDisplay,
         locationResult.lotNumber,
-        preferred_date ? String(preferred_date).trim() : null,
+        cleanPreferredDate,
+        cleanPreferredEndDate,
         cleanNotes,
         JSON.stringify(initialMessages),
       ]
@@ -1195,7 +1256,7 @@ const respondVisitRequest = async (req, res) => {
     // Etapa 1: Validar ID de visita y acción solicitada (`confirm` | `propose` | `decline`)
     const visitId = Number(req.params.id);
     const userId = Number(req.user?.userId || req.user?.id);
-    const { action, preferred_date, reply_text } = req.body;
+    const { action, preferred_date, preferred_end_date, duration_minutes, reply_text } = req.body;
 
     if (!Number.isInteger(visitId) || visitId <= 0) {
       return res.status(400).json({ error: 'ID de visita inválido.' });
@@ -1239,6 +1300,22 @@ const respondVisitRequest = async (req, res) => {
         : 'pending_resident';
 
     const nextDate = cleanProposedDate || visit.preferred_date;
+    // Conservar duración previa o mínimo 60 min si se propuso una nueva fecha sin fin explícito
+    const prevDurationMin =
+      visit.preferred_date && visit.preferred_end_date
+        ? Math.max(
+            60,
+            Math.round(
+              (new Date(visit.preferred_end_date).getTime() - new Date(visit.preferred_date).getTime()) /
+                60000
+            )
+          )
+        : 60;
+    const nextEndDate = resolveVisitEndDate(
+      nextDate,
+      preferred_end_date || (!cleanProposedDate ? visit.preferred_end_date : null),
+      duration_minutes || prevDurationMin
+    );
     const currentMessages = parseMessagesArray(visit.messages);
 
     const readableNextDate = nextDate
@@ -1279,10 +1356,11 @@ const respondVisitRequest = async (req, res) => {
       `UPDATE visit_requests
        SET status = $1,
            preferred_date = $2,
-           messages = $3::jsonb
-       WHERE id = $4
+           preferred_end_date = $3,
+           messages = $4::jsonb
+       WHERE id = $5
        RETURNING *`,
-      [nextStatus, nextDate, JSON.stringify(updatedMessages), visitId]
+      [nextStatus, nextDate, nextEndDate, JSON.stringify(updatedMessages), visitId]
     );
 
     if (normalizedAction === 'confirm' && nextDate) {
@@ -1291,6 +1369,7 @@ const respondVisitRequest = async (req, res) => {
         blockType: 'trustlink_visit',
         title: `Visita TrustLink #${visitId} (${visit.fraction_number || ''} ${visit.lot_number || ''})`.trim(),
         startAt: nextDate,
+        endAt: nextEndDate,
         sourceRef: `visit-${visitId}`,
       });
     } else if (normalizedAction === 'decline') {
@@ -1325,7 +1404,7 @@ const respondVisitRequest = async (req, res) => {
  * sugerir otro día/horario volviendo a `pending_provider`, o `cancel` para cancelar el pedido).
  * PATCH /api/v1/passes/visit-requests/:id/resident-respond
  *
- * @param {import('express').Request} req - Param `id`; body `{ action, preferred_date?, reply_text? }`.
+ * @param {import('express').Request} req - Param `id`; body `{ action, preferred_date?, preferred_end_date?, duration_minutes?, reply_text? }`.
  * @param {import('express').Response} res - Respuesta HTTP 200 con la visita actualizada.
  */
 const respondVisitRequestAsResident = async (req, res) => {
@@ -1335,7 +1414,7 @@ const respondVisitRequestAsResident = async (req, res) => {
     const visitId = Number(req.params.id);
     const userId = Number(req.user?.userId || req.user?.id);
     const isSuperadmin = String(req.user?.role || '').toLowerCase() === 'superadmin';
-    const { action, preferred_date, reply_text } = req.body || {};
+    const { action, preferred_date, preferred_end_date, duration_minutes, reply_text } = req.body || {};
 
     if (!Number.isInteger(visitId) || visitId <= 0) {
       return res.status(400).json({ error: 'ID de visita inválido.' });
@@ -1372,6 +1451,21 @@ const respondVisitRequestAsResident = async (req, res) => {
         ? 'cancelled'
         : 'pending_provider';
     const nextDate = cleanProposedDate || visit.preferred_date;
+    const prevDurationMin =
+      visit.preferred_date && visit.preferred_end_date
+        ? Math.max(
+            60,
+            Math.round(
+              (new Date(visit.preferred_end_date).getTime() - new Date(visit.preferred_date).getTime()) /
+                60000
+            )
+          )
+        : 60;
+    const nextEndDate = resolveVisitEndDate(
+      nextDate,
+      preferred_end_date || (!cleanProposedDate ? visit.preferred_end_date : null),
+      duration_minutes || prevDurationMin
+    );
 
     const readableNextDate = nextDate
       ? (() => {
@@ -1411,10 +1505,11 @@ const respondVisitRequestAsResident = async (req, res) => {
       `UPDATE visit_requests
        SET status = $1,
            preferred_date = $2,
-           messages = $3::jsonb
-       WHERE id = $4
+           preferred_end_date = $3,
+           messages = $4::jsonb
+       WHERE id = $5
        RETURNING *`,
-      [nextStatus, nextDate, JSON.stringify(updatedMessages), visitId]
+      [nextStatus, nextDate, nextEndDate, JSON.stringify(updatedMessages), visitId]
     );
 
     if (normalizedAction === 'accept' && nextDate) {
@@ -1423,6 +1518,7 @@ const respondVisitRequestAsResident = async (req, res) => {
         blockType: 'trustlink_visit',
         title: `Visita TrustLink #${visitId} (${visit.fraction_number || ''} ${visit.lot_number || ''})`.trim(),
         startAt: nextDate,
+        endAt: nextEndDate,
         sourceRef: `visit-${visitId}`,
       });
     } else if (normalizedAction === 'cancel') {

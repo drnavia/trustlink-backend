@@ -577,6 +577,21 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 021: Ventana horaria de cierre en solicitudes de visita (`visit_requests.preferred_end_date`)
+  // Permite registrar duración estimada (mínimo 1 hora contemplando traslados) para reflejar
+  // potenciales visitas en la Agenda Viva del prestador y bloquear el rango exacto al confirmar.
+  // ---------------------------------------------------------------------------
+  {
+    id: '021_visit_requests_preferred_end_date',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.visit_requests
+          ADD COLUMN IF NOT EXISTS preferred_end_date VARCHAR(40) NULL;
+      `);
+    },
+  },
 ];
 
 /**

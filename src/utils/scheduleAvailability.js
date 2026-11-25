@@ -252,12 +252,15 @@ function parseBlockTimestampMs(raw) {
 
 /**
  * Construye las franjas horarias (cada 30 o 60 minutos) de un día calendario específico
- * cruzando la jornada semanal configurada con los bloques activos de agenda.
+ * cruzando la jornada semanal configurada con los bloques confirmados de agenda y,
+ * únicamente para el prestador (`includeBlockDetails = true`), las solicitudes de potencial
+ * visita aún pendientes de confirmación (`tentativeVisits`, sin bloquear todavía para otros residentes).
  *
  * @param {Object} params - Parámetros de generación.
  * @param {string} params.dateStr - Fecha local `YYYY-MM-DD`.
  * @param {Array<Object>} params.rules - Reglas semanales (7 días).
- * @param {Array<Object>} [params.blocks=[]] - Bloques de `provider_schedule_blocks`.
+ * @param {Array<Object>} [params.blocks=[]] - Bloques confirmados/manuales de `provider_schedule_blocks`.
+ * @param {Array<Object>} [params.tentativeVisits=[]] - Solicitudes pendientes (`pending_provider`/`pending_resident`).
  * @param {number} [params.tzOffsetMinutes=180] - Offset en minutos (180 = Argentina UTC-3).
  * @param {number} [params.nowMs=Date.now()] - Instante actual UTC para marcar franjas pasadas.
  * @param {boolean} [params.includeBlockDetails=false] - `true` para Portal Prestador; `false` para privacidad en Residente.
@@ -267,6 +270,7 @@ function buildDaySlots({
   dateStr,
   rules,
   blocks = [],
+  tentativeVisits = [],
   tzOffsetMinutes = 180,
   nowMs = Date.now(),
   includeBlockDetails = false,
@@ -280,7 +284,7 @@ function buildDaySlots({
   const startMin = parseTimeToMinutes(rule.start_time) ?? 8 * 60;
   const endMin = parseTimeToMinutes(rule.end_time) ?? 18 * 60;
 
-  // Pre-parsear bloques válidos una sola vez para cruces O(N)
+  // Pre-parsear bloques confirmados/manuales una sola vez para cruces O(N)
   const parsedBlocks = (blocks || [])
     .map((b) => ({
       ...b,
@@ -289,13 +293,31 @@ function buildDaySlots({
     }))
     .filter((b) => !Number.isNaN(b._startMs) && !Number.isNaN(b._endMs) && b._endMs > b._startMs);
 
+  // Pre-parsear solicitudes tentativas (mínimo 60 min por defecto contemplando traslado) solo para el prestador
+  const parsedTentative = includeBlockDetails
+    ? (tentativeVisits || [])
+        .map((v) => {
+          const sMs = parseBlockTimestampMs(v.preferred_date || v.start_at);
+          if (Number.isNaN(sMs)) return null;
+          const rawEndMs = parseBlockTimestampMs(v.preferred_end_date || v.end_at);
+          const minEndMs = sMs + 60 * 60 * 1000;
+          const eMs = !Number.isNaN(rawEndMs) && rawEndMs >= minEndMs ? rawEndMs : minEndMs;
+          return {
+            ...v,
+            _startMs: sMs,
+            _endMs: eMs,
+          };
+        })
+        .filter(Boolean)
+    : [];
+
   const slots = [];
   if (rule.is_working && endMin > startMin) {
     for (let cursor = startMin; cursor + slotMinutes <= endMin; cursor += slotMinutes) {
       const slotStartMs = localDateMinutesToUtcMs(dateStr, cursor, tzOffsetMinutes);
       const slotEndMs = localDateMinutesToUtcMs(dateStr, cursor + slotMinutes, tzOffsetMinutes);
 
-      // Priorizar bloques de TrustLink (pase/visita) sobre manuales si coexistieran en la misma franja
+      // Priorizar bloques confirmados de TrustLink (pase/visita) sobre manuales
       const overlapping = parsedBlocks.filter(
         (b) => b._startMs < slotEndMs && b._endMs > slotStartMs
       );
@@ -306,9 +328,17 @@ function buildDaySlots({
       });
       const hitBlock = overlapping[0] || null;
 
+      // Solicitud de potencial visita (solo visible en la agenda del prestador; no bloquea a otros residentes)
+      const hitTentative =
+        !hitBlock && includeBlockDetails
+          ? parsedTentative.find((v) => v._startMs < slotEndMs && v._endMs > slotStartMs) || null
+          : null;
+
       let status = 'available';
       if (hitBlock) {
         status = 'busy';
+      } else if (hitTentative) {
+        status = 'tentative';
       } else if (slotEndMs <= nowMs) {
         status = 'past';
       }
@@ -333,12 +363,26 @@ function buildDaySlots({
         };
       }
 
+      if (includeBlockDetails && hitTentative) {
+        slotEntry.tentative_visit = {
+          id: hitTentative.id,
+          status: hitTentative.status,
+          owner_name: hitTentative.owner_name || 'Residente',
+          fraction_number: hitTentative.fraction_number || '',
+          lot_number: hitTentative.lot_number || '',
+          notes: hitTentative.notes || '',
+          start_at: new Date(hitTentative._startMs).toISOString(),
+          end_at: new Date(hitTentative._endMs).toISOString(),
+        };
+      }
+
       slots.push(slotEntry);
     }
   }
 
   const availableCount = slots.filter((s) => s.status === 'available').length;
   const busyCount = slots.filter((s) => s.status === 'busy').length;
+  const tentativeCount = slots.filter((s) => s.status === 'tentative').length;
 
   return {
     date: dateStr,
@@ -351,6 +395,7 @@ function buildDaySlots({
     slot_minutes: slotMinutes,
     available_count: availableCount,
     busy_count: busyCount,
+    tentative_count: tentativeCount,
     total_slots: slots.length,
     slots,
   };
@@ -365,9 +410,10 @@ function buildDaySlots({
  * @param {number} [params.days=7] - Cantidad de días a proyectar (1..14).
  * @param {Array<Object>} params.rules - Reglas semanales del prestador.
  * @param {Array<Object>} [params.blocks=[]] - Bloques horarios del prestador.
+ * @param {Array<Object>} [params.tentativeVisits=[]] - Solicitudes pendientes visibles como tentativas al prestador.
  * @param {number} [params.tzOffsetMinutes=180] - Offset horario del usuario en minutos.
  * @param {number} [params.nowMs=Date.now()] - Instante actual UTC.
- * @param {boolean} [params.includeBlockDetails=false] - Si expone metadatos de bloques (solo prestador).
+ * @param {boolean} [params.includeBlockDetails=false] - Si expone metadatos de bloques y tentativas (solo prestador).
  * @returns {{ start_date: string, schedule_summary: string, slot_minutes: number, rules: Array<Object>, days: Array<Object> }}
  */
 function buildMultiDayAvailability({
@@ -375,6 +421,7 @@ function buildMultiDayAvailability({
   days = 7,
   rules,
   blocks = [],
+  tentativeVisits = [],
   tzOffsetMinutes = 180,
   nowMs = Date.now(),
   includeBlockDetails = false,
@@ -396,6 +443,7 @@ function buildMultiDayAvailability({
         dateStr: currentDate,
         rules: mergedRules,
         blocks,
+        tentativeVisits,
         tzOffsetMinutes,
         nowMs,
         includeBlockDetails,

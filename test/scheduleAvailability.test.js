@@ -114,4 +114,47 @@ describe('scheduleAvailability helper (Fase 5.4)', () => {
     assert.equal(sunday.is_working, false);
     assert.equal(sunday.slots.length, 0);
   });
+
+  // Caso 4: Potenciales visitas pendientes aparecen como `tentative` (mín. 1h) para el prestador SIN bloquear a otros residentes
+  it('muestra potenciales visitas pendientes (mínimo 1h) al prestador sin bloquear disponibilidad para otros residentes', () => {
+    const tentativeVisits = [
+      {
+        id: 12,
+        status: 'pending_provider',
+        owner_name: 'Juan Pérez',
+        fraction_number: 'Fracción 10',
+        lot_number: '3',
+        preferred_date: '2026-11-25T12:00:00Z', // 09:00 Argentina
+        preferred_end_date: null, // Debe aplicar mínimo 1 hora -> 09:00..10:00 (2 franjas de 30 min)
+      },
+    ];
+    const nowMs = Date.parse('2026-11-25T10:00:00Z'); // 07:00 Argentina
+
+    const providerView = buildDaySlots({
+      dateStr: '2026-11-25',
+      rules: DEFAULT_WEEKLY_RULES,
+      blocks: [],
+      tentativeVisits,
+      tzOffsetMinutes: 180,
+      nowMs,
+      includeBlockDetails: true,
+    });
+    assert.equal(providerView.tentative_count, 2);
+    assert.equal(providerView.slots.find((s) => s.time === '09:00').status, 'tentative');
+    assert.equal(providerView.slots.find((s) => s.time === '09:30').status, 'tentative');
+    assert.equal(providerView.slots.find((s) => s.time === '10:00').status, 'available');
+
+    // Para otro residente, las franjas siguen disponibles hasta la confirmación final
+    const otherResidentView = buildDaySlots({
+      dateStr: '2026-11-25',
+      rules: DEFAULT_WEEKLY_RULES,
+      blocks: [],
+      tentativeVisits,
+      tzOffsetMinutes: 180,
+      nowMs,
+      includeBlockDetails: false,
+    });
+    assert.equal(otherResidentView.slots.find((s) => s.time === '09:00').status, 'available');
+    assert.equal(otherResidentView.slots.find((s) => s.time === '09:30').status, 'available');
+  });
 });

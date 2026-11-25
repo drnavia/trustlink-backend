@@ -1812,8 +1812,9 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     const delBlock = await req('DELETE', `/api/v1/passes/schedule/blocks/${createdBlockId}`, undefined, provToken);
     assert.equal(delBlock.status, 200);
 
-    // 6. Circuito completo de acuerdo mutuo de visita:
-    //    Residente pide turno -> Prestador repacta otro horario (pending_resident) -> Residente acepta (confirmed) -> Bloqueo automático en agenda viva
+    // 6. Circuito completo de acuerdo mutuo de visita con ventana mínima 1h y estado tentativo:
+    //    Residente pide turno (10:00->11:00) -> Prestador ve "tentative" en 3. Agenda pero otro residente aún ve "available"
+    //    -> Prestador repacta a 11:30 (pending_resident) -> Residente acepta (confirmed) -> Bloqueo definitivo (11:30 y 12:00 busy)
     const meProv = await req('GET', '/api/v1/providers/me', undefined, provToken);
     const activeProvId = meProv.data.providers[0].id;
     const reqVisit = await req(
@@ -1822,15 +1823,47 @@ describe('TrustLink Backend — E2E Core Suite', () => {
       {
         provider_id: activeProvId,
         preferred_date: `${targetDate}T13:00:00.000Z`,
-        notes: '¿Podés pasar el miércoles a las 10:00?',
+        duration_minutes: 60,
+        notes: '¿Podés pasar el miércoles de 10:00 a 11:00?',
       },
       ownerToken
     );
     assert.equal(reqVisit.status, 201);
     assert.equal(reqVisit.data.visit.status, 'pending_provider');
+    assert.ok(reqVisit.data.visit.preferred_end_date, 'Debe calcular y guardar preferred_end_date (mínimo +1h)');
     const negVisitId = reqVisit.data.visit.id;
 
-    // Prestador repacta a las 11:30 (14:30Z) -> pasa a pending_resident
+    // 6.1. En la agenda del prestador debe figurar como "tentative" (10:00 y 10:30), pero SIN bloquear aún a residentes
+    const provTentativeRes = await req(
+      'GET',
+      `/api/v1/passes/schedule/provider?start_date=${targetDate}&days=1&tz_offset=180`,
+      undefined,
+      provToken
+    );
+    assert.equal(provTentativeRes.status, 200);
+    assert.equal(provTentativeRes.data.calendar_days[0].tentative_count, 2);
+    assert.equal(
+      provTentativeRes.data.calendar_days[0].slots.find((s) => s.time === '10:00').status,
+      'tentative'
+    );
+    assert.equal(
+      provTentativeRes.data.calendar_days[0].slots.find((s) => s.time === '10:30').status,
+      'tentative'
+    );
+
+    const resAvailWhilePending = await req(
+      'GET',
+      `/api/v1/passes/schedule/availability/${provUserId}?start_date=${targetDate}&days=1&tz_offset=180`,
+      undefined,
+      ownerToken
+    );
+    assert.equal(
+      resAvailWhilePending.data.days[0].slots.find((s) => s.time === '10:00').status,
+      'available',
+      'Una solicitud pendiente NO debe bloquear la franja para otros residentes hasta ser confirmada'
+    );
+
+    // 6.2. Prestador repacta a las 11:30 (14:30Z -> 15:30Z) -> pasa a pending_resident
     const repactRes = await req(
       'PATCH',
       `/api/v1/passes/visit-requests/${negVisitId}/respond`,
@@ -1844,7 +1877,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(repactRes.status, 200);
     assert.equal(repactRes.data.visit.status, 'pending_resident');
 
-    // Residente acepta el horario propuesto -> pasa a confirmed y bloquea automáticamente 11:30 en la agenda viva
+    // 6.3. Residente acepta el horario propuesto -> pasa a confirmed y bloquea definitivamente 11:30 y 12:00 para todos
     const acceptRes = await req(
       'PATCH',
       `/api/v1/passes/visit-requests/${negVisitId}/resident-respond`,
@@ -1862,6 +1895,8 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     );
     assert.equal(resAvailAfterAgreement.status, 200);
     const slot1130 = resAvailAfterAgreement.data.days[0].slots.find((s) => s.time === '11:30');
-    assert.equal(slot1130.status, 'busy', 'La visita acordada mutuamente debe quedar reservada en la agenda viva');
+    const slot1200 = resAvailAfterAgreement.data.days[0].slots.find((s) => s.time === '12:00');
+    assert.equal(slot1130.status, 'busy', 'La visita acordada debe bloquear 11:30 en la agenda pública');
+    assert.equal(slot1200.status, 'busy', 'La visita acordada de 1 hora debe bloquear también 12:00');
   });
 });
