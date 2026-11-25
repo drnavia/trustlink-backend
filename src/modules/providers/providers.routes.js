@@ -22,6 +22,7 @@ const {
   listAllProvidersForOps,
   updateComplianceStatus,
   updateUserComplianceStatus,
+  updateUserIdentityVerification,
   listVerifiedProviders,
   listFavoriteProviders,
   addFavoriteProvider,
@@ -83,6 +84,9 @@ router.patch('/compliance', verifyToken, verifyRole(['superadmin']), updateCompl
 
 // Aprobar o rechazar el compliance personal consolidado de un prestador (`user_id`) de una sola vez
 router.patch('/compliance/user', verifyToken, verifyRole(['superadmin']), updateUserComplianceStatus);
+
+// Validar o revocar identidad básica (DNI) de un prestador para habilitar visibilidad Nivel 1 (Fase 6.1)
+router.patch('/identity/verify', verifyToken, verifyRole(['superadmin']), updateUserIdentityVerification);
 
 // ============================================================================
 // 3. DIRECTORIO UNIFICADO DE PRESTADORES VERIFICADOS (Portal Residente / Admin)

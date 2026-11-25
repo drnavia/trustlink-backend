@@ -2019,4 +2019,159 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(reactivateRes.status, 200);
     assert.equal(reactivateRes.data.user.is_active, true);
   });
+
+  // =========================================================================
+  // 22. FASE 6.1: CONFIANZA PROGRESIVA (NIVELES 0..5), IDENTIDAD Y FILTRO VERIFICADOS
+  // =========================================================================
+  it('habilita visibilidad progresiva Nivel 1..5 con identidad validada, exige Nivel 4 para Socio Verificado y filtra Solo Verificados (Fase 6.1)', async () => {
+    const ts = Date.now();
+    const p6Email = `phase61.prov.${ts}@test.com`;
+    const p6Dni = `${String(ts).slice(-6)}96`;
+
+    // 1. Alta de prestador nuevo con especialidad estándar (sin identidad validada ni docs -> Nivel 0, oculto)
+    const reg = await req('POST', '/api/v1/auth/register', {
+      first_name: 'Progresivo',
+      last_name: 'Fase61',
+      dni: p6Dni,
+      email: p6Email,
+      password: 'Password123!',
+      role: 'provider',
+      country_id: 1,
+    });
+    assert.equal(reg.status, 201);
+    const login = await req('POST', '/api/v1/auth/login', {
+      email: p6Email,
+      password: 'Password123!',
+    });
+    assert.equal(login.status, 200);
+    const p6Token = login.data.token;
+    const p6UserId = login.data.user.id;
+
+    const addSpec = await req(
+      'POST',
+      '/api/v1/providers/profile',
+      { specialty: 'Plomero' },
+      p6Token
+    );
+    assert.equal(addSpec.status, 201);
+    const p6ProfId = addSpec.data.provider.id;
+
+    const dirBeforeId = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dirBeforeId.status, 200);
+    assert.equal(
+      dirBeforeId.data.providers.some((p) => Number(p.user_id) === Number(p6UserId)),
+      false,
+      'Sin identidad validada (Nivel 0) no debe aparecer en el directorio'
+    );
+
+    // 2. Superadmin valida identidad básica (DNI) -> pasa a Nivel 1 (Perfil Básico), visible en directorio pero sin Pase QR
+    const verifyId = await req(
+      'PATCH',
+      '/api/v1/providers/identity/verify',
+      { user_id: p6UserId, verified: true },
+      superToken
+    );
+    assert.equal(verifyId.status, 200);
+    assert.equal(verifyId.data.user.identity_verified, true);
+
+    const dirLevel1 = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dirLevel1.status, 200);
+    const entryL1 = dirLevel1.data.providers.find((p) => Number(p.user_id) === Number(p6UserId));
+    assert.ok(entryL1, 'Con identidad validada + rubro debe aparecer como Nivel 1');
+    assert.equal(entryL1.trust_level, 1);
+    assert.equal(entryL1.trust_badge.label, 'Perfil Básico');
+    assert.equal(entryL1.is_verified, false);
+    assert.equal(entryL1.can_issue_pass, false);
+
+    // Con ?verified_only=true NO debe aparecer un prestador Nivel 1
+    const dirVerifiedOnly1 = await req(
+      'GET',
+      '/api/v1/providers/directory?verified_only=true',
+      undefined,
+      ownerToken
+    );
+    assert.equal(dirVerifiedOnly1.status, 200);
+    assert.equal(
+      dirVerifiedOnly1.data.providers.some((p) => Number(p.user_id) === Number(p6UserId)),
+      false,
+      'El filtro verified_only=true debe excluir prestadores Nivel 1..3'
+    );
+
+    // 3. Intentar activar Socio Verificado (Nivel 5) antes de Nivel 4 debe rechazarse con 403
+    const earlySub = await req(
+      'POST',
+      '/api/v1/billing/provider/subscribe',
+      { plan_code: 'verified_monthly' },
+      p6Token
+    );
+    assert.equal(earlySub.status, 403);
+
+    // 4. Cargar Antecedentes -> Nivel 2 (Antecedentes al día)
+    const futureDate = '2029-12-31';
+    const addCrim = await req(
+      'PATCH',
+      `/api/v1/providers/profile/${p6ProfId}`,
+      {
+        criminal_record_url: 'https://docs.test/antecedentes-p61.pdf',
+        criminal_record_expiry: futureDate,
+      },
+      p6Token
+    );
+    assert.equal(addCrim.status, 200);
+    const meL2 = await req('GET', '/api/v1/providers/me', undefined, p6Token);
+    assert.equal(meL2.data.trust_level, 2);
+    assert.equal(meL2.data.trust_badge.label, 'Antecedentes al día');
+
+    // 5. Cargar Póliza ART -> Nivel 3 (Doc. en validación)
+    const addArt = await req(
+      'PATCH',
+      `/api/v1/providers/profile/${p6ProfId}`,
+      {
+        insurance_policy_url: 'https://docs.test/art-p61.pdf',
+        insurance_expiry: futureDate,
+      },
+      p6Token
+    );
+    assert.equal(addArt.status, 200);
+    const meL3 = await req('GET', '/api/v1/providers/me', undefined, p6Token);
+    assert.equal(meL3.data.trust_level, 3);
+    assert.equal(meL3.data.trust_badge.label, 'Doc. en validación');
+
+    // 6. Superadmin aprueba compliance -> Nivel 4 (Verificado), aparece en verified_only=true y habilita suscripción Nivel 5
+    const approveP6 = await req(
+      'PATCH',
+      '/api/v1/providers/compliance/user',
+      { user_id: p6UserId, status: 'approved' },
+      superToken
+    );
+    assert.equal(approveP6.status, 200);
+
+    const dirVerifiedOnly4 = await req(
+      'GET',
+      '/api/v1/providers/directory?verified_only=true',
+      undefined,
+      ownerToken
+    );
+    const entryL4 = dirVerifiedOnly4.data.providers.find(
+      (p) => Number(p.user_id) === Number(p6UserId)
+    );
+    assert.ok(entryL4, 'Nivel 4 Verificado debe aparecer con verified_only=true');
+    assert.equal(entryL4.trust_level, 4);
+    assert.equal(entryL4.trust_badge.label, 'Verificado');
+    assert.equal(entryL4.is_verified, true);
+    assert.equal(entryL4.can_issue_pass, true);
+
+    // 7. Ahora sí puede activar Socio Verificado -> sube a Nivel 5 (Socio Verificado dorado)
+    const subOk = await req(
+      'POST',
+      '/api/v1/billing/provider/subscribe',
+      { plan_code: 'verified_monthly' },
+      p6Token
+    );
+    assert.equal(subOk.status, 201);
+
+    const meL5 = await req('GET', '/api/v1/providers/me', undefined, p6Token);
+    assert.equal(meL5.data.trust_level, 5);
+    assert.equal(meL5.data.trust_badge.label, 'Socio Verificado');
+  });
 });

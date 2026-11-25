@@ -24,6 +24,10 @@ const {
   resolveSpecialtyCatalogMatch,
   REVIEW_MICRO_TAGS,
 } = require('../../utils/providerReputation');
+const {
+  computeProviderTrustLevel,
+  isExpiryDatePast,
+} = require('../../utils/providerTrustLevel');
 
 /**
  * Asegura de forma idempotente la existencia de la tabla `provider_document_versions`.
@@ -1300,6 +1304,41 @@ const getMyProviderProfile = async (req, res) => {
       response_label: responseStats.response_label,
     };
 
+    // Consultar estado de validación de identidad del usuario para calcular nivel progresivo 0..5 (Fase 6.1)
+    const userIdentityRes = await db.query(
+      'SELECT COALESCE(identity_verified, FALSE) AS identity_verified, identity_verified_at, COALESCE(is_active, TRUE) AS is_active FROM users WHERE id = $1 LIMIT 1',
+      [userId]
+    );
+    const userIdentityRow = userIdentityRes.rows[0] || {};
+    const meRows = providersRes.rows || [];
+    const meHasVisibleSpec = meRows.some(
+      (r) =>
+        r.status !== 'rejected' &&
+        String(r.specialty_approval_status || 'approved').toLowerCase() === 'approved' &&
+        r.is_visible_in_directory !== false
+    );
+    const meHasCriminalDoc = meRows.some((r) => Boolean(r.criminal_record_url)) ||
+      (versionsRes.rows || []).some((v) => !String(v.doc_type || '').toLowerCase().includes('art') && !String(v.doc_type || '').toLowerCase().includes('seguro'));
+    const meHasArtDoc = meRows.some((r) => Boolean(r.insurance_policy_url)) ||
+      (versionsRes.rows || []).some((v) => String(v.doc_type || '').toLowerCase().includes('art') || String(v.doc_type || '').toLowerCase().includes('seguro'));
+    const meCrimExpired = meRows.some((r) => isExpiryDatePast(r.criminal_record_expiry));
+    const meArtExpired = meRows.some((r) => isExpiryDatePast(r.insurance_expiry));
+    const meComplianceApproved = meRows.some((r) => r.status === 'approved');
+    const meAllRejected = meRows.length > 0 && meRows.every((r) => r.status === 'rejected');
+
+    const trustBadge = computeProviderTrustLevel({
+      userIsActive: userIdentityRow.is_active !== false,
+      identityVerified: Boolean(userIdentityRow.identity_verified),
+      hasVisibleSpecialty: meHasVisibleSpec,
+      hasCriminalDoc: meHasCriminalDoc,
+      criminalExpired: meCrimExpired,
+      hasArtDoc: meHasArtDoc,
+      artExpired: meArtExpired,
+      complianceApproved: meComplianceApproved,
+      isAllRejected: meAllRejected,
+      isVerifiedMember: Boolean(membership?.is_verified_member),
+    });
+
     const primaryProfile = providersRes.rows[0] || null;
     const commercialProfile = primaryProfile
       ? {
@@ -1320,6 +1359,10 @@ const getMyProviderProfile = async (req, res) => {
         };
 
     return res.status(200).json({
+      identity_verified: Boolean(userIdentityRow.identity_verified) || meComplianceApproved,
+      identity_verified_at: userIdentityRow.identity_verified_at || null,
+      trust_level: trustBadge.level,
+      trust_badge: trustBadge,
       providers: providersRes.rows,
       document_history: versionsRes.rows,
       vehicles,
@@ -1376,6 +1419,8 @@ const listAllProvidersForOps = async (req, res) => {
         u.dni,
         u.email,
         u.phone,
+        COALESCE(u.identity_verified, FALSE) AS identity_verified,
+        u.identity_verified_at,
         COALESCE(u.is_active, TRUE) AS user_is_active,
         COALESCE(p.is_visible_in_directory, TRUE) AS is_visible_in_directory,
         COALESCE(p.specialty, 'Sin especificar (Perfil Incompleto)') AS specialty,
@@ -1498,6 +1543,15 @@ const updateComplianceStatus = async (req, res) => {
     }
 
     const updatedProvider = result.rows[0];
+    if (status === 'approved' && updatedProvider?.user_id) {
+      await db.query(
+        `UPDATE users
+         SET identity_verified = TRUE,
+             identity_verified_at = COALESCE(identity_verified_at, NOW())
+         WHERE id = $1`,
+        [updatedProvider.user_id]
+      );
+    }
     await db.query(
       `
         UPDATE public.provider_document_versions
@@ -1581,6 +1635,16 @@ const updateUserComplianceStatus = async (req, res) => {
       updatedRows = updRes.rows;
     }
 
+    if (status === 'approved') {
+      await db.query(
+        `UPDATE users
+         SET identity_verified = TRUE,
+             identity_verified_at = COALESCE(identity_verified_at, NOW())
+         WHERE id = $1`,
+        [targetUserId]
+      );
+    }
+
     await db.query(
       `UPDATE public.provider_document_versions
        SET status = $1
@@ -1608,6 +1672,50 @@ const updateUserComplianceStatus = async (req, res) => {
   } catch (error) {
     console.error('Error al actualizar compliance personal del prestador:', error);
     return res.status(500).json({ error: 'Error interno al actualizar el compliance personal.' });
+  }
+};
+
+/**
+ * Valida o revoca la identidad básica (DNI) de un prestador para habilitar o pausar
+ * su visibilidad progresiva de Nivel 1 (Perfil Básico) en el directorio de residentes (Fase 6.1).
+ * PATCH /api/v1/providers/identity/verify
+ *
+ * @param {import('express').Request} req - Solicitud HTTP con `{ user_id, verified }`.
+ * @param {import('express').Response} res - Respuesta HTTP con el nuevo estado de identidad.
+ * @returns {Promise<import('express').Response>}
+ */
+const updateUserIdentityVerification = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const targetUserId = parseInt(req.body?.user_id, 10);
+    const verified = req.body?.verified !== undefined ? Boolean(req.body.verified) : true;
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: 'Debe indicar un user_id válido.' });
+    }
+
+    const upd = await db.query(
+      `UPDATE users
+       SET identity_verified = $1,
+           identity_verified_at = CASE WHEN $1 THEN COALESCE(identity_verified_at, NOW()) ELSE NULL END
+       WHERE id = $2
+       RETURNING id, first_name, last_name, dni, email, identity_verified, identity_verified_at`,
+      [verified, targetUserId]
+    );
+
+    if (upd.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario no encontrado.' });
+    }
+
+    return res.status(200).json({
+      message: verified
+        ? 'Identidad (DNI) validada correctamente. El prestador ya puede figurar en el directorio si tiene especialidad activa.'
+        : 'Validación de identidad revocada.',
+      user: upd.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al actualizar validación de identidad:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar validación de identidad.' });
   }
 };
 
@@ -1669,6 +1777,10 @@ const listVerifiedProviders = async (req, res) => {
           u.last_name,
           u.phone,
           u.email,
+          COALESCE(u.identity_verified, FALSE) AS identity_verified,
+          p.status AS profile_status,
+          p.criminal_record_url,
+          p.insurance_policy_url,
           p.specialty,
           p.criminal_record_expiry,
           p.insurance_expiry,
@@ -1719,7 +1831,10 @@ const listVerifiedProviders = async (req, res) => {
           ) AS profile_community_visits
         FROM providers p
         JOIN users u ON p.user_id = u.id
-        WHERE p.status = 'approved'::provider_status
+        WHERE (
+            p.status = 'approved'::provider_status
+            OR (COALESCE(u.identity_verified, FALSE) = TRUE AND p.status = 'pending'::provider_status)
+          )
           AND COALESCE(p.specialty_approval_status, 'approved') = 'approved'
           AND COALESCE(p.is_visible_in_directory, TRUE) = TRUE
           AND COALESCE(u.is_active, TRUE) = TRUE
@@ -1772,6 +1887,12 @@ const listVerifiedProviders = async (req, res) => {
         COALESCE(sub.is_verified_member, FALSE) AS is_verified_member,
         sub.plan_code AS membership_tier,
         sub.ends_at AS membership_ends_at,
+        BOOL_OR(ap.identity_verified) AS identity_verified,
+        BOOL_OR(ap.profile_status = 'approved'::provider_status) AS has_approved_compliance,
+        BOOL_OR(ap.criminal_record_url IS NOT NULL AND BTRIM(ap.criminal_record_url) <> '') AS has_criminal_doc,
+        BOOL_OR(ap.insurance_policy_url IS NOT NULL AND BTRIM(ap.insurance_policy_url) <> '') AS has_art_doc,
+        BOOL_OR(ap.criminal_record_expiry IS NOT NULL AND ap.criminal_record_expiry < CURRENT_DATE) AS criminal_expired,
+        BOOL_OR(ap.insurance_expiry IS NOT NULL AND ap.insurance_expiry < CURRENT_DATE) AS art_expired,
         (
           BOOL_OR(ap.criminal_record_expiry IS NOT NULL AND ap.criminal_record_expiry < CURRENT_DATE)
           OR BOOL_OR(ap.insurance_expiry IS NOT NULL AND ap.insurance_expiry < CURRENT_DATE)
@@ -1939,8 +2060,27 @@ const listVerifiedProviders = async (req, res) => {
         isVerifiedMember: Boolean(row.is_verified_member),
       });
 
+      const trustBadge = computeProviderTrustLevel({
+        userIsActive: true,
+        identityVerified: Boolean(row.identity_verified),
+        hasVisibleSpecialty: true,
+        hasCriminalDoc: Boolean(row.has_criminal_doc),
+        criminalExpired: Boolean(row.criminal_expired),
+        hasArtDoc: Boolean(row.has_art_doc),
+        artExpired: Boolean(row.art_expired),
+        complianceApproved: Boolean(row.has_approved_compliance),
+        isAllRejected: false,
+        isVerifiedMember: Boolean(row.is_verified_member),
+      });
+
       return {
         ...row,
+        identity_verified: Boolean(row.identity_verified) || Boolean(row.has_approved_compliance),
+        trust_level: trustBadge.level,
+        trust_tier: trustBadge.tier,
+        trust_badge: trustBadge,
+        is_verified: trustBadge.is_verified,
+        can_issue_pass: trustBadge.can_issue_pass,
         available_today: availableToday,
         community_jobs_count: communityJobsCount,
         community_visits_count: communityVisitsCount,
@@ -1951,10 +2091,28 @@ const listVerifiedProviders = async (req, res) => {
       };
     });
 
+    // Ordenar priorizando nivel de confianza (5 -> 4 -> 3 -> 2 -> 1), plan pro, rating y user_id
+    enrichedProviders.sort((a, b) => {
+      if (b.trust_level !== a.trust_level) return b.trust_level - a.trust_level;
+      const aPro = a.membership_tier === 'verified_pro' ? 0 : 1;
+      const bPro = b.membership_tier === 'verified_pro' ? 0 : 1;
+      if (aPro !== bPro) return aPro - bPro;
+      const ratingDiff = Number(b.rating_avg || 0) - Number(a.rating_avg || 0);
+      if (ratingDiff !== 0) return ratingDiff;
+      return Number(a.user_id || 0) - Number(b.user_id || 0);
+    });
+
+    const verifiedOnly =
+      String(req.query.verified_only || '').trim().toLowerCase() === 'true' ||
+      String(req.query.verified_only || '').trim() === '1';
+    const finalProviders = verifiedOnly
+      ? enrichedProviders.filter((p) => p.is_verified)
+      : enrichedProviders;
+
     return res.status(200).json({
-      count: enrichedProviders.length,
+      count: finalProviders.length,
       available_review_tags: REVIEW_MICRO_TAGS,
-      providers: enrichedProviders,
+      providers: finalProviders,
     });
   } catch (error) {
     console.error('Error al listar prestadores verificados:', error);
@@ -2874,6 +3032,7 @@ module.exports = {
   listAllProvidersForOps,
   updateComplianceStatus,
   updateUserComplianceStatus,
+  updateUserIdentityVerification,
   listVerifiedProviders,
   listFavoriteProviders,
   addFavoriteProvider,

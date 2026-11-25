@@ -25,8 +25,8 @@ Estos ítems quedan registrados como **pendientes diferidos** (para retomar en l
   - Configurar `PAYMENT_GATEWAY_MODE=mercadopago`, `MP_ACCESS_TOKEN`, `PAYMENT_WEBHOOK_SECRET`, `MP_PUBLIC_APP_URL` y `MP_WEBHOOK_URL`.
   - Probar un cobro real en Sandbox (`TEST-...`) y recepción de webhook firmado (`x-signature`).
   - *(Etapa posterior)* Cobro recurrente automatizado de Membresías **Socio Verificado** y **OAuth Marketplace Split** (liquidación directa 93% prestador / 7% TrustLink).
-- [ ] **Subida Real de Documentos y Fotos (Supabase Storage) + Fase 6 (Confianza Progresiva e IA):**
-  - **Fase 6.1:** Implementar escalera progresiva de insignias (`Perfil Básico` → `Respaldo Parcial` → `Documentación Completa` → `Verificado` → `Socio Verificado` dorado con Nivel 4 obligatorio) y visibilidad temprana en el directorio con filtro *Solo Verificados*, manteniendo el control estricto de garita.
+- [ ] **Subida Real de Documentos y Fotos (Supabase Storage) + Fase 6.2 (Validación Documental IA):**
+  - *(Fase 6.1 completada: niveles `0..5`, insignias progresivas, validación de identidad y filtro Solo Verificados).*
   - **Fase 6.2:** Reemplazar la carga de URLs manuales de DNI, Antecedentes Penales, Póliza ART, seguros vehiculares y cuadrilla por subida directa de PDF/fotos desde celular con enlaces firmados en **Supabase Storage**, integrada con un **validador documental con IA (Gemini Vision / OCR)** que corrobore DNI, titular y fechas `Desde/Hasta` contra lo declarado por el prestador (derivando solo discrepancias a `Administración → Prestadores → Compliance`).
   - **Galería de trabajos ("Antes y después")** en la ficha pública del prestador *(único pendiente de la inspiración Marketplace/Mercado Libre)*.
 - [ ] **Notificaciones Transaccionales Automáticas (Resend / SMTP):**

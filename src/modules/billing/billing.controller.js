@@ -226,6 +226,26 @@ const subscribeProviderMembership = async (req, res) => {
       });
     }
 
+    // 1.5. Regla Fase 6.1: Socio Verificado (Nivel 5) exige tener Nivel 4 (compliance aprobado y documentación vigente)
+    const verifiedCheck = await db.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'approved'::provider_status)::int AS approved_count,
+         BOOL_OR(criminal_record_expiry IS NOT NULL AND criminal_record_expiry < CURRENT_DATE) AS crim_expired,
+         BOOL_OR(insurance_expiry IS NOT NULL AND insurance_expiry < CURRENT_DATE) AS art_expired
+       FROM public.providers
+       WHERE user_id = $1`,
+      [userId]
+    );
+    const vRow = verifiedCheck.rows[0] || {};
+    const hasExpiredPersonalDocs = Boolean(vRow.crim_expired) || Boolean(vRow.art_expired);
+    if (Number(vRow.approved_count || 0) === 0 || hasExpiredPersonalDocs) {
+      return res.status(403).json({
+        error: hasExpiredPersonalDocs
+          ? 'Para activar Socio Verificado (Nivel 5) primero debés renovar tu documentación vencida.'
+          : 'Para activar Socio Verificado (Nivel 5) primero necesitás tener tu perfil Verificado (Nivel 4: identidad, Antecedentes y Póliza ART aprobados).',
+      });
+    }
+
     // 2. Consultar suscripción vigente actual para acumular días desde su fecha de fin (`ends_at`)
     const currentRes = await db.query(
       `SELECT id, ends_at

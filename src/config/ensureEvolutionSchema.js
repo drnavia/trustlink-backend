@@ -67,7 +67,7 @@ async function ensureEvolutionSchema() {
 
   schemaPromise = (async () => {
     try {
-      // 1. Columnas de ubicación estructurada, capacidades duales, portal principal y rol inicial inmutable en `users`
+      // 1. Columnas de ubicación estructurada, capacidades duales, portal principal, rol inicial e identidad validada en `users`
       await db.query(`
         ALTER TABLE users
         ADD COLUMN IF NOT EXISTS fraction_type VARCHAR(20) NOT NULL DEFAULT 'na',
@@ -75,7 +75,9 @@ async function ensureEvolutionSchema() {
         ADD COLUMN IF NOT EXISTS can_use_provider BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS primary_portal VARCHAR(20) NOT NULL DEFAULT 'resident',
         ADD COLUMN IF NOT EXISTS portals_configured BOOLEAN NOT NULL DEFAULT FALSE,
-        ADD COLUMN IF NOT EXISTS initial_role VARCHAR(30) NULL
+        ADD COLUMN IF NOT EXISTS initial_role VARCHAR(30) NULL,
+        ADD COLUMN IF NOT EXISTS identity_verified BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS identity_verified_at TIMESTAMP WITHOUT TIME ZONE NULL
       `);
 
       // Backfill idempotente de `initial_role` para cuentas creadas antes de la migración 022
@@ -83,6 +85,19 @@ async function ensureEvolutionSchema() {
         UPDATE users
         SET initial_role = LOWER(role::text)
         WHERE initial_role IS NULL
+      `);
+
+      // Backfill idempotente de `identity_verified` para prestadores ya aprobados antes de la migración 023
+      await db.query(`
+        UPDATE users u
+        SET
+          identity_verified = TRUE,
+          identity_verified_at = COALESCE(u.identity_verified_at, NOW())
+        WHERE COALESCE(u.identity_verified, FALSE) = FALSE
+          AND EXISTS (
+            SELECT 1 FROM providers p
+            WHERE p.user_id = u.id AND p.status = 'approved'::provider_status
+          )
       `);
 
       // 2. Backfill único solo para cuentas legacy que aún no tienen portals_configured = TRUE.

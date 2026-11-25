@@ -612,6 +612,33 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 023: Confianza progresiva y validación de identidad en `users` (Fase 6.1)
+  // Permite habilitar visibilidad básica (Nivel 1) cuando la identidad (DNI) fue validada
+  // junto con al menos 1 especialidad, manteniendo la auditoría estricta de compliance/garita.
+  // ---------------------------------------------------------------------------
+  {
+    id: '023_provider_progressive_trust_identity',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.users
+          ADD COLUMN IF NOT EXISTS identity_verified BOOLEAN NOT NULL DEFAULT FALSE,
+          ADD COLUMN IF NOT EXISTS identity_verified_at TIMESTAMP WITHOUT TIME ZONE NULL;
+      `);
+      await db.query(`
+        UPDATE public.users u
+        SET
+          identity_verified = TRUE,
+          identity_verified_at = COALESCE(u.identity_verified_at, NOW())
+        WHERE COALESCE(u.identity_verified, FALSE) = FALSE
+          AND EXISTS (
+            SELECT 1 FROM public.providers p
+            WHERE p.user_id = u.id AND p.status = 'approved'::provider_status
+          );
+      `);
+    },
+  },
 ];
 
 /**
