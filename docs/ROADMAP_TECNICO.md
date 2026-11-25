@@ -99,8 +99,8 @@ Hoy `payments.controller.js` ya calcula `platform_fee` (7%) y `provider_payout` 
   - Guardar en `transactions` el `preference_id` inicial y actualizar con el `payment_id` definitivo en el webhook.
   - Adaptar `confirmPayment` para consultar `GET https://api.mercadopago.com/v1/payments/:id` ante notificación real de MP, verificar monto/moneda y garantizar idempotencia estricta (evitar doble acreditación).
   - Mantener un modo `PAYMENT_GATEWAY_MODE=mock|mercadopago` para que los tests E2E locales sigan corriendo sin red.
-- **Cambios en Frontend (`ContractPaymentView.jsx`):**
-  - Redirigir a `init_point` / `sandbox_init_point` cuando el backend devuelva `checkout_url` real, y mostrar estado de retorno (`approved` / `pending` / `rejected`) al volver desde Mercado Pago.
+- **Cambios en Frontend (`ResidentDashboard.jsx` — Paso 4 unificado):**
+  - Redirigir a `init_point` / `sandbox_init_point` cuando el backend devuelva `checkout_url` real, mostrar estado de retorno (`approved` / `pending` / `rejected`) al volver desde Mercado Pago (incluso redirigiendo `/#payments` al Paso 4 del Portal Residente), y gestionar la creación de órdenes desde Pases QR dentro del mismo flujo de 5 pasos sin vistas duplicadas en la barra superior.
 
 ---
 
