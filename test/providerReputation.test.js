@@ -155,4 +155,28 @@ describe('providerReputation helper', () => {
     assert.equal(custom.isStandard, false);
     assert.equal(custom.canonicalSpecialty, 'Instalador de Domótica KNX');
   });
+
+  // Caso 8: Copy de próximo hito sin contradicciones cuando un prestador con puntaje bajo tiene 0 reclamos
+  it('muestra próximo objetivo contextual sin mencionar reclamos cuando disputesCount es 0', () => {
+    const noDisputes = computeProviderReputation({
+      ratingAvg: 3.0,
+      reviewsCount: 1,
+      completedJobs: 1,
+      disputesCount: 0,
+    });
+    assert.equal(noDisputes.level_label, 'En crecimiento');
+    assert.ok(
+      !noDisputes.next_milestone.toLowerCase().includes('reclamo'),
+      'No debe pedir resolver reclamos cuando el prestador tiene 0 reclamos'
+    );
+
+    const withDisputes = computeProviderReputation({
+      ratingAvg: 3.0,
+      reviewsCount: 2,
+      completedJobs: 2,
+      disputesCount: 2,
+    });
+    assert.equal(withDisputes.level_label, 'Requiere mejora');
+    assert.ok(withDisputes.next_milestone.toLowerCase().includes('reclamo'));
+  });
 });

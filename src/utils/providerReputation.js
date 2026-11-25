@@ -278,15 +278,23 @@ function computeProviderReputation(metrics = {}) {
     };
   }
 
+  const hasDisputes = disputesCount > 0;
+  const remainingForSilver = Math.max(1, 2 - completedJobs);
+  const milestoneWithoutDisputes =
+    completedJobs < 2
+      ? `Completá ${remainingForSilver} trabajo(s) más con conformidad y calificación ≥ 4.0 para subir a nivel Confiable.`
+      : 'Sumá trabajos conformados con calificación ≥ 4.0 para mejorar tu puntaje y subir a nivel Confiable.';
+
   return {
     score: rawScore,
     thermometer: rawScore >= 35 ? 2 : 1,
     level: 'bronze',
-    level_label: 'Requiere mejora',
+    level_label: hasDisputes ? 'Requiere mejora' : 'En crecimiento',
     tone: rawScore >= 35 ? 'orange' : 'rose',
     dispute_rate: disputeRate,
-    next_milestone:
-      'Resolvé reclamos pendientes y sumá trabajos conformados con buenas reseñas para recuperar el termómetro verde.',
+    next_milestone: hasDisputes
+      ? 'Resolvé tus reclamos pendientes y sumá trabajos conformados con buenas reseñas para recuperar el termómetro verde.'
+      : milestoneWithoutDisputes,
   };
 }
 
