@@ -1041,9 +1041,17 @@ const getMyCommunityBilling = async (req, res) => {
     await Promise.all([ensureCountriesColumns(), ensureIntegrationsTable(), ensureAuditLogsTable()]);
 
     // Etapa 1: Determinar la comunidad objetivo según el rol autenticado
+    // Para admin local se consulta también `users.country_id` en BD por si fue asignado tras emitir el JWT
     const isSuperadmin = req.user?.role === 'superadmin';
     const requestedCountryId = req.query.country_id ? parseInt(req.query.country_id, 10) : null;
     let targetCountryId = isSuperadmin && requestedCountryId ? requestedCountryId : req.user?.countryId;
+
+    if (!isSuperadmin && !targetCountryId && req.user?.userId) {
+      const userCountryRes = await db.query('SELECT country_id FROM users WHERE id = $1 LIMIT 1', [
+        Number(req.user.userId),
+      ]);
+      targetCountryId = userCountryRes.rows[0]?.country_id || null;
+    }
 
     // Para superadmin sin countryId en sesión ni query, usar la primera comunidad registrada como fallback
     if (!targetCountryId && isSuperadmin) {

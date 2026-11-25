@@ -916,42 +916,66 @@ const buildProviderExpiryAlerts = ({
 }) => {
   const alerts = [];
 
-  // Etapa 1: Evaluar documentación personal de cada perfil (Antecedentes Penales y Póliza ART)
+  // Etapa 1: Evaluar documentación personal agrupada por persona (`user_id`), evitando duplicar
+  // Antecedentes Penales o Póliza ART cuando un mismo prestador tiene múltiples especialidades.
+  const personalDocsByKey = new Map();
   providers.forEach((p) => {
     const meta = providerMetaById[p.id] || {};
     const ownerLabel = meta.provider_name || p.specialty || `Perfil #${p.id}`;
+    const personKey = p.user_id ? `user-${p.user_id}` : `prov-${p.id}`;
 
-    const crimEval = evaluateExpiryDate(p.criminal_record_expiry, windowDays);
-    if (crimEval) {
-      alerts.push({
-        id: `criminal-${p.id}`,
-        provider_id: p.id,
-        provider_name: meta.provider_name || null,
-        provider_phone: meta.provider_phone || null,
-        provider_email: meta.provider_email || null,
-        category: 'criminal_record',
-        target_step: 'credentials',
-        title: 'Antecedentes Penales',
-        subtitle: `${ownerLabel}${p.specialty ? ` · ${p.specialty}` : ''}`,
-        ...crimEval,
-      });
-    }
+    const registerPersonalAlert = (category, title, evalResult, idPrefix) => {
+      if (!evalResult) return;
+      const mapKey = `${category}:${personKey}`;
+      const existing = personalDocsByKey.get(mapKey);
+      if (!existing) {
+        const specialties = p.specialty ? [p.specialty] : [];
+        personalDocsByKey.set(mapKey, {
+          id: `${idPrefix}-${p.user_id || p.id}`,
+          user_id: p.user_id || null,
+          provider_id: p.id,
+          provider_name: meta.provider_name || null,
+          provider_phone: meta.provider_phone || null,
+          provider_email: meta.provider_email || null,
+          category,
+          target_step: 'credentials',
+          title,
+          owner_label: ownerLabel,
+          specialties,
+          subtitle: `${ownerLabel}${specialties.length ? ` · ${specialties.join(' · ')}` : ''}`,
+          ...evalResult,
+        });
+      } else {
+        if (p.specialty && !existing.specialties.includes(p.specialty)) {
+          existing.specialties.push(p.specialty);
+          existing.subtitle = `${existing.owner_label} · ${existing.specialties.join(' · ')}`;
+        }
+        // Si hubiera fechas distintas entre rubros históricos, conservar la más crítica (menor days_remaining)
+        if (evalResult.days_remaining < existing.days_remaining) {
+          existing.days_remaining = evalResult.days_remaining;
+          existing.expiry_date = evalResult.expiry_date;
+          existing.severity = evalResult.severity;
+        }
+      }
+    };
 
-    const insEval = evaluateExpiryDate(p.insurance_expiry, windowDays);
-    if (insEval) {
-      alerts.push({
-        id: `insurance-${p.id}`,
-        provider_id: p.id,
-        provider_name: meta.provider_name || null,
-        provider_phone: meta.provider_phone || null,
-        provider_email: meta.provider_email || null,
-        category: 'provider_art',
-        target_step: 'credentials',
-        title: 'Póliza ART / Seguro Personal',
-        subtitle: `${ownerLabel}${p.specialty ? ` · ${p.specialty}` : ''}`,
-        ...insEval,
-      });
-    }
+    registerPersonalAlert(
+      'criminal_record',
+      'Antecedentes Penales',
+      evaluateExpiryDate(p.criminal_record_expiry, windowDays),
+      'criminal'
+    );
+    registerPersonalAlert(
+      'provider_art',
+      'Póliza ART / Seguro Personal',
+      evaluateExpiryDate(p.insurance_expiry, windowDays),
+      'insurance'
+    );
+  });
+
+  personalDocsByKey.forEach((item) => {
+    const { owner_label: _ignoredOwnerLabel, ...cleanAlert } = item;
+    alerts.push(cleanAlert);
   });
 
   // Etapa 2: Evaluar vencimientos de seguro automotor en toda la flota vehicular registrada
@@ -2291,17 +2315,29 @@ const ensureLocalSuspensionsTable = async () => {
 const listLocalSuspensions = async (req, res) => {
   try {
     // Etapa 1: Asegurar tabla y determinar la comunidad efectiva según el rol (aislamiento multi-tenant)
+    // Si es admin local sin `countryId` en el JWT, se consulta `users.country_id` en BD por si fue asignado tras iniciar sesión
     await ensureLocalSuspensionsTable();
     const countryIdParam = req.query.country_id ? parseInt(req.query.country_id, 10) : null;
     const isSuperadmin = req.user.role === 'superadmin';
-    const effectiveCountryId =
-      isSuperadmin && countryIdParam ? countryIdParam : req.user.countryId;
+    let effectiveCountryId =
+      isSuperadmin && countryIdParam ? countryIdParam : req.user.countryId || null;
+
+    if (!isSuperadmin && !effectiveCountryId && req.user?.userId) {
+      const userCountryRes = await db.query(
+        'SELECT country_id FROM public.users WHERE id = $1 LIMIT 1',
+        [Number(req.user.userId)]
+      );
+      effectiveCountryId = userCountryRes.rows[0]?.country_id || null;
+    }
 
     const params = [];
     let whereClause = '';
-    if (effectiveCountryId && Number.isInteger(effectiveCountryId) && effectiveCountryId > 0) {
-      params.push(effectiveCountryId);
+    if (effectiveCountryId && Number.isInteger(Number(effectiveCountryId)) && Number(effectiveCountryId) > 0) {
+      params.push(Number(effectiveCountryId));
       whereClause = 'WHERE pls.country_id = $1';
+    } else if (!isSuperadmin) {
+      // Admin local sin barrio asignado: no exponer suspensiones de otras comunidades
+      whereClause = 'WHERE 1 = 0';
     }
 
     // Etapa 2: Preparar la consulta de suspensiones (priorizando activas) y catálogos para el panel
@@ -2334,7 +2370,7 @@ const listLocalSuspensions = async (req, res) => {
       ? db.query('SELECT id, name, is_active FROM public.countries ORDER BY id ASC')
       : effectiveCountryId
       ? db.query('SELECT id, name, is_active FROM public.countries WHERE id = $1 ORDER BY id ASC', [
-          effectiveCountryId,
+          Number(effectiveCountryId),
         ])
       : Promise.resolve({ rows: [] });
 
@@ -2385,10 +2421,24 @@ const createLocalSuspension = async (req, res) => {
     // Etapa 1: Asegurar tabla, resolver comunidad según rol y validar campos obligatorios
     await ensureLocalSuspensionsTable();
     const { provider_id, reason, country_id } = req.body;
-    const effectiveCountryId =
+    let effectiveCountryId =
       req.user.role === 'superadmin' && country_id
         ? parseInt(country_id, 10)
-        : req.user.countryId;
+        : req.user.countryId || null;
+
+    if (req.user.role !== 'superadmin' && !effectiveCountryId && req.user?.userId) {
+      const userCountryRes = await db.query(
+        'SELECT country_id FROM public.users WHERE id = $1 LIMIT 1',
+        [Number(req.user.userId)]
+      );
+      effectiveCountryId = userCountryRes.rows[0]?.country_id || null;
+    }
+
+    if (!effectiveCountryId) {
+      return res.status(400).json({
+        error: 'Tu cuenta no tiene una comunidad asignada para registrar suspensiones locales.',
+      });
+    }
 
     if (!provider_id || !reason || !String(reason).trim()) {
       return res.status(400).json({ error: 'Debe indicar el prestador y el motivo del reporte.' });
