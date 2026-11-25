@@ -1709,7 +1709,17 @@ const listVerifiedProviders = async (req, res) => {
         STRING_AGG(DISTINCT ap.specialty, ' · ' ORDER BY ap.specialty) AS specialties_label,
         ARRAY_AGG(DISTINCT ap.specialty ORDER BY ap.specialty) AS specialties,
         (ARRAY_AGG(ap.specialty ORDER BY ap.ordered_id ASC))[1] AS specialty,
-        ROUND(AVG(ap.rating_avg)::numeric, 2) AS rating_avg,
+        -- Promedio consolidado real a nivel persona desde provider_reviews (evita dilucion por especialidades sin resenas)
+        COALESCE(
+          (
+            SELECT ROUND(AVG(pr.rating)::numeric, 2)
+            FROM provider_reviews pr
+            JOIN providers p_rev ON p_rev.id = pr.provider_id
+            WHERE p_rev.user_id = ap.user_id
+          ),
+          ROUND(AVG(ap.rating_avg) FILTER (WHERE ap.rating_avg > 0)::numeric, 2),
+          0.00
+        ) AS rating_avg,
         COALESCE(SUM(ap.profile_jobs), 0)::int AS total_jobs,
         COALESCE(SUM(ap.profile_completed_jobs), 0)::int AS completed_jobs,
         COALESCE(SUM(ap.profile_reviews_count), 0)::int AS reviews_count,
@@ -1760,8 +1770,8 @@ const listVerifiedProviders = async (req, res) => {
           JOIN providers p_blk ON p_blk.id = psb.provider_id
           WHERE p_blk.user_id = ap.user_id
             AND psb.block_type = 'unavailable'
-            AND psb.start_at < (CURRENT_DATE + INTERVAL '1 day')
-            AND psb.end_at > NOW()
+            AND psb.start_at < (date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')
+            AND psb.end_at > (NOW() AT TIME ZONE 'UTC')
         ) AS has_open_schedule_today,
         COALESCE(
           (
@@ -1849,7 +1859,7 @@ const listVerifiedProviders = async (req, res) => {
       ORDER BY
         COALESCE(sub.is_verified_member, FALSE) DESC,
         CASE WHEN sub.plan_code = 'verified_pro' THEN 0 ELSE 1 END ASC,
-        AVG(ap.rating_avg) DESC,
+        rating_avg DESC,
         ap.user_id ASC;
     `;
 

@@ -1689,6 +1689,23 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     const meAfterEdit = await req('GET', '/api/v1/providers/me', undefined, provToken);
     assert.equal((meAfterEdit.data.document_history || []).length, docsCountBeforeEdit);
 
+    // 6.5. Verificar que con múltiples especialidades aprobadas el directorio NO diluye `rating_avg` ni `reputation.score`
+    const dirMultiSpec = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
+    assert.equal(dirMultiSpec.status, 200);
+    const provInDir = dirMultiSpec.data.providers.find((p) => Number(p.user_id) === Number(provUserId));
+    assert.ok(provInDir, 'El prestador multi-especialidad debe figurar en el directorio');
+    assert.ok(Array.isArray(provInDir.specialties) && provInDir.specialties.length >= 2);
+    assert.equal(
+      Number(provInDir.rating_avg),
+      Number(meAfterEdit.data.reputation.rating_avg),
+      'El rating del directorio debe coincidir exactamente con el scoring real del prestador sin diluirse por especialidades sin reseñas'
+    );
+    assert.equal(
+      Number(provInDir.reputation.score),
+      Number(meAfterEdit.data.reputation.score),
+      'El puntaje de reputación del directorio debe coincidir con el tablero Mi Reputación'
+    );
+
     // 7. Renovar 1 documento personal (ART) lo propaga a todas las especialidades del usuario y agrega exactamente 1 versión al historial
     const renewedArtUrl = 'https://storage.trustlink.com/art_renovada_2027.pdf';
     const renewArtRes = await req(
