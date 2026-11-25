@@ -1728,4 +1728,88 @@ describe('TrustLink Backend — E2E Core Suite', () => {
       'La renovación de ART debe sincronizarse en todas las especialidades del mismo prestador'
     );
   });
+
+  // =========================================================================
+  // FASE 11: Fase 5.4 — Calendario Vivo (Jornada Semanal, Franjas cada 30 min y Privacidad Residente)
+  // =========================================================================
+  it('configura jornada semanal cada 30 min, bloquea trabajo externo y expone disponibilidad privada al residente (Fase 5.4)', async () => {
+    const provAccount = await req('GET', '/api/v1/account/me', undefined, provToken);
+    assert.equal(provAccount.status, 200);
+    const provUserId = Number(provAccount.data.account?.id || provAccount.data.user?.id);
+
+    // 1. Configurar jornada semanal: Lun-Vie 09:00..17:00, Sáb y Dom no laborables, franjas cada 30 min
+    const rulesPayload = [
+      { day_of_week: 1, is_working: true, start_time: '09:00', end_time: '17:00', slot_minutes: 30 },
+      { day_of_week: 2, is_working: true, start_time: '09:00', end_time: '17:00', slot_minutes: 30 },
+      { day_of_week: 3, is_working: true, start_time: '09:00', end_time: '17:00', slot_minutes: 30 },
+      { day_of_week: 4, is_working: true, start_time: '09:00', end_time: '17:00', slot_minutes: 30 },
+      { day_of_week: 5, is_working: true, start_time: '09:00', end_time: '17:00', slot_minutes: 30 },
+      { day_of_week: 6, is_working: false, start_time: '09:00', end_time: '13:00', slot_minutes: 30 },
+      { day_of_week: 0, is_working: false, start_time: '09:00', end_time: '13:00', slot_minutes: 30 },
+    ];
+    const saveRulesRes = await req(
+      'PUT',
+      '/api/v1/passes/schedule/rules',
+      { slot_minutes: 30, rules: rulesPayload },
+      provToken
+    );
+    assert.equal(saveRulesRes.status, 200);
+    assert.equal(saveRulesRes.data.slot_minutes, 30);
+    assert.equal(saveRulesRes.data.rules.length, 7);
+
+    // 2. Bloquear un trabajo externo en el próximo Miércoles (2026-12-02) de 10:00 a 11:00 (Argentina UTC-3 = 13:00Z..14:00Z)
+    const targetDate = '2026-12-02';
+    const extBlockRes = await req(
+      'POST',
+      '/api/v1/passes/schedule/blocks',
+      {
+        block_type: 'external_visit',
+        title: 'Obra confidencial cliente externo',
+        start_at: `${targetDate}T13:00:00.000Z`,
+        end_at: `${targetDate}T14:00:00.000Z`,
+      },
+      provToken
+    );
+    assert.equal(extBlockRes.status, 201);
+    const createdBlockId = extBlockRes.data.block.id;
+
+    // 3. El prestador ve su calendario vivo con detalle completo del trabajo externo en 10:00 y 10:30
+    const provSchedRes = await req(
+      'GET',
+      `/api/v1/passes/schedule/provider?start_date=${targetDate}&days=3&tz_offset=180`,
+      undefined,
+      provToken
+    );
+    assert.equal(provSchedRes.status, 200);
+    assert.equal(provSchedRes.data.calendar_days.length, 3);
+    const provDay = provSchedRes.data.calendar_days[0];
+    assert.equal(provDay.slots.length, 16); // 09:00..17:00 cada 30 min = 16 franjas
+    const provSlot1000 = provDay.slots.find((s) => s.time === '10:00');
+    const provSlot1030 = provDay.slots.find((s) => s.time === '10:30');
+    const provSlot1100 = provDay.slots.find((s) => s.time === '11:00');
+    assert.equal(provSlot1000.status, 'busy');
+    assert.equal(provSlot1030.status, 'busy');
+    assert.equal(provSlot1000.block.title, 'Obra confidencial cliente externo');
+    assert.equal(provSlot1100.status, 'available');
+
+    // 4. El residente consulta disponibilidad pública -> ve 10:00/10:30 ocupadas y 11:00 libre, SIN título privado
+    const resAvail = await req(
+      'GET',
+      `/api/v1/passes/schedule/availability/${provUserId}?start_date=${targetDate}&days=3&tz_offset=180`,
+      undefined,
+      ownerToken
+    );
+    assert.equal(resAvail.status, 200);
+    assert.equal(resAvail.data.days.length, 3);
+    const resDay = resAvail.data.days[0];
+    const resSlot1000 = resDay.slots.find((s) => s.time === '10:00');
+    const resSlot1100 = resDay.slots.find((s) => s.time === '11:00');
+    assert.equal(resSlot1000.status, 'busy');
+    assert.equal(resSlot1000.block, undefined, 'Nunca debe exponer metadatos privados al residente');
+    assert.equal(resSlot1100.status, 'available');
+
+    // 5. Liberar el trabajo externo -> vuelve a quedar disponible
+    const delBlock = await req('DELETE', `/api/v1/passes/schedule/blocks/${createdBlockId}`, undefined, provToken);
+    assert.equal(delBlock.status, 200);
+  });
 });

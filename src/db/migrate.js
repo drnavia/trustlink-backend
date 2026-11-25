@@ -548,6 +548,35 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 020: Jornada semanal configurable del prestador (`provider_availability_rules`) — Fase 5.4
+  // Permite que cada prestador configure por día de la semana (`0` Dom .. `6` Sáb) si trabaja,
+  // su franja horaria (`start_time` / `end_time`) y el intervalo de turnos (`30` o `60` minutos)
+  // para alimentar el calendario vivo compartido con residentes.
+  // ---------------------------------------------------------------------------
+  {
+    id: '020_provider_weekly_availability',
+    run: async () => {
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS public.provider_availability_rules (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+          day_of_week SMALLINT NOT NULL CHECK (day_of_week >= 0 AND day_of_week <= 6),
+          is_working BOOLEAN NOT NULL DEFAULT TRUE,
+          start_time VARCHAR(5) NOT NULL DEFAULT '08:00',
+          end_time VARCHAR(5) NOT NULL DEFAULT '18:00',
+          slot_minutes SMALLINT NOT NULL DEFAULT 30 CHECK (slot_minutes IN (30, 60)),
+          updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+          UNIQUE (user_id, day_of_week)
+        );
+      `);
+      await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_provider_availability_rules_user
+        ON public.provider_availability_rules (user_id, day_of_week);
+      `);
+    },
+  },
 ];
 
 /**

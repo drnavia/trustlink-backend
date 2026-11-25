@@ -4,7 +4,7 @@ API REST modular de **TrustLink** — plataforma inteligente de servicios verifi
 
 > Documentación viva del proyecto:
 > - Negocio y producto: [docs/TRUSTLINK_MASTER_BRIEF.md](./docs/TRUSTLINK_MASTER_BRIEF.md)
-> - Roadmap técnico (Fases 1–5.3): [docs/ROADMAP_TECNICO.md](./docs/ROADMAP_TECNICO.md)
+> - Roadmap técnico (Fases 1–5.4): [docs/ROADMAP_TECNICO.md](./docs/ROADMAP_TECNICO.md)
 > - Puesta en producción en Supabase desde cero: [docs/DEPLOY_SUPABASE.md](./docs/DEPLOY_SUPABASE.md) + script SQL único [database/trustlink-production-init.sql](./database/trustlink-production-init.sql)
 > - Backlog diferido (externos y smoke test): [docs/PENDIENTES.md](./docs/PENDIENTES.md)
 
@@ -13,9 +13,9 @@ API REST modular de **TrustLink** — plataforma inteligente de servicios verifi
 ## Stack Tecnológico
 
 - **Runtime:** Node.js + Express (`src/server.js`)
-- **Base de datos:** PostgreSQL (`pg`) con soporte dual local (`DB_*`) y nube (`DATABASE_URL` + SSL dinámico) y 19 migraciones idempotentes (`src/db/migrate.js`)
+- **Base de datos:** PostgreSQL (`pg`) con soporte dual local (`DB_*`) y nube (`DATABASE_URL` + SSL dinámico) y 20 migraciones idempotentes (`src/db/migrate.js`)
 - **Autenticación y Seguridad:** JWT (`jsonwebtoken`), `bcryptjs`, cabeceras HTTP de hardening y rate limiting (`src/middlewares/security.middleware.js`)
-- **Tests:** Runner nativo de Node (`node --test`) — 19 tests E2E + 16 tests unitarios (`complianceExpiry`, `mercadopagoService`, `providerReputation`)
+- **Tests:** Runner nativo de Node (`node --test`) — 20 tests E2E + 20 tests unitarios (`complianceExpiry`, `mercadopagoService`, `providerReputation`, `scheduleAvailability`)
 
 ---
 

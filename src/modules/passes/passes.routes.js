@@ -10,6 +10,8 @@
 const { Router } = require('express');
 const {
   getProviderSchedule,
+  saveProviderAvailabilityRules,
+  getProviderPublicAvailability,
   createScheduleBlock,
   deleteScheduleBlock,
   createVisitCoordination,
@@ -29,12 +31,18 @@ const { verifyToken, verifyRole, verifyRoleOrPortal } = require('../../middlewar
 const router = Router();
 
 // ============================================================================
-// 1. AGENDA Y BLOQUEOS HORARIOS DEL PRESTADOR (Portal Prestador)
+// 1. AGENDA VIVA, JORNADA SEMANAL Y BLOQUEOS HORARIOS (Prestador <-> Residente)
 // ============================================================================
-// Consultar agenda combinada (bloqueos manuales + pases confirmados) del prestador autenticado
+// Consultar agenda combinada (jornada semanal, calendario vivo cada 30 min, bloqueos y pases) del prestador
 router.get('/schedule/provider', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), getProviderSchedule);
 
-// Crear un bloqueo de no disponibilidad o reserva en la agenda del prestador
+// Guardar configuración semanal del prestador (días laborables, desde/hasta e intervalo 30/60 min)
+router.put('/schedule/rules', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), saveProviderAvailabilityRules);
+
+// Consultar disponibilidad viva (libre/ocupado sin exponer datos privados) de un prestador para residentes
+router.get('/schedule/availability/:providerUserId', verifyToken, verifyRoleOrPortal(['owner', 'family', 'admin', 'superadmin'], 'resident'), getProviderPublicAvailability);
+
+// Crear un bloqueo de no disponibilidad o visita externa en la agenda del prestador
 router.post('/schedule/blocks', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), createScheduleBlock);
 
 // Eliminar un bloqueo horario propio por ID

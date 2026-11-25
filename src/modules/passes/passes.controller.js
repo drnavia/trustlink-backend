@@ -14,6 +14,38 @@ const {
   findComplianceExpiryViolation,
   hydrateAuthorizedEmployeesExpiry,
 } = require('../../utils/complianceExpiry');
+const {
+  normalizeWeeklyRulesInput,
+  mergeWithDefaultRules,
+  buildScheduleSummaryText,
+  buildMultiDayAvailability,
+} = require('../../utils/scheduleAvailability');
+
+/**
+ * Asegura de forma idempotente la tabla `provider_availability_rules` (Fase 5.4)
+ * donde cada prestador configura su jornada semanal (días laborables, desde/hasta e intervalo 30/60 min).
+ *
+ * @returns {Promise<void>}
+ */
+const ensureAvailabilityRulesTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS public.provider_availability_rules (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+      day_of_week SMALLINT NOT NULL CHECK (day_of_week >= 0 AND day_of_week <= 6),
+      is_working BOOLEAN NOT NULL DEFAULT TRUE,
+      start_time VARCHAR(5) NOT NULL DEFAULT '08:00',
+      end_time VARCHAR(5) NOT NULL DEFAULT '18:00',
+      slot_minutes SMALLINT NOT NULL DEFAULT 30 CHECK (slot_minutes IN (30, 60)),
+      updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+      UNIQUE (user_id, day_of_week)
+    );
+  `);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_provider_availability_rules_user
+    ON public.provider_availability_rules (user_id, day_of_week);
+  `);
+};
 
 /**
  * Asegura de forma idempotente la existencia de la tabla `gate_access_logs`
@@ -516,55 +548,241 @@ const resolveResidentLocation = async (residentUserId, requestedFractionNumber, 
 const getProviderSchedule = async (req, res) => {
   try {
     await ensureScheduleBlocksTable();
+    await ensureAvailabilityRulesTable();
     await expireOverduePasses();
 
-    // Etapa 1: Resolver todos los perfiles de prestador asociados al usuario autenticado
+    // Etapa 1: Resolver todos los perfiles de prestador y parámetros de proyección del calendario
     const userId = Number(req.user?.userId || req.user?.id);
-    const providerProfilesRes = await db.query(
-      'SELECT id FROM providers WHERE user_id = $1',
-      [userId]
-    );
+    const startDateParam = req.query.start_date ? String(req.query.start_date).trim() : undefined;
+    const daysParam = req.query.days ? Number(req.query.days) : 7;
+    const tzOffsetParam =
+      req.query.tz_offset !== undefined && !Number.isNaN(Number(req.query.tz_offset))
+        ? Number(req.query.tz_offset)
+        : 180;
+
+    const [providerProfilesRes, rulesRes] = await Promise.all([
+      db.query('SELECT id FROM providers WHERE user_id = $1', [userId]),
+      db.query(
+        `SELECT day_of_week, is_working, start_time, end_time, slot_minutes
+         FROM public.provider_availability_rules
+         WHERE user_id = $1
+         ORDER BY day_of_week ASC`,
+        [userId]
+      ),
+    ]);
     const providerIds = providerProfilesRes.rows.map((r) => Number(r.id)).filter(Boolean);
+    const mergedRules = mergeWithDefaultRules(rulesRes.rows);
 
     if (providerIds.length === 0) {
-      return res.status(200).json({ blocks: [], passes: [] });
+      const emptyCalendar = buildMultiDayAvailability({
+        startDateStr: startDateParam,
+        days: daysParam,
+        rules: mergedRules,
+        blocks: [],
+        tzOffsetMinutes: tzOffsetParam,
+        includeBlockDetails: true,
+      });
+      return res.status(200).json({
+        rules: emptyCalendar.rules,
+        schedule_summary: emptyCalendar.schedule_summary,
+        slot_minutes: emptyCalendar.slot_minutes,
+        calendar_days: emptyCalendar.days,
+        blocks: [],
+        passes: [],
+      });
     }
 
-    // Etapa 2: Consultar bloqueos de agenda (manuales, visitas externas y reservas TrustLink)
-    const blocksRes = await db.query(
-      `SELECT *
-       FROM provider_schedule_blocks
-       WHERE provider_id = ANY($1::int[])
-       ORDER BY start_at ASC, id DESC`,
-      [providerIds]
-    );
+    // Etapa 2: Consultar bloqueos de agenda (formateados en UTC ISO explícito para evitar desfases locales) y pases QR
+    const [blocksRes, passesRes] = await Promise.all([
+      db.query(
+        `SELECT
+           id,
+           provider_id,
+           block_type,
+           title,
+           TO_CHAR(start_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS start_at,
+           TO_CHAR(end_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS end_at,
+           source_ref,
+           created_at
+         FROM provider_schedule_blocks
+         WHERE provider_id = ANY($1::int[])
+         ORDER BY start_at ASC, id DESC`,
+        [providerIds]
+      ),
+      db.query(
+        `SELECT
+           ap.id,
+           ap.provider_id,
+           ap.fraction_number,
+           ap.lot_number,
+           ap.start_time,
+           ap.end_time,
+           ap.status,
+           TRIM(CONCAT(COALESCE(u_owner.first_name, ''), ' ', COALESCE(u_owner.last_name, ''))) AS owner_name
+         FROM access_passes ap
+         LEFT JOIN users u_owner ON ap.owner_id = u_owner.id
+         WHERE ap.provider_id = ANY($1::int[])
+           AND ap.status IN ('pending'::pass_status, 'used'::pass_status)
+         ORDER BY ap.start_time ASC`,
+        [providerIds]
+      ),
+    ]);
 
-    // Etapa 3: Consultar pases QR activos o ya utilizados para superponer en la agenda
-    const passesRes = await db.query(
-      `SELECT
-         ap.id,
-         ap.provider_id,
-         ap.fraction_number,
-         ap.lot_number,
-         ap.start_time,
-         ap.end_time,
-         ap.status,
-         TRIM(CONCAT(COALESCE(u_owner.first_name, ''), ' ', COALESCE(u_owner.last_name, ''))) AS owner_name
-       FROM access_passes ap
-       LEFT JOIN users u_owner ON ap.owner_id = u_owner.id
-       WHERE ap.provider_id = ANY($1::int[])
-         AND ap.status IN ('pending'::pass_status, 'used'::pass_status)
-       ORDER BY ap.start_time ASC`,
-      [providerIds]
-    );
+    // Etapa 3: Construir la proyección de calendario vivo (con detalle completo de bloques para el prestador)
+    const calendar = buildMultiDayAvailability({
+      startDateStr: startDateParam,
+      days: daysParam,
+      rules: mergedRules,
+      blocks: blocksRes.rows,
+      tzOffsetMinutes: tzOffsetParam,
+      includeBlockDetails: true,
+    });
 
     return res.status(200).json({
+      rules: calendar.rules,
+      schedule_summary: calendar.schedule_summary,
+      slot_minutes: calendar.slot_minutes,
+      calendar_days: calendar.days,
       blocks: blocksRes.rows,
       passes: passesRes.rows,
     });
   } catch (error) {
     console.error('Error al obtener agenda del prestador:', error);
     return res.status(500).json({ error: 'Error interno al consultar la agenda del prestador.' });
+  }
+};
+
+/**
+ * Guarda la configuración de jornada semanal del prestador autenticado (días laborables,
+ * hora de inicio/fin por día e intervalo de turnos de 30 o 60 minutos).
+ * PUT /api/v1/passes/schedule/rules
+ *
+ * @param {import('express').Request} req - Body: `{ rules: Array<{ day_of_week, is_working, start_time, end_time, slot_minutes? }>, slot_minutes? }`.
+ * @param {import('express').Response} res - Respuesta HTTP 200 con la jornada semanal normalizada.
+ */
+const saveProviderAvailabilityRules = async (req, res) => {
+  try {
+    await ensureAvailabilityRulesTable();
+    const userId = Number(req.user?.userId || req.user?.id);
+    const { rules: rawRules, slot_minutes } = req.body || {};
+
+    const { rules: normalizedRules, error: validationError } = normalizeWeeklyRulesInput(
+      rawRules,
+      slot_minutes
+    );
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    for (const rule of normalizedRules) {
+      await db.query(
+        `INSERT INTO public.provider_availability_rules (
+           user_id, day_of_week, is_working, start_time, end_time, slot_minutes, updated_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, NOW())
+         ON CONFLICT (user_id, day_of_week)
+         DO UPDATE SET
+           is_working = EXCLUDED.is_working,
+           start_time = EXCLUDED.start_time,
+           end_time = EXCLUDED.end_time,
+           slot_minutes = EXCLUDED.slot_minutes,
+           updated_at = NOW()`,
+        [
+          userId,
+          rule.day_of_week,
+          rule.is_working,
+          rule.start_time,
+          rule.end_time,
+          rule.slot_minutes,
+        ]
+      );
+    }
+
+    const hydrated = mergeWithDefaultRules(normalizedRules);
+    return res.status(200).json({
+      message: 'Jornada semanal y disponibilidad actualizadas correctamente.',
+      rules: hydrated,
+      schedule_summary: buildScheduleSummaryText(hydrated),
+      slot_minutes: hydrated[0]?.slot_minutes || 30,
+    });
+  } catch (error) {
+    console.error('Error al guardar jornada semanal del prestador:', error);
+    return res.status(500).json({ error: 'Error interno al guardar la configuración de agenda.' });
+  }
+};
+
+/**
+ * Devuelve al residente la disponibilidad viva (7 días por defecto, franjas cada 30/60 min)
+ * de un prestador específico (`providerUserId`) sin exponer datos privados de trabajos externos
+ * ni lotes de otros vecinos (`includeBlockDetails = false`).
+ * GET /api/v1/passes/schedule/availability/:providerUserId
+ *
+ * @param {import('express').Request} req - Param `providerUserId` y query opcional `start_date`, `days`, `tz_offset`.
+ * @param {import('express').Response} res - Respuesta HTTP 200 con resumen semanal y grilla libre/ocupado.
+ */
+const getProviderPublicAvailability = async (req, res) => {
+  try {
+    await ensureScheduleBlocksTable();
+    await ensureAvailabilityRulesTable();
+
+    const providerUserId = Number(req.params.providerUserId);
+    if (!Number.isInteger(providerUserId) || providerUserId <= 0) {
+      return res.status(400).json({ error: 'Identificador de prestador inválido.' });
+    }
+
+    const startDateParam = req.query.start_date ? String(req.query.start_date).trim() : undefined;
+    const daysParam = req.query.days ? Number(req.query.days) : 7;
+    const tzOffsetParam =
+      req.query.tz_offset !== undefined && !Number.isNaN(Number(req.query.tz_offset))
+        ? Number(req.query.tz_offset)
+        : 180;
+
+    const [profilesRes, rulesRes] = await Promise.all([
+      db.query('SELECT id FROM providers WHERE user_id = $1', [providerUserId]),
+      db.query(
+        `SELECT day_of_week, is_working, start_time, end_time, slot_minutes
+         FROM public.provider_availability_rules
+         WHERE user_id = $1
+         ORDER BY day_of_week ASC`,
+        [providerUserId]
+      ),
+    ]);
+
+    if (profilesRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Prestador no encontrado.' });
+    }
+
+    const providerIds = profilesRes.rows.map((r) => Number(r.id)).filter(Boolean);
+    const blocksRes = await db.query(
+      `SELECT
+         id,
+         provider_id,
+         block_type,
+         TO_CHAR(start_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS start_at,
+         TO_CHAR(end_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS end_at
+       FROM provider_schedule_blocks
+       WHERE provider_id = ANY($1::int[])
+         AND end_at >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '1 day'
+       ORDER BY start_at ASC`,
+      [providerIds]
+    );
+
+    const availability = buildMultiDayAvailability({
+      startDateStr: startDateParam,
+      days: daysParam,
+      rules: rulesRes.rows,
+      blocks: blocksRes.rows,
+      tzOffsetMinutes: tzOffsetParam,
+      includeBlockDetails: false,
+    });
+
+    return res.status(200).json({
+      provider_user_id: providerUserId,
+      ...availability,
+    });
+  } catch (error) {
+    console.error('Error al consultar disponibilidad pública del prestador:', error);
+    return res.status(500).json({ error: 'Error interno al consultar la disponibilidad.' });
   }
 };
 
@@ -609,22 +827,30 @@ const createScheduleBlock = async (req, res) => {
       return res.status(400).json({ error: 'El rango horario es inválido.' });
     }
 
-    // Etapa 3: Persistir el bloqueo manual en `provider_schedule_blocks`
+    // Etapa 3: Persistir el bloqueo manual en `provider_schedule_blocks` devolviendo UTC ISO explícito
     const cleanTitle =
       String(title || '').trim() ||
-      (normalizedType === 'external_visit' ? 'Visita externa agendada' : 'Horario no laborable');
+      (normalizedType === 'external_visit' ? 'Trabajo externo agendado' : 'Horario no laborable');
 
     const inserted = await db.query(
       `INSERT INTO provider_schedule_blocks (provider_id, block_type, title, start_at, end_at)
        VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
+       RETURNING
+         id,
+         provider_id,
+         block_type,
+         title,
+         TO_CHAR(start_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS start_at,
+         TO_CHAR(end_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS end_at,
+         source_ref,
+         created_at`,
       [providerId, normalizedType, cleanTitle, startDate.toISOString(), endDate.toISOString()]
     );
 
     return res.status(201).json({
       message:
         normalizedType === 'external_visit'
-          ? 'Visita externa registrada y franja bloqueada en tu agenda.'
+          ? 'Trabajo externo registrado y franja bloqueada en tu agenda.'
           : 'Horario no laborable bloqueado en tu agenda.',
       block: inserted.rows[0],
     });
@@ -1896,6 +2122,8 @@ const verifyPassByQR = async (req, res) => {
 // Exportaciones públicas del módulo de agenda, coordinación de visitas, pases QR y Consola Garita
 module.exports = {
   getProviderSchedule,
+  saveProviderAvailabilityRules,
+  getProviderPublicAvailability,
   createScheduleBlock,
   deleteScheduleBlock,
   createVisitCoordination,

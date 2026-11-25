@@ -143,7 +143,15 @@ Para respaldar la promesa de "garantía post-servicio y trazabilidad" frente a l
 
 ---
 
+## Fase 5.4 (P2): Calendario Vivo de Disponibilidad cada 30 min (Completada)
+
+- **Migración `020_provider_weekly_availability`:** crea `provider_availability_rules` (por `user_id` y `day_of_week 0..6`, con `is_working`, `start_time`, `end_time` y `slot_minutes` en `30` o `60` min) sincronizada también en `database/trustlink-production-init.sql`.
+- **Backend:** motor puro `src/utils/scheduleAvailability.js` (+ suite unitaria `test/scheduleAvailability.test.js`), nuevo endpoint `PUT /api/v1/passes/schedule/rules` para guardar la jornada semanal, `GET /api/v1/passes/schedule/provider` enriquecido con proyección de 7 días cada 30/60 min y timestamps UTC explícitos, y `GET /api/v1/passes/schedule/availability/:providerUserId` para que el residente consulte franjas libres/ocupadas **sin exponer títulos privados de trabajos externos ni lotes de otros vecinos**.
+- **Frontend:** nuevo componente `src/components/ProviderCalendarManager.jsx` en el Paso 3 (`Agenda`) del Portal Prestador (configurador semanal Lun–Dom, tira semanal navegable, grilla interactiva cada 30 min para bloquear en 1 clic trabajos externos o franjas no laborables y visualizar visitas/pases TrustLink en vivo) + **selector de disponibilidad en tiempo real** dentro del modal *"Solicitar Visita"* en `ResidentDashboard.jsx`.
+
+---
+
 ## Estado de Ejecución y Siguiente Etapa
 
-1. **Sprints 1–5 (Completados):** Fases 1, 2, 3 (modo dual), 4, 5 mejoras evolutivas, Fase 5, Fase 5.2 y Fase 5.3, con **19/19 tests E2E**, **16/16 unitarios backend** y **6/6 unitarios frontend**.
+1. **Sprints 1–5 (Completados):** Fases 1, 2, 3 (modo dual), 4, 5 mejoras evolutivas, Fase 5, Fase 5.2, Fase 5.3 y Fase 5.4, con **20/20 tests E2E**, **20/20 unitarios backend** y **6/6 unitarios frontend**.
 2. **Siguiente Etapa (Salida Comercial — Externos):** ver checklist vivo en [PENDIENTES.md](./PENDIENTES.md) (Smoke Test en nube, credenciales reales Mercado Pago, Supabase Storage para documentos + galería *Antes y después*, y Resend/SMTP para emails transaccionales).
