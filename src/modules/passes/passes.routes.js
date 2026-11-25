@@ -19,6 +19,7 @@ const {
   listProviderVisitRequests,
   addVisitRequestMessage,
   respondVisitRequest,
+  respondVisitRequestAsResident,
   createPass,
   getMyPasses,
   listProviderPasses,
@@ -63,8 +64,11 @@ router.get('/visit-requests/provider', verifyToken, verifyRoleOrPortal(['provide
 // Agregar un mensaje al hilo de coordinación de una visita (participantes autorizados y admin)
 router.post('/visit-requests/:id/messages', verifyToken, verifyRole(['owner', 'family', 'provider', 'admin', 'superadmin']), addVisitRequestMessage);
 
-// Prestador acepta, propone alternativa o rechaza una solicitud de visita
+// Prestador acepta, repacta otro horario (pending_resident) o rechaza una solicitud de visita
 router.patch('/visit-requests/:id/respond', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), respondVisitRequest);
+
+// Residente acepta una contrapropuesta (confirmed), propone otro horario (pending_provider) o cancela la visita
+router.patch('/visit-requests/:id/resident-respond', verifyToken, verifyRoleOrPortal(['owner', 'family', 'superadmin'], 'resident'), respondVisitRequestAsResident);
 
 // ============================================================================
 // 3. CICLO DE VIDA DE PASES QR Y VALIDACIÓN PERIMETRAL EN GARITA

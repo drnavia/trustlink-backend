@@ -1811,5 +1811,57 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     // 5. Liberar el trabajo externo -> vuelve a quedar disponible
     const delBlock = await req('DELETE', `/api/v1/passes/schedule/blocks/${createdBlockId}`, undefined, provToken);
     assert.equal(delBlock.status, 200);
+
+    // 6. Circuito completo de acuerdo mutuo de visita:
+    //    Residente pide turno -> Prestador repacta otro horario (pending_resident) -> Residente acepta (confirmed) -> Bloqueo automático en agenda viva
+    const meProv = await req('GET', '/api/v1/providers/me', undefined, provToken);
+    const activeProvId = meProv.data.providers[0].id;
+    const reqVisit = await req(
+      'POST',
+      '/api/v1/passes/visit-requests',
+      {
+        provider_id: activeProvId,
+        preferred_date: `${targetDate}T13:00:00.000Z`,
+        notes: '¿Podés pasar el miércoles a las 10:00?',
+      },
+      ownerToken
+    );
+    assert.equal(reqVisit.status, 201);
+    assert.equal(reqVisit.data.visit.status, 'pending_provider');
+    const negVisitId = reqVisit.data.visit.id;
+
+    // Prestador repacta a las 11:30 (14:30Z) -> pasa a pending_resident
+    const repactRes = await req(
+      'PATCH',
+      `/api/v1/passes/visit-requests/${negVisitId}/respond`,
+      {
+        action: 'propose',
+        preferred_date: `${targetDate}T14:30:00.000Z`,
+        reply_text: 'A las 10 estoy en obra, ¿te sirve 11:30?',
+      },
+      provToken
+    );
+    assert.equal(repactRes.status, 200);
+    assert.equal(repactRes.data.visit.status, 'pending_resident');
+
+    // Residente acepta el horario propuesto -> pasa a confirmed y bloquea automáticamente 11:30 en la agenda viva
+    const acceptRes = await req(
+      'PATCH',
+      `/api/v1/passes/visit-requests/${negVisitId}/resident-respond`,
+      { action: 'accept' },
+      ownerToken
+    );
+    assert.equal(acceptRes.status, 200);
+    assert.equal(acceptRes.data.visit.status, 'confirmed');
+
+    const resAvailAfterAgreement = await req(
+      'GET',
+      `/api/v1/passes/schedule/availability/${provUserId}?start_date=${targetDate}&days=1&tz_offset=180`,
+      undefined,
+      ownerToken
+    );
+    assert.equal(resAvailAfterAgreement.status, 200);
+    const slot1130 = resAvailAfterAgreement.data.days[0].slots.find((s) => s.time === '11:30');
+    assert.equal(slot1130.status, 'busy', 'La visita acordada mutuamente debe quedar reservada en la agenda viva');
   });
 });

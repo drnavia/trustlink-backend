@@ -1026,6 +1026,7 @@ const listMyVisitRequests = async (req, res) => {
     const result = await db.query(
       `SELECT
          vr.*,
+         p.user_id AS provider_user_id,
          TRIM(CONCAT(COALESCE(u_prov.first_name, ''), ' ', COALESCE(u_prov.last_name, ''))) AS provider_name,
          p.specialty AS provider_specialty
        FROM visit_requests vr
@@ -1222,24 +1223,45 @@ const respondVisitRequest = async (req, res) => {
       return res.status(403).json({ error: 'Solo el prestador asignado puede responder esta visita.' });
     }
 
-    // Etapa 3: Resolver nuevo estado, fecha acordada y mensaje automático/personalizado
+    // Etapa 3: Validar fecha al repactar y resolver nuevo estado de la máquina bilateral
+    const cleanProposedDate = preferred_date ? String(preferred_date).trim() : '';
+    if (normalizedAction === 'propose' && !cleanProposedDate) {
+      return res.status(400).json({
+        error: 'Indicá la nueva fecha y horario propuesto para repactar la visita.',
+      });
+    }
+
     const nextStatus =
       normalizedAction === 'confirm'
         ? 'confirmed'
         : normalizedAction === 'decline'
         ? 'declined'
-        : 'pending_provider';
+        : 'pending_resident';
 
-    const nextDate = preferred_date ? String(preferred_date).trim() : visit.preferred_date;
+    const nextDate = cleanProposedDate || visit.preferred_date;
     const currentMessages = parseMessagesArray(visit.messages);
+
+    const readableNextDate = nextDate
+      ? (() => {
+          const d = new Date(nextDate);
+          return Number.isNaN(d.getTime())
+            ? nextDate
+            : d.toLocaleString('es-AR', {
+                day: '2-digit',
+                month: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+              });
+        })()
+      : '';
 
     const autoSummaryText =
       String(reply_text || '').trim() ||
       (normalizedAction === 'confirm'
-        ? `Disponibilidad confirmada${nextDate ? ` para ${nextDate}` : ''}. Ya podés emitir el Pase QR.`
+        ? `Disponibilidad confirmada${readableNextDate ? ` para ${readableNextDate}` : ''}. Ya podés emitir el Pase QR.`
         : normalizedAction === 'decline'
         ? 'No tengo disponibilidad para esa visita en este momento.'
-        : `Propongo coordinar para ${nextDate || 'otro horario'}.`);
+        : `Propongo repactar la visita para ${readableNextDate || 'otro horario'}. Confirmame si te queda bien.`);
 
     const updatedMessages = [
       ...currentMessages,
@@ -1252,7 +1274,7 @@ const respondVisitRequest = async (req, res) => {
       },
     ];
 
-    // Etapa 4: Persistir cambio de estado/mensajes y reservar agenda si se confirmó con fecha
+    // Etapa 4: Persistir cambio de estado/mensajes y sincronizar agenda viva del prestador
     const updated = await db.query(
       `UPDATE visit_requests
        SET status = $1,
@@ -1271,6 +1293,11 @@ const respondVisitRequest = async (req, res) => {
         startAt: nextDate,
         sourceRef: `visit-${visitId}`,
       });
+    } else if (normalizedAction === 'decline') {
+      await ensureScheduleBlocksTable();
+      await db.query('DELETE FROM provider_schedule_blocks WHERE source_ref = $1', [
+        `visit-${visitId}`,
+      ]);
     }
 
     const row = updated.rows[0];
@@ -1280,7 +1307,7 @@ const respondVisitRequest = async (req, res) => {
           ? 'Disponibilidad confirmada y horario bloqueado en tu agenda.'
           : normalizedAction === 'decline'
           ? 'Visita marcada como sin disponibilidad.'
-          : 'Propuesta enviada al residente.',
+          : 'Contrapropuesta enviada al residente. Esperando su confirmación.',
       visit: {
         ...row,
         messages: parseMessagesArray(row.messages),
@@ -1289,6 +1316,138 @@ const respondVisitRequest = async (req, res) => {
   } catch (error) {
     console.error('Error al responder solicitud de visita:', error);
     return res.status(500).json({ error: 'Error interno al actualizar la solicitud de visita.' });
+  }
+};
+
+/**
+ * Permite al residente dueño de la solicitud responder una contrapropuesta del prestador
+ * (`accept` para acordar mutuamente el horario y reservar en la agenda viva, `propose` para
+ * sugerir otro día/horario volviendo a `pending_provider`, o `cancel` para cancelar el pedido).
+ * PATCH /api/v1/passes/visit-requests/:id/resident-respond
+ *
+ * @param {import('express').Request} req - Param `id`; body `{ action, preferred_date?, reply_text? }`.
+ * @param {import('express').Response} res - Respuesta HTTP 200 con la visita actualizada.
+ */
+const respondVisitRequestAsResident = async (req, res) => {
+  try {
+    await ensureVisitRequestsTable();
+
+    const visitId = Number(req.params.id);
+    const userId = Number(req.user?.userId || req.user?.id);
+    const isSuperadmin = String(req.user?.role || '').toLowerCase() === 'superadmin';
+    const { action, preferred_date, reply_text } = req.body || {};
+
+    if (!Number.isInteger(visitId) || visitId <= 0) {
+      return res.status(400).json({ error: 'ID de visita inválido.' });
+    }
+
+    const normalizedAction = String(action || '').toLowerCase();
+    if (!['accept', 'propose', 'cancel'].includes(normalizedAction)) {
+      return res.status(400).json({ error: 'Acción inválida (accept | propose | cancel).' });
+    }
+
+    const visitRes = await db.query('SELECT * FROM visit_requests WHERE id = $1 LIMIT 1', [visitId]);
+    if (visitRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Solicitud de visita no encontrada.' });
+    }
+
+    const visit = visitRes.rows[0];
+    if (!isSuperadmin && Number(visit.owner_id) !== userId) {
+      return res.status(403).json({
+        error: 'Solo el residente que solicitó esta visita puede responderla.',
+      });
+    }
+
+    const cleanProposedDate = preferred_date ? String(preferred_date).trim() : '';
+    if (normalizedAction === 'propose' && !cleanProposedDate) {
+      return res.status(400).json({
+        error: 'Seleccioná una nueva fecha y horario de la agenda del prestador.',
+      });
+    }
+
+    const nextStatus =
+      normalizedAction === 'accept'
+        ? 'confirmed'
+        : normalizedAction === 'cancel'
+        ? 'cancelled'
+        : 'pending_provider';
+    const nextDate = cleanProposedDate || visit.preferred_date;
+
+    const readableNextDate = nextDate
+      ? (() => {
+          const d = new Date(nextDate);
+          return Number.isNaN(d.getTime())
+            ? nextDate
+            : d.toLocaleString('es-AR', {
+                day: '2-digit',
+                month: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+              });
+        })()
+      : '';
+
+    const autoText =
+      String(reply_text || '').trim() ||
+      (normalizedAction === 'accept'
+        ? `Acepto el horario propuesto${readableNextDate ? ` (${readableNextDate})` : ''}. Visita acordada.`
+        : normalizedAction === 'cancel'
+        ? 'Solicitud de visita cancelada por el residente.'
+        : `Propongo otro horario: ${readableNextDate || 'a convenir'}. ¿Te sirve?`);
+
+    const currentMessages = parseMessagesArray(visit.messages);
+    const updatedMessages = [
+      ...currentMessages,
+      {
+        id: `msg-${Date.now()}`,
+        sender_role: 'owner',
+        sender_id: userId,
+        text: autoText,
+        created_at: new Date().toISOString(),
+      },
+    ];
+
+    const updated = await db.query(
+      `UPDATE visit_requests
+       SET status = $1,
+           preferred_date = $2,
+           messages = $3::jsonb
+       WHERE id = $4
+       RETURNING *`,
+      [nextStatus, nextDate, JSON.stringify(updatedMessages), visitId]
+    );
+
+    if (normalizedAction === 'accept' && nextDate) {
+      await upsertScheduleBlock({
+        providerId: visit.provider_id,
+        blockType: 'trustlink_visit',
+        title: `Visita TrustLink #${visitId} (${visit.fraction_number || ''} ${visit.lot_number || ''})`.trim(),
+        startAt: nextDate,
+        sourceRef: `visit-${visitId}`,
+      });
+    } else if (normalizedAction === 'cancel') {
+      await ensureScheduleBlocksTable();
+      await db.query('DELETE FROM provider_schedule_blocks WHERE source_ref = $1', [
+        `visit-${visitId}`,
+      ]);
+    }
+
+    const row = updated.rows[0];
+    return res.status(200).json({
+      message:
+        normalizedAction === 'accept'
+          ? '¡Visita acordada por ambas partes! Ya quedó reservada en la agenda del prestador y habilitaste el Pase QR.'
+          : normalizedAction === 'cancel'
+          ? 'Solicitud de visita cancelada.'
+          : 'Nueva propuesta enviada al prestador. Esperando su confirmación.',
+      visit: {
+        ...row,
+        messages: parseMessagesArray(row.messages),
+      },
+    });
+  } catch (error) {
+    console.error('Error al responder visita desde residente:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar la visita.' });
   }
 };
 
@@ -2131,6 +2290,7 @@ module.exports = {
   listProviderVisitRequests,
   addVisitRequestMessage,
   respondVisitRequest,
+  respondVisitRequestAsResident,
   createPass,
   getMyPasses,
   listProviderPasses,
