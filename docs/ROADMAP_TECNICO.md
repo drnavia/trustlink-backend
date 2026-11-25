@@ -151,7 +151,15 @@ Para respaldar la promesa de "garantía post-servicio y trazabilidad" frente a l
 
 ---
 
+## Fase 5.5 (P2): Analítica de Adquisición, Identidad Dual y Rediseño de Usuarios Superadmin (Completada)
+
+- **Migración `022_users_initial_role`:** agrega columna inmutable `initial_role` en `users` (sincronizada en `ensureEvolutionSchema.js` y `database/trustlink-production-init.sql`) para preservar el origen de registro (`owner`/`family` vs. `provider`) incluso si el usuario activa Identidad Dual o cambia su portal principal.
+- **Backend (`auth.controller.js` / `auth.routes.js`):** nuevo endpoint `GET /api/v1/auth/users/analytics` (exclusivo `superadmin`, filtrable por `country_id` y `period=all|30d|7d`) que entrega los 3 bloques clave de negocio: (1) Adquisición vs. Identidad Activa Hoy, cuentas duales y tasas de conversión cruzada; (2) Embudo de Activación de Prestadores y Residentes + ratio Demanda/Oferta; (3) Embudo operativo completo (`Visitas → Acuerdos → Pases QR → Garita → Órdenes/Conformidad → Reseñas`), ritmo de altas 7d/30d y comparativa por comunidad.
+- **Frontend (`UserManagementView.jsx` + `App.jsx`):** sección renombrada en Modo Maestro a **Usuarios y Métricas**, dividida en dos pestañas limpias (**Métricas y Comunidad** con filtros, exportación CSV y los 3 bloques visuales; y **Cuentas Privilegiadas** rediseñada con buscador, filtros por rol en español, listado a ancho completo, alcance comunitario explícito y alta/edición en modales con CTA contextual).
+
+---
+
 ## Estado de Ejecución y Siguiente Etapa
 
-1. **Sprints 1–5 (Completados):** Fases 1, 2, 3 (modo dual), 4, 5 mejoras evolutivas, Fase 5, Fase 5.2, Fase 5.3 y Fase 5.4, con **20/20 tests E2E**, **21/21 unitarios backend** y **6/6 unitarios frontend**.
+1. **Sprints 1–5 (Completados):** Fases 1, 2, 3 (modo dual), 4, 5 mejoras evolutivas, Fase 5, Fase 5.2, Fase 5.3, Fase 5.4 y Fase 5.5, con **21/21 tests E2E**, **21/21 unitarios backend** y **6/6 unitarios frontend**.
 2. **Siguiente Etapa (Salida Comercial — Externos):** ver checklist vivo en [PENDIENTES.md](./PENDIENTES.md) (Smoke Test en nube, credenciales reales Mercado Pago, Supabase Storage para documentos + galería *Antes y después*, y Resend/SMTP para emails transaccionales).

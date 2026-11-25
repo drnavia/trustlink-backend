@@ -1899,4 +1899,84 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(slot1130.status, 'busy', 'La visita acordada debe bloquear 11:30 en la agenda pública');
     assert.equal(slot1200.status, 'busy', 'La visita acordada de 1 hora debe bloquear también 12:00');
   });
+
+  // ===========================================================================
+  // TEST 21: Analítica de usuarios, `initial_role` inmutable e identidad dual
+  // ===========================================================================
+  it('preserva initial_role ante cambios de identidad dual y expone analítica consolidada al Superadmin (Fase 5.5)', async () => {
+    const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const dualEmail = `dual.origin.${suffix}@test.com`;
+
+    // 1. Registrar una cuenta que nace como Residente (`owner`)
+    const regDual = await req('POST', '/api/v1/auth/register', {
+      country_id: 1,
+      role: 'owner',
+      first_name: 'Origen',
+      last_name: 'Residente',
+      dni: `94${suffix.slice(-6)}`,
+      email: dualEmail,
+      password: 'Password123!',
+      fraction_type: 'fraccion',
+      fraction_number: '2',
+      lot_number: '44',
+    });
+    assert.equal(regDual.status, 201);
+    assert.equal(regDual.data.user.initial_role, 'owner');
+
+    const loginDual = await req('POST', '/api/v1/auth/login', {
+      email: dualEmail,
+      password: 'Password123!',
+    });
+    assert.equal(loginDual.status, 200);
+    const dualToken = loginDual.data.token;
+
+    // 2. Activar portal Prestador y cambiar portal principal a `provider` (sobrescribe `role` -> 'provider')
+    const actProv = await req(
+      'PATCH',
+      '/api/v1/account/profile',
+      { activate_provider_portal: true },
+      dualToken
+    );
+    assert.equal(actProv.status, 200);
+
+    const switchPrimary = await req(
+      'PATCH',
+      '/api/v1/account/primary-portal',
+      { primary_portal: 'provider' },
+      actProv.data.token || dualToken
+    );
+    assert.equal(switchPrimary.status, 200);
+    assert.equal(switchPrimary.data.account.role, 'provider');
+
+    // 3. Un usuario estándar NO puede consultar la analítica maestra
+    const forbiddenRes = await req(
+      'GET',
+      '/api/v1/auth/users/analytics',
+      undefined,
+      switchPrimary.data.token || dualToken
+    );
+    assert.equal(forbiddenRes.status, 403);
+
+    // 4. Superadmin consulta los 3 bloques de analítica (histórico y 7d) y verifica conversión cruzada
+    const analyticsRes = await req(
+      'GET',
+      '/api/v1/auth/users/analytics?period=7d&country_id=1',
+      undefined,
+      superToken
+    );
+    assert.equal(analyticsRes.status, 200);
+    const { block1_identity: b1, block2_activation: b2, block3_operations: b3 } = analyticsRes.data;
+
+    assert.ok(b1.total_community_users >= 2, 'Debe contabilizar usuarios comunitarios');
+    assert.ok(b1.created_as_resident >= 1, 'Debe conservar el origen inicial como Residente');
+    assert.ok(b1.created_as_provider >= 1, 'Debe contabilizar el origen inicial como Prestador');
+    assert.ok(b1.dual_accounts >= 1, 'Debe detectar cuentas duales activas');
+    assert.ok(
+      b1.resident_to_provider_count >= 1,
+      'Debe detectar residentes de origen que activaron portal prestador incluso tras cambiar primary_portal'
+    );
+    assert.ok(b2.providers_registered >= 1 && b2.residents_registered >= 1);
+    assert.ok(b3.growth.last_7d_total >= 1);
+    assert.ok(Array.isArray(b3.by_community) && b3.by_community.length >= 1);
+  });
 });

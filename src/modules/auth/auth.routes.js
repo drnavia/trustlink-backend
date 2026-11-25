@@ -16,6 +16,7 @@ const {
   createPrivilegedUser,
   getPrivilegedUsers,
   updatePrivilegedUser,
+  getUsersAnalytics,
 } = require('./auth.controller');
 const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
 const { createRateLimiter } = require('../../middlewares/security.middleware');
@@ -64,7 +65,8 @@ router.post('/reset-password', resetLimiter, resetPassword);
 // ============================================================================
 // GESTIÓN DE USUARIOS PRIVILEGIADOS (Exclusivo Superadmin)
 // ============================================================================
-// Alta, listado y actualización de cuentas administrativas y de seguridad perimetral
+// Alta, listado, analítica de comunidad y actualización de cuentas administrativas y de seguridad perimetral
+router.get('/users/analytics', verifyToken, verifyRole(['superadmin']), getUsersAnalytics);
 router.get('/users/privileged', verifyToken, verifyRole(['superadmin']), getPrivilegedUsers);
 router.post('/users/privileged', verifyToken, verifyRole(['superadmin']), createPrivilegedUser);
 router.patch('/users/privileged/:id', verifyToken, verifyRole(['superadmin']), updatePrivilegedUser);

@@ -67,14 +67,22 @@ async function ensureEvolutionSchema() {
 
   schemaPromise = (async () => {
     try {
-      // 1. Columnas de ubicación estructurada, capacidades duales y portal principal en `users`
+      // 1. Columnas de ubicación estructurada, capacidades duales, portal principal y rol inicial inmutable en `users`
       await db.query(`
         ALTER TABLE users
         ADD COLUMN IF NOT EXISTS fraction_type VARCHAR(20) NOT NULL DEFAULT 'na',
         ADD COLUMN IF NOT EXISTS can_use_resident BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS can_use_provider BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS primary_portal VARCHAR(20) NOT NULL DEFAULT 'resident',
-        ADD COLUMN IF NOT EXISTS portals_configured BOOLEAN NOT NULL DEFAULT FALSE
+        ADD COLUMN IF NOT EXISTS portals_configured BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS initial_role VARCHAR(30) NULL
+      `);
+
+      // Backfill idempotente de `initial_role` para cuentas creadas antes de la migración 022
+      await db.query(`
+        UPDATE users
+        SET initial_role = LOWER(role::text)
+        WHERE initial_role IS NULL
       `);
 
       // 2. Backfill único solo para cuentas legacy que aún no tienen portals_configured = TRUE.
@@ -248,6 +256,21 @@ async function ensureEvolutionSchema() {
         ADD COLUMN IF NOT EXISTS is_custom_specialty BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS custom_specialty_description TEXT NULL,
         ADD COLUMN IF NOT EXISTS specialty_approval_status VARCHAR(20) NOT NULL DEFAULT 'approved'
+      `);
+
+      // 12. Asegurar tablas de agenda semanal y ventana de visitas (Fase 5.4) para consultas de analítica
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS public.provider_availability_rules (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+          day_of_week SMALLINT NOT NULL CHECK (day_of_week >= 0 AND day_of_week <= 6),
+          is_working BOOLEAN NOT NULL DEFAULT TRUE,
+          start_time VARCHAR(5) NOT NULL DEFAULT '08:00',
+          end_time VARCHAR(5) NOT NULL DEFAULT '18:00',
+          slot_minutes SMALLINT NOT NULL DEFAULT 30 CHECK (slot_minutes IN (30, 60)),
+          updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+          UNIQUE (user_id, day_of_week)
+        )
       `);
 
       schemaInitialized = true;

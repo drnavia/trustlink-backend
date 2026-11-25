@@ -592,6 +592,26 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 022: Rol inicial inmutable de alta en `users` (`initial_role`)
+  // Preserva cómo creó su cuenta cada usuario (residente vs. prestador) incluso si luego
+  // activa Identidad Dual o cambia su portal principal (`users.role`).
+  // ---------------------------------------------------------------------------
+  {
+    id: '022_users_initial_role',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.users
+          ADD COLUMN IF NOT EXISTS initial_role VARCHAR(30) NULL;
+      `);
+      await db.query(`
+        UPDATE public.users
+        SET initial_role = LOWER(role::text)
+        WHERE initial_role IS NULL;
+      `);
+    },
+  },
 ];
 
 /**
