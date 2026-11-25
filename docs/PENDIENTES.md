@@ -1,22 +1,22 @@
 # TrustLink — Pendientes Guardados (Backlog Diferido)
 
-> Última actualización: 2026-11-24
-> Estado base: **Fases 1–5.3 del Roadmap Técnico + 5 Mejoras Evolutivas + documentación completa de scripts + script SQL consolidado de Supabase completados y verificados.**
+> Última actualización: 2026-11-25
+> Estado base: **Fases 1–5.5 del Roadmap Técnico + 5 Mejoras Evolutivas + arquitectura de 6 vistas en Administración con diseño homogéneo + documentación completa de scripts + script SQL consolidado de Supabase completados y verificados.**
 
 Estos ítems quedan registrados como **pendientes diferidos** (para retomar en la validación en la nube y al avanzar hacia el lanzamiento comercial / piloto con servicios externos):
 
 ---
 
 ## 1. Validación Operativa en la Nube (Smoke Test)
-- [ ] Confirmar que los últimos commits en `main` (incluyendo **Fases 5 y 5.2**) estén redeployados correctamente en **Railway** (`trustlink-backend`) y **Vercel** (`trustlink-web`).
+- [ ] Confirmar que los últimos commits en `main` (incluyendo **Fases 5–5.5** y el rediseño de **Administración**) estén redeployados correctamente en **Railway** (`trustlink-backend`) y **Vercel** (`trustlink-web`).
 - [ ] *(Opcional si se desea dejar `schema_migrations` al día en una base Supabase ya existente)* Ejecutar `npm run migrate` contra Supabase según [DEPLOY_SUPABASE.md](./DEPLOY_SUPABASE.md) *(al arrancar Railway, `ensureEvolutionSchema()` ya asegura las columnas y tablas nuevas automáticamente)*.
 - [ ] Recorrida E2E en vivo:
   - Landing actualizada, **buscador inteligente por síntomas** (*"pérdida de agua"*, *"salta la térmica"*) e instalación **PWA** desde celular (`manifest.webmanifest` + `sw.js`).
-  - **Marketplace (Fases 5 y 5.2):** termómetro de reputación, *"servicios/ingresos en tu barrio"*, tiempo promedio de respuesta, filtros *Mis Favoritos*, *Disponible hoy*, *Urgencias 24h* y *Solo Socios Verificados*, sello *Hogar Protegido*, ficha comercial rápida, **Q&A público** (preguntar y responder), **Volver a contratar** en 1 clic, **micro-tags** y filtros en modal de reseñas.
-  - **Portal Prestador:** Tablero *Mi Reputación*, editor de *Ficha Comercial / Urgencias 24h*, respuestas Q&A, visibilidad persistente de especialidades, resumen de ingresos netos (93%) y membresía **Socio Verificado**.
-  - Bloqueo automático por documentación vencida (ART / antecedentes / cuadrilla) en garita.
-  - **Licencia B2B** por comunidad (`Admin Barrio` y `Salud & APIs`) y exportaciones **CSV**.
-  - **Conformidad final** (digital/efectivo), **Comprobante del Hogar** imprimible y **reclamos/garantía** en Ops.
+  - **Marketplace (Fases 5, 5.2 y 5.3):** termómetro de reputación, *"servicios/ingresos en tu barrio"*, tiempo promedio de respuesta, filtros *Mis Favoritos*, *Disponible hoy*, *Urgencias 24h* y *Solo Socios Verificados*, sello *Hogar Protegido*, ficha comercial rápida, **Q&A público**, **Volver a contratar** en 1 clic, **micro-tags**, catálogo estándar de especialidades y moderación de rubros personalizados.
+  - **Calendario Vivo (Fase 5.4):** jornada semanal cada 30 min, bloqueos externos, visitas potenciales en ámbar punteado, negociación bilateral y emisión de Pase QR con domicilio y ventana mínima de 1 hora precargados.
+  - **Portal Prestador:** Documentación Personal en 2 tarjetas vigentes + historial legal, Tablero *Mi Reputación*, *Ficha Comercial / Urgencias 24h*, respuestas Q&A, visibilidad persistente de especialidades, resumen de ingresos netos (93%) y membresía **Socio Verificado**.
+  - **Administración (6 vistas — Fase 5.5):** **Métricas** (adquisición `initial_role` vs. identidad dual), **Prestadores** (compliance agrupado y reclamos), **Comunidades** (Barrios/Licencias B2B, Claves API y Operación Local), **Usuarios** (Cuentas Generales y Privilegiadas), **Auditoría** (Accesos en Garita y Transacciones) y **Sistema** (Salud/Pases QR, Endpoints y Apariencia white-label), más consola directa **Admin Barrio** y exportaciones **CSV**.
+  - Bloqueo automático por documentación vencida (ART / antecedentes / cuadrilla) en garita, **conformidad final** (digital/efectivo) y **Comprobante del Hogar** imprimible.
 
 ---
 
