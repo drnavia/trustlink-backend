@@ -159,7 +159,25 @@ Para respaldar la promesa de "garantía post-servicio y trazabilidad" frente a l
 
 ---
 
+## Fase 6 (P1 — Planificada): Confianza Progresiva por Niveles, Validación Documental con IA e Insignias
+
+Evolución del modelo de alta y verificación de prestadores para eliminar la fricción de entrada (*cold start*) sin comprometer la seguridad perimetral en garita:
+
+### Escalera de 5 Niveles e Insignias (separada de Reputación)
+- **Nivel 0 — Incompleto (oculto):** cuenta registrada sin validación de identidad ni especialidades.
+- **Nivel 1 — `Perfil Básico` (visible con aviso):** identidad validada (DNI) + al menos 1 especialidad activa. Aparece al final del directorio del Portal Residente para consultas, Q&A y presupuestos, mostrando transparencia explícita (*"Sin documentación de compliance aún"*); no habilita emisión de Pase QR en barrios con política estricta.
+- **Nivel 2 — `Respaldo Parcial` (`Antecedentes cargados` / `ART cargada`):** Nivel 1 + 1 de los 2 documentos personales vigentes cargados. Sube prioridad en el directorio mostrando qué respaldo posee.
+- **Nivel 3 — `Documentación Completa`:** Nivel 1 + Antecedentes Penales vigentes + Póliza ART vigente cargados (en proceso de verificación automática/Ops).
+- **Nivel 4 — `Verificado` (tilde verificado TrustLink — IA + Ops):** Nivel 3 + verificación automática por **IA Multimodal (OCR + Cross-Check)** que corrobora que los archivos subidos coinciden con **DNI, titular y fechas Desde/Hasta** declaradas por el prestador, habilitando prioridad alta en el buscador, filtro *"Solo Verificados"* y Pase QR ágil en garita.
+- **Nivel 5 — `Socio Verificado` (tilde dorado — Suscripción):** **exige Nivel 4 obligatorio** + suscripción activa (evita comprar el verificado sin compliance real). Otorga prioridad máxima en el directorio y sello dorado destacado.
+
+### Sub-etapas de Implementación
+- **Fase 6.1 (Motor de Niveles y Visibilidad Progresiva — sin externos):** agregar soporte de `identity_verified` y cálculo de nivel/insignia `0..5` en backend, habilitar visibilidad progresiva en `GET /api/v1/providers/directory` con filtro *Solo Verificados* y ordenamiento por nivel, manteniendo bloqueo de emisión/validación de Pase QR en garita cuando falta ART o Antecedentes vigentes.
+- **Fase 6.2 (Supabase Storage + Motor de Validación Documental con IA):** reemplazar URLs manuales por carga directa de PDFs/fotos (DNI, Antecedentes y ART) en Supabase Storage y conectar un servicio de IA Multimodal (ej. Gemini Vision) que extraiga titular, DNI/CUIT y vigencias `Desde/Hasta`, calcule nivel de confianza, auto-verifique coincidencias exactas (≥ 90%) y derive únicamente discrepancias o baja confianza a `Administración → Prestadores → Compliance` (*human-in-the-loop*).
+
+---
+
 ## Estado de Ejecución y Siguiente Etapa
 
-1. **Sprints 1–5 (Completados):** Fases 1, 2, 3 (modo dual), 4, 5 mejoras evolutivas, Fase 5, Fase 5.2, Fase 5.3, Fase 5.4 y Fase 5.5, con **21/21 tests E2E**, **21/21 unitarios backend** y **6/6 unitarios frontend**.
-2. **Siguiente Etapa (Salida Comercial — Externos):** ver checklist vivo en [PENDIENTES.md](./PENDIENTES.md) (Smoke Test en nube, credenciales reales Mercado Pago, Supabase Storage para documentos + galería *Antes y después*, y Resend/SMTP para emails transaccionales).
+1. **Sprints 1–5 (Completados):** Fases 1, 2, 3 (modo dual), 4, 5 mejoras evolutivas, Fase 5, Fase 5.2, Fase 5.3, Fase 5.4 y Fase 5.5, con **21/21 tests E2E**, **12/12 unitarios backend** y **6/6 unitarios frontend**.
+2. **Siguiente Etapa:** **Fase 6 (Confianza Progresiva + Validación Documental con IA)** y salida comercial externa — ver checklist vivo en [PENDIENTES.md](./PENDIENTES.md) (Smoke Test en nube, credenciales reales Mercado Pago, Supabase Storage + galería *Antes y después*, motor de verificación IA y Resend/SMTP).

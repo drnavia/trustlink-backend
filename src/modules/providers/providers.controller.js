@@ -1209,7 +1209,7 @@ const getMyProviderProfile = async (req, res) => {
       await Promise.all([
         Promise.resolve(
           buildProviderExpiryAlerts({
-            providers: providersRes.rows,
+            providers: providersRes.rows.map((p) => ({ ...p, user_id: p.user_id || userId })),
             vehicles,
             employees,
             windowDays: 30,
