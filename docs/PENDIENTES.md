@@ -1,7 +1,7 @@
 # TrustLink — Pendientes Guardados (Backlog Diferido)
 
-> Última actualización: 2026-11-25
-> Estado base: **Fases 1–5.5 del Roadmap Técnico + 5 Mejoras Evolutivas + arquitectura de 6 vistas en Administración con diseño homogéneo + documentación completa de scripts + script SQL consolidado de Supabase completados y verificados.**
+> Última actualización: 2026-11-26
+> Estado base: **Fases 1–6.1 del Roadmap Técnico + Mejoras UX/UI en Landing v2 (vidriera pública sin PII), Auth minimalista, Portal Prestador (6 pasos), Portal Residente (5 pasos + reputación consolidada por persona con filtro por rubro) y Compliance N1–N5 completados y verificados.**
 
 Estos ítems quedan registrados como **pendientes diferidos** (para retomar en la validación en la nube y al avanzar hacia el lanzamiento comercial / piloto con servicios externos):
 
@@ -31,3 +31,12 @@ Estos ítems quedan registrados como **pendientes diferidos** (para retomar en l
   - **Galería de trabajos ("Antes y después")** en la ficha pública del prestador *(único pendiente de la inspiración Marketplace/Mercado Libre)*.
 - [ ] **Notificaciones Transaccionales Automáticas (Resend / SMTP):**
   - Envío automático por email para recuperación de contraseña, alertas proactivas de vencimiento documental (30 / 15 / 7 días) y avisos de visitas, preguntas públicas (Q&A) y reclamos.
+
+---
+
+## 3. Evolución de Producto / Marketplace (Backlog Futuro)
+- [ ] **Servicios / Paquetes con Precio de Referencia (estilo publicaciones de Marketplace):**
+  - Mantener el **Directorio principal centrado en el Prestador** (1 tarjeta por persona con reputación general consolidada, nivel `N1–N5` y rubros habilitados, ideal para oficios con visita y presupuesto in situ).
+  - En una fase evolutiva posterior, habilitar a prestadores verificados a publicar **servicios/paquetes estandarizados con precio de referencia o precio cerrado** (ej.: *Limpieza de aire split*, *Mantenimiento mensual de pileta*, *Corte de césped lote estándar*, *Instalación básica*), indicando alcance, duración estimada, si incluye materiales y modalidad de pago.
+  - Permitir que estos paquetes convivan como una sección o pestaña dedicada dentro del Portal Residente y en la ficha del prestador, manteniendo las mismas reglas de compliance (`N4–N5` para emisión de Pase QR en garita) y reputación consolidada por persona.
+  - *(Complemento UX liviano opcional)* Pre-seleccionar automáticamente el rubro buscado/filtrado por el residente al abrir el modal de `Solicitar Visita`.
