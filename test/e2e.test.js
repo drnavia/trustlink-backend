@@ -2192,5 +2192,29 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(meL5.data.trust_badge.label, 'Socio Verificado');
     assert.equal(meL5.data.trust_badge.checks.pass_qr_ok, true);
     assert.equal(meL5.data.trust_badge.checks.member_ok, true);
+
+    // 8. Vidriera pública sin autenticación (/api/v1/providers/public-showcase):
+    //    debe exponer el prestador con su nivel N5/checks/categorías y omitir estrictamente PII (email/phone/dni/docs)
+    const publicShowcase = await req('GET', '/api/v1/providers/public-showcase');
+    assert.equal(publicShowcase.status, 200);
+    assert.ok(publicShowcase.data.summary && typeof publicShowcase.data.summary.total_active_providers === 'number');
+    assert.ok(Array.isArray(publicShowcase.data.categories));
+    assert.ok(Array.isArray(publicShowcase.data.providers) && publicShowcase.data.providers.length >= 1);
+
+    const publicP6 = publicShowcase.data.providers.find(
+      (p) => String(p.display_name || '').includes('Progresivo Fase61')
+    );
+    assert.ok(publicP6, 'El prestador Nivel 5 debe figurar en la vidriera pública de la Landing');
+    assert.equal(publicP6.trust_level, 5);
+    assert.equal(publicP6.can_issue_pass, true);
+    assert.equal(publicP6.trust_badge?.checks?.pass_qr_ok, true);
+    assert.equal('email' in publicP6, false, 'La vidriera pública nunca debe exponer email');
+    assert.equal('phone' in publicP6, false, 'La vidriera pública nunca debe exponer teléfono');
+    assert.equal('dni' in publicP6, false, 'La vidriera pública nunca debe exponer DNI');
+    assert.equal('dni_document_url' in publicP6, false, 'La vidriera pública nunca debe exponer documentos');
+    assert.equal('criminal_record_url' in publicP6, false, 'La vidriera pública nunca debe exponer documentos');
+    assert.equal('insurance_policy_url' in publicP6, false, 'La vidriera pública nunca debe exponer documentos');
+    assert.equal('vehicles' in publicP6, false, 'La vidriera pública nunca debe exponer patentes');
+    assert.equal('employees' in publicP6, false, 'La vidriera pública nunca debe exponer nómina');
   });
 });

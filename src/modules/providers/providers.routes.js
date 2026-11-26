@@ -25,6 +25,7 @@ const {
   updateMyIdentityDocument,
   updateUserIdentityVerification,
   listVerifiedProviders,
+  listPublicProviderShowcase,
   listFavoriteProviders,
   addFavoriteProvider,
   removeFavoriteProvider,
@@ -93,8 +94,11 @@ router.patch('/compliance/user', verifyToken, verifyRole(['superadmin']), update
 router.patch('/identity/verify', verifyToken, verifyRole(['superadmin']), updateUserIdentityVerification);
 
 // ============================================================================
-// 3. DIRECTORIO UNIFICADO DE PRESTADORES VERIFICADOS (Portal Residente / Admin)
+// 3. DIRECTORIO UNIFICADO Y VIDRIERA PÚBLICA DE PRESTADORES
 // ============================================================================
+// Vidriera pública sin autenticación para la Landing (solo datos comerciales, niveles N1..N5 y rubros; sin PII)
+router.get('/public-showcase', listPublicProviderShowcase);
+
 // Devuelve prestadores aprobados, visibles, con reputación, disponibilidad hoy y favoritos
 router.get(
   '/directory',

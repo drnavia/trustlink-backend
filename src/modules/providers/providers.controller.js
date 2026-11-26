@@ -2178,6 +2178,320 @@ const listVerifiedProviders = async (req, res) => {
 };
 
 /**
+ * Vidriera pública de prestadores activos para la Landing sin autenticación.
+ * Expone exclusivamente datos comerciales, especialidades, insignias de confianza progresiva
+ * (`N1..N5`), controles verificados (`DNI · Antecedentes · ART · Pase QR`), reputación y
+ * conteos por categoría, omitiendo estrictamente datos personales sensibles (`email`, `phone`,
+ * `dni`, enlaces documentales, patentes y nómina de ayudantes).
+ * GET /api/v1/providers/public-showcase
+ *
+ * @param {import('express').Request} req - Solicitud HTTP pública con parámetros opcionales `limit` y `verified_only`.
+ * @param {import('express').Response} res - Respuesta HTTP con resumen de red, categorías y tarjetas seguras.
+ * @returns {Promise<import('express').Response>}
+ */
+const listPublicProviderShowcase = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS provider_schedule_blocks (
+        id SERIAL PRIMARY KEY,
+        provider_id INTEGER NOT NULL,
+        block_type VARCHAR(30) NOT NULL DEFAULT 'unavailable',
+        title VARCHAR(160) NOT NULL,
+        start_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+        end_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+        source_ref VARCHAR(80) NULL,
+        created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    const requestedLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isInteger(requestedLimit)
+      ? Math.max(1, Math.min(24, requestedLimit))
+      : 24;
+    const verifiedOnly =
+      String(req.query.verified_only || '').trim().toLowerCase() === 'true' ||
+      String(req.query.verified_only || '').trim() === '1';
+
+    const [showcaseRes, communitiesRes] = await Promise.all([
+      db.query(`
+        WITH visible_profiles AS (
+          SELECT
+            p.id AS provider_id,
+            p.user_id,
+            u.first_name,
+            u.last_name,
+            COALESCE(u.identity_verified, FALSE) AS identity_verified,
+            p.status AS profile_status,
+            p.criminal_record_url,
+            p.insurance_policy_url,
+            p.specialty,
+            p.criminal_record_expiry,
+            p.insurance_expiry,
+            COALESCE(p.accepts_emergencies, FALSE) AS accepts_emergencies,
+            COALESCE(p.quote_visit_policy, 'consultar') AS quote_visit_policy,
+            COALESCE(p.invoice_type, 'consultar') AS invoice_type,
+            COALESCE(p.accepted_payment_methods, '["efectivo","transferencia","mercadopago"]'::jsonb) AS accepted_payment_methods,
+            p.service_bio,
+            COALESCE(p.rating_avg, 0.00)::numeric(4,2) AS rating_avg,
+            p.id AS ordered_id,
+            (
+              SELECT COUNT(*)::int
+              FROM service_contracts sc
+              WHERE sc.provider_id = p.id
+            ) AS profile_jobs,
+            (
+              SELECT COUNT(*)::int
+              FROM service_contracts sc
+              WHERE sc.provider_id = p.id
+                AND sc.status = 'completed'::contract_status
+            ) AS profile_completed_jobs,
+            (
+              SELECT COUNT(*)::int
+              FROM provider_reviews pr
+              WHERE pr.provider_id = p.id
+            ) AS profile_reviews_count,
+            (
+              SELECT COUNT(*)::int
+              FROM public.service_disputes sd
+              JOIN service_contracts sc ON sc.id = sd.contract_id
+              WHERE sc.provider_id = p.id
+            ) AS profile_disputes_count
+          FROM providers p
+          JOIN users u ON p.user_id = u.id
+          WHERE (
+              p.status = 'approved'::provider_status
+              OR (COALESCE(u.identity_verified, FALSE) = TRUE AND p.status = 'pending'::provider_status)
+            )
+            AND COALESCE(p.specialty_approval_status, 'approved') = 'approved'
+            AND COALESCE(p.is_visible_in_directory, TRUE) = TRUE
+            AND COALESCE(u.is_active, TRUE) = TRUE
+            AND COALESCE(u.can_use_provider, FALSE) = TRUE
+        )
+        SELECT
+          (ARRAY_AGG(vp.provider_id ORDER BY vp.ordered_id ASC))[1] AS showcase_id,
+          vp.user_id,
+          vp.first_name,
+          vp.last_name,
+          STRING_AGG(DISTINCT vp.specialty, ' · ' ORDER BY vp.specialty) AS specialties_label,
+          ARRAY_AGG(DISTINCT vp.specialty ORDER BY vp.specialty) AS specialties,
+          (ARRAY_AGG(vp.specialty ORDER BY vp.ordered_id ASC))[1] AS specialty,
+          COALESCE(
+            (
+              SELECT ROUND(AVG(pr.rating)::numeric, 2)
+              FROM provider_reviews pr
+              JOIN providers p_rev ON p_rev.id = pr.provider_id
+              WHERE p_rev.user_id = vp.user_id
+            ),
+            ROUND(AVG(vp.rating_avg) FILTER (WHERE vp.rating_avg > 0)::numeric, 2),
+            0.00
+          ) AS rating_avg,
+          COALESCE(SUM(vp.profile_jobs), 0)::int AS total_jobs,
+          COALESCE(SUM(vp.profile_completed_jobs), 0)::int AS completed_jobs,
+          COALESCE(SUM(vp.profile_reviews_count), 0)::int AS reviews_count,
+          COALESCE(SUM(vp.profile_disputes_count), 0)::int AS disputes_count,
+          BOOL_OR(vp.accepts_emergencies) AS accepts_emergencies,
+          (ARRAY_AGG(vp.quote_visit_policy ORDER BY vp.ordered_id ASC))[1] AS quote_visit_policy,
+          (ARRAY_AGG(vp.invoice_type ORDER BY vp.ordered_id ASC))[1] AS invoice_type,
+          (ARRAY_AGG(vp.accepted_payment_methods ORDER BY vp.ordered_id ASC))[1] AS accepted_payment_methods,
+          (ARRAY_AGG(vp.service_bio ORDER BY vp.ordered_id ASC) FILTER (WHERE vp.service_bio IS NOT NULL))[1] AS service_bio,
+          (
+            SELECT COUNT(*)::int
+            FROM public.provider_public_questions ppq
+            WHERE ppq.provider_user_id = vp.user_id
+              AND ppq.answer IS NOT NULL
+          ) AS answered_questions_count,
+          COALESCE(sub.is_verified_member, FALSE) AS is_verified_member,
+          sub.plan_code AS membership_tier,
+          BOOL_OR(vp.identity_verified) AS identity_verified,
+          BOOL_OR(vp.profile_status = 'approved'::provider_status) AS has_approved_compliance,
+          BOOL_OR(vp.criminal_record_url IS NOT NULL AND BTRIM(vp.criminal_record_url) <> '') AS has_criminal_doc,
+          BOOL_OR(vp.insurance_policy_url IS NOT NULL AND BTRIM(vp.insurance_policy_url) <> '') AS has_art_doc,
+          BOOL_OR(vp.criminal_record_expiry IS NOT NULL AND vp.criminal_record_expiry < CURRENT_DATE) AS criminal_expired,
+          BOOL_OR(vp.insurance_expiry IS NOT NULL AND vp.insurance_expiry < CURRENT_DATE) AS art_expired,
+          (
+            BOOL_OR(vp.criminal_record_expiry IS NOT NULL AND vp.criminal_record_expiry < CURRENT_DATE)
+            OR BOOL_OR(vp.insurance_expiry IS NOT NULL AND vp.insurance_expiry < CURRENT_DATE)
+          ) AS has_expired_docs,
+          NOT EXISTS (
+            SELECT 1
+            FROM provider_schedule_blocks psb
+            JOIN providers p_blk ON p_blk.id = psb.provider_id
+            WHERE p_blk.user_id = vp.user_id
+              AND psb.block_type = 'unavailable'
+              AND psb.start_at < (date_trunc('day', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 day')
+              AND psb.end_at > (NOW() AT TIME ZONE 'UTC')
+          ) AS has_open_schedule_today,
+          COALESCE(
+            (
+              SELECT JSON_AGG(
+                JSON_BUILD_OBJECT('tag', t.tag, 'count', t.cnt)
+                ORDER BY t.cnt DESC, t.tag ASC
+              )
+              FROM (
+                SELECT tag, COUNT(*)::int AS cnt
+                FROM provider_reviews pr
+                JOIN providers p4 ON p4.id = pr.provider_id
+                CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(pr.tags, '[]'::jsonb)) AS tag
+                WHERE p4.user_id = vp.user_id
+                GROUP BY tag
+                ORDER BY cnt DESC, tag ASC
+                LIMIT 3
+              ) t
+            ),
+            '[]'::json
+          ) AS top_tags
+        FROM visible_profiles vp
+        LEFT JOIN LATERAL (
+          SELECT
+            ps.plan_code,
+            TRUE AS is_verified_member
+          FROM public.provider_subscriptions ps
+          WHERE ps.user_id = vp.user_id
+            AND ps.status IN ('active', 'trialing')
+            AND ps.ends_at > NOW()
+          ORDER BY
+            CASE WHEN ps.plan_code = 'verified_pro' THEN 0 ELSE 1 END ASC,
+            ps.ends_at DESC,
+            ps.id DESC
+          LIMIT 1
+        ) sub ON TRUE
+        GROUP BY
+          vp.user_id,
+          vp.first_name,
+          vp.last_name,
+          sub.is_verified_member,
+          sub.plan_code
+      `),
+      db.query(`SELECT COUNT(*)::int AS total FROM public.countries`).catch(() => ({
+        rows: [{ total: 0 }],
+      })),
+    ]);
+
+    const enriched = showcaseRes.rows.map((row) => {
+      const hasExpiredDocs = Boolean(row.has_expired_docs);
+      const trustBadge = computeProviderTrustLevel({
+        userIsActive: true,
+        identityVerified: Boolean(row.identity_verified),
+        hasVisibleSpecialty: true,
+        hasCriminalDoc: Boolean(row.has_criminal_doc),
+        criminalExpired: Boolean(row.criminal_expired),
+        hasArtDoc: Boolean(row.has_art_doc),
+        artExpired: Boolean(row.art_expired),
+        complianceApproved: Boolean(row.has_approved_compliance),
+        isAllRejected: false,
+        isVerifiedMember: Boolean(row.is_verified_member),
+      });
+
+      const reputation = computeProviderReputation({
+        ratingAvg: Number(row.rating_avg || 0),
+        reviewsCount: Number(row.reviews_count || 0),
+        completedJobs: Number(row.completed_jobs || 0),
+        totalJobs: Number(row.total_jobs || 0),
+        disputesCount: Number(row.disputes_count || 0),
+        hasExpiredDocs,
+        hasActiveLocalSuspension: false,
+        isVerifiedMember: Boolean(row.is_verified_member),
+      });
+
+      const displayName = `${row.first_name || ''} ${row.last_name || ''}`.trim() || 'Prestador TrustLink';
+
+      return {
+        showcase_id: Number(row.showcase_id),
+        display_name: displayName,
+        first_name: row.first_name || '',
+        last_name: row.last_name || '',
+        specialty: row.specialty || '',
+        specialties: Array.isArray(row.specialties) ? row.specialties : [],
+        specialties_label: row.specialties_label || row.specialty || '',
+        rating_avg: Number(row.rating_avg || 0),
+        reviews_count: Number(row.reviews_count || 0),
+        completed_jobs: Number(row.completed_jobs || 0),
+        accepts_emergencies: Boolean(row.accepts_emergencies),
+        quote_visit_policy: row.quote_visit_policy || 'consultar',
+        invoice_type: row.invoice_type || 'consultar',
+        accepted_payment_methods: Array.isArray(row.accepted_payment_methods)
+          ? row.accepted_payment_methods
+          : ['efectivo', 'transferencia', 'mercadopago'],
+        service_bio: row.service_bio ? String(row.service_bio).slice(0, 220) : null,
+        answered_questions_count: Number(row.answered_questions_count || 0),
+        top_tags: Array.isArray(row.top_tags) ? row.top_tags : [],
+        is_verified_member: Boolean(row.is_verified_member),
+        membership_tier: row.membership_tier || null,
+        has_expired_docs: hasExpiredDocs,
+        available_today: Boolean(row.has_open_schedule_today) && !hasExpiredDocs,
+        trust_level: trustBadge.level,
+        trust_tier: trustBadge.tier,
+        trust_badge: trustBadge,
+        is_verified: trustBadge.is_verified,
+        can_issue_pass: trustBadge.can_issue_pass,
+        reputation,
+      };
+    });
+
+    // Priorizar vigentes primero, luego nivel de confianza (5 -> 1), plan pro, rating y trabajos completados
+    enriched.sort((a, b) => {
+      if (a.has_expired_docs !== b.has_expired_docs) return a.has_expired_docs ? 1 : -1;
+      if (b.trust_level !== a.trust_level) return b.trust_level - a.trust_level;
+      const aPro = a.membership_tier === 'verified_pro' ? 0 : 1;
+      const bPro = b.membership_tier === 'verified_pro' ? 0 : 1;
+      if (aPro !== bPro) return aPro - bPro;
+      if (b.rating_avg !== a.rating_avg) return b.rating_avg - a.rating_avg;
+      return b.completed_jobs - a.completed_jobs;
+    });
+
+    // Construir conteo real por categoría/rubro para la grilla visual de la Landing
+    const categoryMap = new Map();
+    enriched.forEach((prov) => {
+      const specs = Array.isArray(prov.specialties) && prov.specialties.length > 0
+        ? prov.specialties
+        : prov.specialty
+          ? [prov.specialty]
+          : [];
+      specs.forEach((rawSpec) => {
+        const name = String(rawSpec || '').trim();
+        if (!name) return;
+        const key = name.toLowerCase();
+        const curr = categoryMap.get(key) || { name, total_count: 0, verified_count: 0 };
+        curr.total_count += 1;
+        if (prov.is_verified && !prov.has_expired_docs) {
+          curr.verified_count += 1;
+        }
+        categoryMap.set(key, curr);
+      });
+    });
+
+    const categories = Array.from(categoryMap.values()).sort((a, b) => {
+      if (b.verified_count !== a.verified_count) return b.verified_count - a.verified_count;
+      if (b.total_count !== a.total_count) return b.total_count - a.total_count;
+      return a.name.localeCompare(b.name, 'es');
+    });
+
+    const filteredProviders = verifiedOnly
+      ? enriched.filter((p) => p.is_verified && !p.has_expired_docs)
+      : enriched;
+
+    return res.status(200).json({
+      summary: {
+        total_active_providers: enriched.length,
+        verified_providers: enriched.filter((p) => p.is_verified && !p.has_expired_docs).length,
+        socio_providers: enriched.filter((p) => p.trust_level === 5 && !p.has_expired_docs).length,
+        emergency_providers: enriched.filter((p) => p.accepts_emergencies && !p.has_expired_docs).length,
+        total_communities: Number(communitiesRes.rows[0]?.total || 0),
+      },
+      categories,
+      count: Math.min(filteredProviders.length, limit),
+      providers: filteredProviders.slice(0, limit),
+    });
+  } catch (error) {
+    console.error('Error al consultar vidriera pública de prestadores:', error);
+    return res.status(500).json({
+      error: 'Error interno al consultar la vidriera pública de prestadores.',
+    });
+  }
+};
+
+/**
  * Lista los `provider_user_id` guardados como favoritos por el residente autenticado.
  * GET /api/v1/providers/favorites
  *
@@ -3090,6 +3404,7 @@ module.exports = {
   updateMyIdentityDocument,
   updateUserIdentityVerification,
   listVerifiedProviders,
+  listPublicProviderShowcase,
   listFavoriteProviders,
   addFavoriteProvider,
   removeFavoriteProvider,
