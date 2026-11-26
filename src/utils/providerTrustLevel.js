@@ -185,7 +185,7 @@ function computeProviderTrustLevel({
       level: criminalOk || artOk ? 2 : 1,
       tier: 'docs_expired',
       label: 'Doc. vencida',
-      sublabel: 'Renová Antecedentes/ART para rehabilitar garita',
+      sublabel: 'Renová ART/Antecedentes para rehabilitar garita',
       tone: 'danger',
       is_verified: false,
       visible_in_directory: true,
@@ -239,7 +239,7 @@ function computeProviderTrustLevel({
       level: 3,
       tier: 'docs_complete',
       label: 'Doc. en validación',
-      sublabel: 'Antecedentes + ART cargados',
+      sublabel: 'ART + Antecedentes cargados',
       tone: 'teal',
       is_verified: false,
       visible_in_directory: true,
@@ -284,7 +284,7 @@ function computeProviderTrustLevel({
     can_subscribe_verified_partner: false,
     has_expired_docs: hasExpiredDocs,
     checks: { ...baseChecks },
-    next_step_hint: 'Cargá tus Antecedentes Penales y Póliza ART vigentes para subir de nivel y habilitar Pases QR.',
+    next_step_hint: 'Cargá tu Póliza ART y Antecedentes Penales vigentes para subir de nivel y habilitar Pases QR.',
   };
 }
 
