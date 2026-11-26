@@ -2046,6 +2046,7 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(login.status, 200);
     const p6Token = login.data.token;
     const p6UserId = login.data.user.id;
+    createdUserIds.push(p6UserId);
 
     const addSpec = await req(
       'POST',
@@ -2191,14 +2192,5 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(meL5.data.trust_badge.label, 'Socio Verificado');
     assert.equal(meL5.data.trust_badge.checks.pass_qr_ok, true);
     assert.equal(meL5.data.trust_badge.checks.member_ok, true);
-
-    // 8. Limpieza: desactivar cuenta efímera de prueba para no ensuciar el directorio local
-    const cleanupRes = await req(
-      'PATCH',
-      `/api/v1/auth/users/community/${p6UserId}/toggle`,
-      { is_active: false },
-      superToken
-    );
-    assert.equal(cleanupRes.status, 200);
   });
 });
