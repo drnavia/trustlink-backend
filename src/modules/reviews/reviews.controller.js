@@ -207,11 +207,12 @@ const createProviderReview = async (req, res) => {
       return res.status(400).json({ error: 'La calificación debe ser un número entero de 1 a 5.' });
     }
 
-    // 2. Verificar existencia del contrato y que el usuario autenticado sea el propietario contratante
+    // 2. Verificar existencia del contrato, su prestador (`user_id`) y que el usuario autenticado sea el contratante
     const contractRes = await db.query(
-      `SELECT id, owner_id, provider_id, status
-       FROM service_contracts
-       WHERE id = $1`,
+      `SELECT sc.id, sc.owner_id, sc.provider_id, sc.status, p.user_id AS provider_user_id
+       FROM service_contracts sc
+       JOIN providers p ON p.id = sc.provider_id
+       WHERE sc.id = $1`,
       [contractId]
     );
 
@@ -242,18 +243,19 @@ const createProviderReview = async (req, res) => {
       );
     }
 
-    // 5. Recalcular el promedio global `AVG(rating)` a 2 decimales y sincronizar `providers.rating_avg`
+    // 5. Recalcular el promedio consolidado a nivel persona (`user_id`) y sincronizar `providers.rating_avg` en todos sus rubros
     const avgRes = await db.query(
-      `SELECT COALESCE(AVG(rating), 0)::numeric(3,2) AS new_avg
-       FROM provider_reviews
-       WHERE provider_id = $1`,
-      [contract.provider_id]
+      `SELECT COALESCE(ROUND(AVG(pr.rating)::numeric, 2), 0)::numeric(3,2) AS new_avg
+       FROM provider_reviews pr
+       JOIN providers p ON p.id = pr.provider_id
+       WHERE p.user_id = $1`,
+      [contract.provider_user_id]
     );
     const newAverage = avgRes.rows[0]?.new_avg ?? '0.00';
 
     await db.query(
-      'UPDATE providers SET rating_avg = $1 WHERE id = $2',
-      [newAverage, contract.provider_id]
+      'UPDATE providers SET rating_avg = $1 WHERE user_id = $2',
+      [newAverage, contract.provider_user_id]
     );
 
     return res.status(201).json({
@@ -340,12 +342,13 @@ const createOwnerReview = async (req, res) => {
 };
 
 /**
- * Consulta todas las reseñas públicas recibidas por un prestador específico,
- * enriquecidas con el nombre del residente que las emitió y ordenadas de más reciente a más antigua.
+ * Consulta todas las reseñas públicas consolidadas a nivel persona (`user_id`) de un prestador
+ * a partir de cualquiera de sus `providerId`, enriquecidas con el rubro (`specialty`) del trabajo
+ * calificado y el nombre del residente emisor, ordenadas de más reciente a más antigua.
  * GET /api/v1/reviews/provider/:providerId
  *
  * @param {import('express').Request} req - Petición HTTP con `:providerId` en params.
- * @param {import('express').Response} res - Respuesta HTTP con `{ provider_id, count, reviews }`.
+ * @param {import('express').Response} res - Respuesta HTTP con `{ provider_id, provider_user_id, specialties, count, reviews }`.
  * @returns {Promise<import('express').Response>}
  */
 const getProviderReviewsById = async (req, res) => {
@@ -357,11 +360,31 @@ const getProviderReviewsById = async (req, res) => {
       return res.status(400).json({ error: 'ID de prestador inválido.' });
     }
 
-    // 2. Consultar reseñas del prestador (incluyendo micro-tags) uniendo datos básicos del residente
+    // 2. Resolver la persona (`user_id`) dueña de ese perfil para consolidar reseñas de todos sus rubros
+    const ownerLookup = await db.query(
+      'SELECT user_id FROM providers WHERE id = $1 LIMIT 1',
+      [providerId]
+    );
+    const providerUserId = ownerLookup.rows[0]?.user_id ? Number(ownerLookup.rows[0].user_id) : null;
+
+    if (!providerUserId) {
+      return res.status(200).json({
+        provider_id: providerId,
+        provider_user_id: null,
+        specialties: [],
+        count: 0,
+        reviews: [],
+      });
+    }
+
+    // 3. Consultar todas las reseñas de la persona incluyendo el rubro (`specialty`) de cada trabajo
     const reviewsRes = await db.query(
       `SELECT
         pr.id,
         pr.contract_id,
+        pr.provider_id,
+        p.specialty,
+        sc.description AS service_description,
         pr.rating,
         pr.comment,
         COALESCE(pr.tags, '[]'::jsonb) AS tags,
@@ -369,16 +392,28 @@ const getProviderReviewsById = async (req, res) => {
         u.first_name AS owner_first_name,
         u.last_name AS owner_last_name
        FROM provider_reviews pr
+       JOIN providers p ON p.id = pr.provider_id
+       LEFT JOIN service_contracts sc ON sc.id = pr.contract_id
        LEFT JOIN users u ON u.id = pr.owner_id
-       WHERE pr.provider_id = $1
+       WHERE p.user_id = $1
        ORDER BY pr.id DESC`,
-      [providerId]
+      [providerUserId]
+    );
+
+    const specialties = Array.from(
+      new Set(
+        reviewsRes.rows
+          .map((row) => String(row.specialty || '').trim())
+          .filter(Boolean)
+      )
     );
 
     return res.status(200).json({
       provider_id: providerId,
+      provider_user_id: providerUserId,
+      specialties,
       count: reviewsRes.rows.length,
-      reviews: reviewsRes.rows
+      reviews: reviewsRes.rows,
     });
   } catch (error) {
     console.error('Error al consultar reseñas del prestador:', error);

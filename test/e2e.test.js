@@ -1621,6 +1621,25 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(stdRes.data.provider.status, 'approved');
     assert.equal(stdRes.data.provider.is_custom_specialty, false);
 
+    // 1.b Consultar GET /api/v1/reviews/provider/:id usando el ID de la nueva especialidad (Plomero)
+    //     debe devolver consolidadas las reseñas históricas de la persona (incluyendo Electricista) con `specialty`
+    const consolidatedRevRes = await req(
+      'GET',
+      `/api/v1/reviews/provider/${stdRes.data.provider.id}`,
+      undefined,
+      ownerToken
+    );
+    assert.equal(consolidatedRevRes.status, 200);
+    assert.equal(Number(consolidatedRevRes.data.provider_user_id), provUserId);
+    assert.ok(
+      Array.isArray(consolidatedRevRes.data.reviews) && consolidatedRevRes.data.reviews.length >= 1,
+      'Las reseñas deben consolidarse a nivel persona (user_id) aunque se consulte por otra especialidad'
+    );
+    assert.ok(
+      consolidatedRevRes.data.reviews.every((r) => Boolean(r.specialty)),
+      'Cada reseña consolidada debe incluir el rubro (specialty) del trabajo calificado'
+    );
+
     // 2. El prestador propone una especialidad personalizada fuera del catálogo sin descripción -> debe rechazar 400 si marca is_custom_specialty=true
     const badCustom = await req(
       'POST',
