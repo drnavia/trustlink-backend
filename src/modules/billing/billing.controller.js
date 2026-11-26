@@ -226,7 +226,7 @@ const subscribeProviderMembership = async (req, res) => {
       });
     }
 
-    // 1.5. Regla Fase 6.1: Socio Verificado (Nivel 5) exige tener Nivel 4 (compliance aprobado y documentación vigente)
+    // 1.5. Regla Eje Comercial v2: Destacado / Membresía exige tener Nivel 3+ (compliance aprobado y documentación vigente)
     const verifiedCheck = await db.query(
       `SELECT
          COUNT(*) FILTER (WHERE status = 'approved'::provider_status)::int AS approved_count,
@@ -241,8 +241,8 @@ const subscribeProviderMembership = async (req, res) => {
     if (Number(vRow.approved_count || 0) === 0 || hasExpiredPersonalDocs) {
       return res.status(403).json({
         error: hasExpiredPersonalDocs
-          ? 'Para activar Socio Verificado (Nivel 5) primero debés renovar tu documentación vencida.'
-          : 'Para activar Socio Verificado (Nivel 5) primero necesitás tener tu perfil Verificado (Nivel 4: identidad, Antecedentes y Póliza ART aprobados).',
+          ? 'Para activar el plan Destacado primero debés renovar tu documentación vencida.'
+          : 'Para activar el plan Destacado primero necesitás alcanzar Nivel 3 (Pase QR habilitado: identidad, Seguro AP/ART y Antecedentes aprobados).',
       });
     }
 

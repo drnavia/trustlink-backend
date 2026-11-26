@@ -24,6 +24,7 @@ const {
   updateUserComplianceStatus,
   updateMyIdentityDocument,
   updateUserIdentityVerification,
+  updateUserAutoVerification,
   listVerifiedProviders,
   listPublicProviderShowcase,
   listFavoriteProviders,
@@ -90,8 +91,11 @@ router.patch('/compliance', verifyToken, verifyRole(['superadmin']), updateCompl
 // Aprobar o rechazar el compliance personal consolidado de un prestador (`user_id`) de una sola vez
 router.patch('/compliance/user', verifyToken, verifyRole(['superadmin']), updateUserComplianceStatus);
 
-// Validar o revocar identidad básica (DNI) de un prestador para habilitar visibilidad Nivel 1 (Fase 6.1)
+// Validar o revocar identidad básica (DNI) de un prestador para habilitar visibilidad Nivel 1
 router.patch('/identity/verify', verifyToken, verifyRole(['superadmin']), updateUserIdentityVerification);
+
+// Validar o revocar sello Nivel 4 Verificado TrustLink (cotejo automático/cruzado de PDFs)
+router.patch('/auto-verify', verifyToken, verifyRole(['superadmin']), updateUserAutoVerification);
 
 // ============================================================================
 // 3. DIRECTORIO UNIFICADO Y VIDRIERA PÚBLICA DE PRESTADORES

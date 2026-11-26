@@ -28,6 +28,10 @@ const {
   computeProviderTrustLevel,
   isExpiryDatePast,
 } = require('../../utils/providerTrustLevel');
+const {
+  DEFAULT_CRIMINAL_WINDOW_DAYS,
+  computeEffectiveCriminalRecordExpiry,
+} = require('../../utils/complianceExpiry');
 
 /**
  * Asegura de forma idempotente la existencia de la tabla `provider_document_versions`.
@@ -48,8 +52,13 @@ const ensureDocumentVersionsTable = async () => {
       valid_from DATE NULL,
       valid_to DATE NULL,
       status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
     );
+  `);
+  await db.query(`
+    ALTER TABLE public.provider_document_versions
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
   `);
 };
 
@@ -121,7 +130,8 @@ const recordDocumentVersion = async ({
   documentUrl,
   validFrom = null,
   validTo = null,
-  status = 'pending'
+  status = 'pending',
+  metadata = {},
 }) => {
   if (!documentUrl || !String(documentUrl).trim()) return null;
 
@@ -136,10 +146,11 @@ const recordDocumentVersion = async ({
         document_url,
         valid_from,
         valid_to,
-        status
+        status,
+        metadata
       )
-      VALUES ($1, $2, $3, $4, $5::date, $6::date, $7)
-      RETURNING id, user_id, provider_id, doc_type, document_url, valid_from, valid_to, status, created_at;
+      VALUES ($1, $2, $3, $4, $5::date, $6::date, $7, $8::jsonb)
+      RETURNING id, user_id, provider_id, doc_type, document_url, valid_from, valid_to, status, metadata, created_at;
     `,
     [
       userId,
@@ -148,7 +159,8 @@ const recordDocumentVersion = async ({
       String(documentUrl).trim(),
       validFrom || null,
       validTo || null,
-      status || 'pending'
+      status || 'pending',
+      JSON.stringify(metadata && typeof metadata === 'object' ? metadata : {}),
     ]
   );
 
@@ -378,9 +390,12 @@ const editProviderProfile = async (req, res) => {
           user_id,
           specialty,
           criminal_record_url,
+          criminal_record_issued_at,
           criminal_record_expiry,
+          COALESCE(criminal_record_metadata, '{}'::jsonb) AS criminal_record_metadata,
           insurance_policy_url,
           insurance_expiry,
+          COALESCE(insurance_metadata, '{}'::jsonb) AS insurance_metadata,
           COALESCE(is_custom_specialty, FALSE) AS is_custom_specialty,
           custom_specialty_description,
           COALESCE(specialty_approval_status, 'approved') AS specialty_approval_status,
@@ -402,12 +417,15 @@ const editProviderProfile = async (req, res) => {
       custom_specialty_description,
       criminal_record_url,
       criminal_record_from,
+      criminal_record_issued_at,
       criminal_record_expiry,
+      criminal_record_metadata,
       insurance_policy_url,
       art_insurance_url,
       insurance_from,
       insurance_expiry,
-      art_insurance_expiry
+      art_insurance_expiry,
+      insurance_metadata,
     } = req.body;
 
     // Helper local para comparar fechas DATE/ISO sin falsos positivos por zona horaria
@@ -420,23 +438,40 @@ const editProviderProfile = async (req, res) => {
       return str.length >= 10 ? str.slice(0, 10) : str;
     };
 
-    // Etapa 2: Detectar si se actualizaron realmente documentos personales (Antecedentes y/o ART)
+    // Etapa 2: Detectar si se actualizaron realmente documentos personales (Antecedentes y/o Seguro AP/ART)
     const hasCriminalUrlField = Object.prototype.hasOwnProperty.call(req.body, 'criminal_record_url');
     const hasCriminalExpiryField = Object.prototype.hasOwnProperty.call(
       req.body,
       'criminal_record_expiry'
     );
+    const incomingCriminalIssuedAt =
+      criminal_record_issued_at ||
+      criminal_record_metadata?.issued_at ||
+      null;
+    const hasCriminalMetaField =
+      Boolean(incomingCriminalIssuedAt) ||
+      (criminal_record_metadata && typeof criminal_record_metadata === 'object');
     const hasInsuranceUrlField =
       Object.prototype.hasOwnProperty.call(req.body, 'insurance_policy_url') ||
       Object.prototype.hasOwnProperty.call(req.body, 'art_insurance_url');
     const hasInsuranceExpiryField =
       Object.prototype.hasOwnProperty.call(req.body, 'insurance_expiry') ||
       Object.prototype.hasOwnProperty.call(req.body, 'art_insurance_expiry');
+    const hasInsuranceMetaField = Boolean(insurance_metadata && typeof insurance_metadata === 'object');
 
     const incomingCriminalUrl = hasCriminalUrlField
       ? String(criminal_record_url || '').trim()
       : undefined;
-    const incomingCriminalExpiry = hasCriminalExpiryField ? criminal_record_expiry || null : undefined;
+    // Si envía fecha de emisión de Antecedentes sin vencimiento explícito, calcula vencimiento base de red (180 días)
+    const computedBaseCriminalExpiry = incomingCriminalIssuedAt
+      ? computeEffectiveCriminalRecordExpiry({
+          criminalRecordIssuedAt: incomingCriminalIssuedAt,
+          maxAgeDays: DEFAULT_CRIMINAL_WINDOW_DAYS,
+        })
+      : null;
+    const incomingCriminalExpiry = hasCriminalExpiryField
+      ? criminal_record_expiry || computedBaseCriminalExpiry || null
+      : computedBaseCriminalExpiry || undefined;
     const rawInsuranceUrl =
       insurance_policy_url !== undefined ? insurance_policy_url : art_insurance_url;
     const rawInsuranceExpiry =
@@ -458,7 +493,8 @@ const editProviderProfile = async (req, res) => {
         (incomingCriminalExpiry !== undefined &&
           normalizeDateKey(incomingCriminalExpiry) !== '' &&
           normalizeDateKey(incomingCriminalExpiry) !== currentCriminalExpiryKey) ||
-        Boolean(criminal_record_from)
+        Boolean(criminal_record_from) ||
+        hasCriminalMetaField
     );
 
     const insuranceChanged = Boolean(
@@ -468,7 +504,8 @@ const editProviderProfile = async (req, res) => {
         (incomingInsuranceExpiry !== undefined &&
           normalizeDateKey(incomingInsuranceExpiry) !== '' &&
           normalizeDateKey(incomingInsuranceExpiry) !== currentInsuranceExpiryKey) ||
-        Boolean(insurance_from)
+        Boolean(insurance_from) ||
+        hasInsuranceMetaField
     );
 
     const hasDocumentChanges = criminalChanged || insuranceChanged;
@@ -539,10 +576,21 @@ const editProviderProfile = async (req, res) => {
 
     const finalCriminalUrl =
       criminalChanged && incomingCriminalUrl ? incomingCriminalUrl : existing.criminal_record_url;
+    const finalCriminalIssuedAt =
+      criminalChanged && incomingCriminalIssuedAt
+        ? incomingCriminalIssuedAt
+        : existing.criminal_record_issued_at || null;
     const finalCriminalExpiry =
       criminalChanged && incomingCriminalExpiry !== undefined
         ? incomingCriminalExpiry
         : existing.criminal_record_expiry;
+    const finalCriminalMeta = criminalChanged && hasCriminalMetaField
+      ? {
+          ...(existing.criminal_record_metadata || {}),
+          ...(criminal_record_metadata || {}),
+          ...(finalCriminalIssuedAt ? { issued_at: normalizeDateKey(finalCriminalIssuedAt) } : {}),
+        }
+      : existing.criminal_record_metadata || {};
     const finalInsuranceUrl =
       insuranceChanged && incomingInsuranceUrl
         ? incomingInsuranceUrl
@@ -551,28 +599,40 @@ const editProviderProfile = async (req, res) => {
       insuranceChanged && incomingInsuranceExpiry !== undefined
         ? incomingInsuranceExpiry
         : existing.insurance_expiry;
+    const finalInsuranceMeta = insuranceChanged && hasInsuranceMetaField
+      ? {
+          ...(existing.insurance_metadata || {}),
+          ...(insurance_metadata || {}),
+        }
+      : existing.insurance_metadata || {};
 
     // Etapa 5: Persistir actualización en la fila objetivo
     const updateQuery = `
       UPDATE providers
       SET specialty = $1,
           criminal_record_url = $2,
-          criminal_record_expiry = $3::date,
-          insurance_policy_url = $4,
-          insurance_expiry = $5::date,
-          is_custom_specialty = $6,
-          custom_specialty_description = $7,
-          specialty_approval_status = $8,
-          status = $9::provider_status
-      WHERE id = $10 AND user_id = $11
+          criminal_record_issued_at = $3::date,
+          criminal_record_expiry = $4::date,
+          criminal_record_metadata = $5::jsonb,
+          insurance_policy_url = $6,
+          insurance_expiry = $7::date,
+          insurance_metadata = $8::jsonb,
+          is_custom_specialty = $9,
+          custom_specialty_description = $10,
+          specialty_approval_status = $11,
+          status = $12::provider_status
+      WHERE id = $13 AND user_id = $14
       RETURNING
         id,
         user_id,
         specialty,
         criminal_record_url,
+        criminal_record_issued_at,
         criminal_record_expiry,
+        criminal_record_metadata,
         insurance_policy_url,
         insurance_expiry,
+        insurance_metadata,
         is_custom_specialty,
         custom_specialty_description,
         specialty_approval_status,
@@ -584,9 +644,12 @@ const editProviderProfile = async (req, res) => {
     const result = await db.query(updateQuery, [
       nextSpecialty,
       finalCriminalUrl || null,
+      finalCriminalIssuedAt || null,
       finalCriminalExpiry || null,
+      JSON.stringify(finalCriminalMeta),
       finalInsuranceUrl || null,
       finalInsuranceExpiry || null,
+      JSON.stringify(finalInsuranceMeta),
       nextIsCustom,
       nextCustomDescription,
       nextSpecialtyApprovalStatus,
@@ -598,28 +661,39 @@ const editProviderProfile = async (req, res) => {
     const updatedProvider = result.rows[0];
 
     // Etapa 6: Si hubo renovación documental, propagar el documento personal a todas las especialidades
-    // del prestador y registrar versiones append-only solo de los documentos realmente modificados
+    // del prestador, resetear el sello N4 (requiere re-cotejo de PDFs) y registrar versiones append-only
     if (hasDocumentChanges) {
       await db.query(
         `
           UPDATE providers
           SET criminal_record_url = CASE WHEN $1::boolean THEN $2 ELSE criminal_record_url END,
-              criminal_record_expiry = CASE WHEN $1::boolean THEN $3::date ELSE criminal_record_expiry END,
-              insurance_policy_url = CASE WHEN $4::boolean THEN $5 ELSE insurance_policy_url END,
-              insurance_expiry = CASE WHEN $4::boolean THEN $6::date ELSE insurance_expiry END,
+              criminal_record_issued_at = CASE WHEN $1::boolean THEN $3::date ELSE criminal_record_issued_at END,
+              criminal_record_expiry = CASE WHEN $1::boolean THEN $4::date ELSE criminal_record_expiry END,
+              criminal_record_metadata = CASE WHEN $1::boolean THEN $5::jsonb ELSE criminal_record_metadata END,
+              insurance_policy_url = CASE WHEN $6::boolean THEN $7 ELSE insurance_policy_url END,
+              insurance_expiry = CASE WHEN $6::boolean THEN $8::date ELSE insurance_expiry END,
+              insurance_metadata = CASE WHEN $6::boolean THEN $9::jsonb ELSE insurance_metadata END,
               status = 'pending'::provider_status
-          WHERE user_id = $7 AND id <> $8
+          WHERE user_id = $10 AND id <> $11
         `,
         [
           criminalChanged,
           finalCriminalUrl || null,
+          finalCriminalIssuedAt || null,
           finalCriminalExpiry || null,
+          JSON.stringify(finalCriminalMeta),
           insuranceChanged,
           finalInsuranceUrl || null,
           finalInsuranceExpiry || null,
+          JSON.stringify(finalInsuranceMeta),
           userId,
           updatedProvider.id
         ]
+      );
+
+      await db.query(
+        `UPDATE users SET auto_verified = FALSE, auto_verified_at = NULL WHERE id = $1`,
+        [userId]
       );
 
       if (criminalChanged) {
@@ -628,9 +702,10 @@ const editProviderProfile = async (req, res) => {
           providerId: updatedProvider.id,
           docType: 'criminal',
           documentUrl: finalCriminalUrl || 'Sin URL',
-          validFrom: criminal_record_from || null,
+          validFrom: finalCriminalIssuedAt || criminal_record_from || null,
           validTo: finalCriminalExpiry || null,
-          status: 'pending'
+          status: 'pending',
+          metadata: finalCriminalMeta,
         });
       }
 
@@ -642,7 +717,8 @@ const editProviderProfile = async (req, res) => {
           documentUrl: finalInsuranceUrl || 'Sin URL',
           validFrom: insurance_from || null,
           validTo: finalInsuranceExpiry || null,
-          status: 'pending'
+          status: 'pending',
+          metadata: finalInsuranceMeta,
         });
       }
     }
@@ -1115,9 +1191,12 @@ const getMyProviderProfile = async (req, res) => {
           id,
           specialty,
           criminal_record_url,
+          criminal_record_issued_at,
           criminal_record_expiry,
+          COALESCE(criminal_record_metadata, '{}'::jsonb) AS criminal_record_metadata,
           insurance_policy_url,
           insurance_expiry,
+          COALESCE(insurance_metadata, '{}'::jsonb) AS insurance_metadata,
           status,
           COALESCE(is_visible_in_directory, TRUE) AS is_visible_in_directory,
           COALESCE(is_custom_specialty, FALSE) AS is_custom_specialty,
@@ -1147,6 +1226,7 @@ const getMyProviderProfile = async (req, res) => {
           valid_from,
           valid_to,
           status,
+          COALESCE(metadata, '{}'::jsonb) AS metadata,
           created_at
         FROM public.provider_document_versions
         WHERE user_id = $1
@@ -1304,9 +1384,22 @@ const getMyProviderProfile = async (req, res) => {
       response_label: responseStats.response_label,
     };
 
-    // Consultar estado de validación de identidad y archivo DNI del usuario para calcular nivel progresivo 0..5 (Fase 6.1)
+    // Consultar estado de N0–N4 (celular, DNI frente/dorso, identidad validada y cotejo automático N4)
     const userIdentityRes = await db.query(
-      'SELECT dni, dni_document_url, COALESCE(identity_verified, FALSE) AS identity_verified, identity_verified_at, COALESCE(is_active, TRUE) AS is_active FROM users WHERE id = $1 LIMIT 1',
+      `SELECT
+         dni,
+         dni_document_url,
+         dni_back_url,
+         COALESCE(phone_verified, TRUE) AS phone_verified,
+         phone_verified_at,
+         COALESCE(identity_verified, FALSE) AS identity_verified,
+         identity_verified_at,
+         COALESCE(auto_verified, FALSE) AS auto_verified,
+         auto_verified_at,
+         COALESCE(is_active, TRUE) AS is_active
+       FROM users
+       WHERE id = $1
+       LIMIT 1`,
       [userId]
     );
     const userIdentityRow = userIdentityRes.rows[0] || {};
@@ -1327,6 +1420,10 @@ const getMyProviderProfile = async (req, res) => {
         const dt = String(v.doc_type || '').toLowerCase();
         return dt.includes('art') || dt.includes('seguro') || dt.includes('insurance');
       });
+    const meLatestCriminalIssuedAt =
+      meRows.find((r) => r.criminal_record_issued_at)?.criminal_record_issued_at || null;
+    const meLatestCriminalExpiry =
+      meRows.find((r) => r.criminal_record_expiry)?.criminal_record_expiry || null;
     const meCrimExpired = meRows.some((r) => isExpiryDatePast(r.criminal_record_expiry));
     const meArtExpired = meRows.some((r) => isExpiryDatePast(r.insurance_expiry));
     const meComplianceApproved = meRows.some((r) => r.status === 'approved');
@@ -1334,13 +1431,18 @@ const getMyProviderProfile = async (req, res) => {
 
     const trustBadge = computeProviderTrustLevel({
       userIsActive: userIdentityRow.is_active !== false,
+      phoneVerified: userIdentityRow.phone_verified !== false,
       identityVerified: Boolean(userIdentityRow.identity_verified),
       hasVisibleSpecialty: meHasVisibleSpec,
       hasCriminalDoc: meHasCriminalDoc,
       criminalExpired: meCrimExpired,
+      criminalRecordIssuedAt: meLatestCriminalIssuedAt,
+      criminalRecordExpiry: meLatestCriminalExpiry,
+      criminalRecordMaxAgeDays: DEFAULT_CRIMINAL_WINDOW_DAYS,
       hasArtDoc: meHasArtDoc,
       artExpired: meArtExpired,
       complianceApproved: meComplianceApproved,
+      autoVerified: Boolean(userIdentityRow.auto_verified),
       isAllRejected: meAllRejected,
       isVerifiedMember: Boolean(membership?.is_verified_member),
     });
@@ -1367,8 +1469,14 @@ const getMyProviderProfile = async (req, res) => {
     return res.status(200).json({
       dni: userIdentityRow.dni || null,
       dni_document_url: userIdentityRow.dni_document_url || null,
+      dni_back_url: userIdentityRow.dni_back_url || null,
+      phone_verified: userIdentityRow.phone_verified !== false,
+      phone_verified_at: userIdentityRow.phone_verified_at || null,
       identity_verified: Boolean(userIdentityRow.identity_verified) || meComplianceApproved,
       identity_verified_at: userIdentityRow.identity_verified_at || null,
+      auto_verified: Boolean(userIdentityRow.auto_verified),
+      auto_verified_at: userIdentityRow.auto_verified_at || null,
+      is_featured_partner: Boolean(trustBadge.is_featured_partner),
       trust_level: trustBadge.level,
       trust_badge: trustBadge,
       providers: providersRes.rows,
@@ -1426,10 +1534,14 @@ const listAllProvidersForOps = async (req, res) => {
         u.last_name,
         u.dni,
         u.dni_document_url,
+        u.dni_back_url,
         u.email,
         u.phone,
+        COALESCE(u.phone_verified, TRUE) AS phone_verified,
         COALESCE(u.identity_verified, FALSE) AS identity_verified,
         u.identity_verified_at,
+        COALESCE(u.auto_verified, FALSE) AS auto_verified,
+        u.auto_verified_at,
         COALESCE(u.is_active, TRUE) AS user_is_active,
         COALESCE(p.is_visible_in_directory, TRUE) AS is_visible_in_directory,
         COALESCE(p.specialty, 'Sin especificar (Perfil Incompleto)') AS specialty,
@@ -1437,9 +1549,12 @@ const listAllProvidersForOps = async (req, res) => {
         p.custom_specialty_description,
         COALESCE(p.specialty_approval_status, 'approved') AS specialty_approval_status,
         p.criminal_record_url,
+        p.criminal_record_issued_at,
         p.criminal_record_expiry,
+        COALESCE(p.criminal_record_metadata, '{}'::jsonb) AS criminal_record_metadata,
         p.insurance_policy_url,
         p.insurance_expiry,
+        COALESCE(p.insurance_metadata, '{}'::jsonb) AS insurance_metadata,
         COALESCE(p.status::text, 'sin_perfil') AS status,
         COALESCE(p.rating_avg, 0.00) AS rating_avg,
         COALESCE(p.created_at, u.created_at) AS created_at,
@@ -1698,20 +1813,52 @@ const updateMyIdentityDocument = async (req, res) => {
     await ensureEvolutionSchema();
     const userId = Number(req.user.userId);
     const rawUrl = String(req.body?.dni_document_url || '').trim();
+    const rawBackUrl =
+      req.body?.dni_back_url !== undefined && req.body?.dni_back_url !== null
+        ? String(req.body.dni_back_url).trim()
+        : undefined;
+    const rawDni =
+      req.body?.dni !== undefined && req.body?.dni !== null
+        ? String(req.body.dni).replace(/\D+/g, '').trim()
+        : undefined;
 
     if (!rawUrl || rawUrl.length < 4) {
       return res.status(400).json({
-        error: 'Ingresá el enlace o URL válida de tu documento de identidad (DNI).',
+        error: 'Ingresá el enlace o URL válida de tu documento de identidad (frente o PDF).',
       });
     }
 
+    if (rawDni !== undefined && rawDni.length > 0) {
+      if (rawDni.length < 6 || rawDni.length > 12) {
+        return res.status(400).json({ error: 'Ingresá un número de DNI válido (solo dígitos).' });
+      }
+      const dupCheck = await db.query('SELECT id FROM users WHERE dni = $1 AND id <> $2 LIMIT 1', [
+        rawDni,
+        userId,
+      ]);
+      if (dupCheck.rows.length > 0) {
+        return res.status(400).json({ error: 'Ese número de DNI ya está asociado a otra cuenta.' });
+      }
+    }
+
     const cleanUrl = rawUrl.slice(0, 1000);
+    const cleanBackUrl = rawBackUrl !== undefined ? (rawBackUrl ? rawBackUrl.slice(0, 1000) : null) : undefined;
+
     const upd = await db.query(
       `UPDATE users
-       SET dni_document_url = $1
-       WHERE id = $2
-       RETURNING id, first_name, last_name, dni, dni_document_url, identity_verified, identity_verified_at`,
-      [cleanUrl, userId]
+       SET dni_document_url = $1,
+           dni_back_url = CASE WHEN $2::boolean THEN $3 ELSE dni_back_url END,
+           dni = CASE WHEN $4::boolean THEN $5 ELSE dni END
+       WHERE id = $6
+       RETURNING id, first_name, last_name, dni, dni_document_url, dni_back_url, identity_verified, identity_verified_at`,
+      [
+        cleanUrl,
+        cleanBackUrl !== undefined,
+        cleanBackUrl ?? null,
+        Boolean(rawDni),
+        rawDni || null,
+        userId,
+      ]
     );
 
     if (upd.rows.length === 0) {
@@ -1721,7 +1868,7 @@ const updateMyIdentityDocument = async (req, res) => {
     return res.status(200).json({
       message: upd.rows[0].identity_verified
         ? 'Documento de identidad (DNI) actualizado correctamente.'
-        : 'Documento de identidad (DNI) cargado. Administración TrustLink ya puede revisarlo para validar tu DNI.',
+        : 'Documento de identidad (DNI) cargado. Administración TrustLink ya puede revisarlo para validar tu Nivel 1.',
       user: upd.rows[0],
     });
   } catch (error) {
@@ -1732,12 +1879,8 @@ const updateMyIdentityDocument = async (req, res) => {
 
 /**
  * Valida o revoca la identidad básica (DNI) de un prestador para habilitar o pausar
- * su visibilidad progresiva de Nivel 1 (Perfil Básico) en el directorio de residentes (Fase 6.1).
+ * su visibilidad progresiva de Nivel 1 (Perfil Básico) en el directorio de residentes.
  * PATCH /api/v1/providers/identity/verify
- *
- * @param {import('express').Request} req - Solicitud HTTP con `{ user_id, verified }`.
- * @param {import('express').Response} res - Respuesta HTTP con el nuevo estado de identidad.
- * @returns {Promise<import('express').Response>}
  */
 const updateUserIdentityVerification = async (req, res) => {
   try {
@@ -1754,7 +1897,7 @@ const updateUserIdentityVerification = async (req, res) => {
        SET identity_verified = $1,
            identity_verified_at = CASE WHEN $1 THEN COALESCE(identity_verified_at, NOW()) ELSE NULL END
        WHERE id = $2
-       RETURNING id, first_name, last_name, dni, dni_document_url, email, identity_verified, identity_verified_at`,
+       RETURNING id, first_name, last_name, dni, dni_document_url, dni_back_url, email, identity_verified, identity_verified_at`,
       [verified, targetUserId]
     );
 
@@ -1764,13 +1907,67 @@ const updateUserIdentityVerification = async (req, res) => {
 
     return res.status(200).json({
       message: verified
-        ? 'DNI validado correctamente. El prestador ya puede figurar en el directorio si tiene especialidad activa.'
+        ? 'DNI validado correctamente. El prestador ya puede figurar en el directorio (Nivel 1) si tiene especialidad activa.'
         : 'Validación de DNI revocada.',
       user: upd.rows[0],
     });
   } catch (error) {
     console.error('Error al actualizar validación de DNI:', error);
     return res.status(500).json({ error: 'Error interno al actualizar validación de DNI.' });
+  }
+};
+
+/**
+ * Otorga o revoca el sello Nivel 4 "Verificado TrustLink" (cotejo automático/cruzado de PDFs
+ * contra los datos cargados por el prestador). Exige tener Nivel 3 (compliance aprobado) vigente.
+ * PATCH /api/v1/providers/auto-verify
+ */
+const updateUserAutoVerification = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const targetUserId = parseInt(req.body?.user_id, 10);
+    const verified = req.body?.verified !== undefined ? Boolean(req.body.verified) : true;
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: 'Debe indicar un user_id válido.' });
+    }
+
+    if (verified) {
+      const checkRes = await db.query(
+        `SELECT COUNT(*) FILTER (WHERE status = 'approved'::provider_status)::int AS approved_count
+         FROM providers
+         WHERE user_id = $1`,
+        [targetUserId]
+      );
+      if (Number(checkRes.rows[0]?.approved_count || 0) === 0) {
+        return res.status(400).json({
+          error: 'Para otorgar el sello Nivel 4 (Verificado), el prestador primero debe tener Nivel 3 (compliance aprobado).',
+        });
+      }
+    }
+
+    const upd = await db.query(
+      `UPDATE users
+       SET auto_verified = $1,
+           auto_verified_at = CASE WHEN $1 THEN NOW() ELSE NULL END
+       WHERE id = $2
+       RETURNING id, first_name, last_name, email, auto_verified, auto_verified_at`,
+      [verified, targetUserId]
+    );
+
+    if (upd.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario no encontrado.' });
+    }
+
+    return res.status(200).json({
+      message: verified
+        ? 'Sello Nivel 4 (Verificado TrustLink — cotejo de PDFs) otorgado correctamente.'
+        : 'Sello Nivel 4 (Verificado TrustLink) revocado.',
+      user: upd.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al actualizar verificación automática N4:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar el sello Nivel 4.' });
   }
 };
 
@@ -1809,6 +2006,20 @@ const listVerifiedProviders = async (req, res) => {
     const viewerUserId = req.user?.userId ? Number(req.user.userId) : null;
     const viewerCountryId = req.user?.countryId ? Number(req.user.countryId) : null;
 
+    // Consultar la ventana de vigencia de Antecedentes Penales configurada por la comunidad del residente
+    let communityCriminalWindowDays = DEFAULT_CRIMINAL_WINDOW_DAYS;
+    if (viewerCountryId) {
+      const winRes = await db
+        .query(
+          'SELECT COALESCE(criminal_record_max_age_days, 180) AS max_days FROM countries WHERE id = $1 LIMIT 1',
+          [viewerCountryId]
+        )
+        .catch(() => ({ rows: [] }));
+      if (winRes.rows[0]?.max_days) {
+        communityCriminalWindowDays = Number(winRes.rows[0].max_days);
+      }
+    }
+
     /*
      * Etapa 2: Consulta consolidada del directorio público enriquecido (Fase 5 — Marketplace & Scoring):
      * 1) CTE `approved_profiles`: filtra perfiles con compliance aprobado (`approved`), visibles en
@@ -1832,9 +2043,12 @@ const listVerifiedProviders = async (req, res) => {
           u.last_name,
           u.phone,
           u.email,
+          COALESCE(u.phone_verified, TRUE) AS phone_verified,
           COALESCE(u.identity_verified, FALSE) AS identity_verified,
+          COALESCE(u.auto_verified, FALSE) AS auto_verified,
           p.status AS profile_status,
           p.criminal_record_url,
+          p.criminal_record_issued_at,
           p.insurance_policy_url,
           p.specialty,
           p.criminal_record_expiry,
@@ -1888,7 +2102,11 @@ const listVerifiedProviders = async (req, res) => {
         JOIN users u ON p.user_id = u.id
         WHERE (
             p.status = 'approved'::provider_status
-            OR (COALESCE(u.identity_verified, FALSE) = TRUE AND p.status = 'pending'::provider_status)
+            OR (
+              COALESCE(u.phone_verified, TRUE) = TRUE
+              AND COALESCE(u.identity_verified, FALSE) = TRUE
+              AND p.status = 'pending'::provider_status
+            )
           )
           AND COALESCE(p.specialty_approval_status, 'approved') = 'approved'
           AND COALESCE(p.is_visible_in_directory, TRUE) = TRUE
@@ -1942,10 +2160,14 @@ const listVerifiedProviders = async (req, res) => {
         COALESCE(sub.is_verified_member, FALSE) AS is_verified_member,
         sub.plan_code AS membership_tier,
         sub.ends_at AS membership_ends_at,
+        BOOL_OR(ap.phone_verified) AS phone_verified,
         BOOL_OR(ap.identity_verified) AS identity_verified,
+        BOOL_OR(ap.auto_verified) AS auto_verified,
         BOOL_OR(ap.profile_status = 'approved'::provider_status) AS has_approved_compliance,
         BOOL_OR(ap.criminal_record_url IS NOT NULL AND BTRIM(ap.criminal_record_url) <> '') AS has_criminal_doc,
         BOOL_OR(ap.insurance_policy_url IS NOT NULL AND BTRIM(ap.insurance_policy_url) <> '') AS has_art_doc,
+        MAX(ap.criminal_record_issued_at) AS criminal_record_issued_at,
+        MAX(ap.criminal_record_expiry) AS criminal_record_expiry,
         BOOL_OR(ap.criminal_record_expiry IS NOT NULL AND ap.criminal_record_expiry < CURRENT_DATE) AS criminal_expired,
         BOOL_OR(ap.insurance_expiry IS NOT NULL AND ap.insurance_expiry < CURRENT_DATE) AS art_expired,
         (
@@ -2117,26 +2339,36 @@ const listVerifiedProviders = async (req, res) => {
 
       const trustBadge = computeProviderTrustLevel({
         userIsActive: true,
+        phoneVerified: row.phone_verified !== false,
         identityVerified: Boolean(row.identity_verified),
         hasVisibleSpecialty: true,
         hasCriminalDoc: Boolean(row.has_criminal_doc),
         criminalExpired: Boolean(row.criminal_expired),
+        criminalRecordIssuedAt: row.criminal_record_issued_at || null,
+        criminalRecordExpiry: row.criminal_record_expiry || null,
+        criminalRecordMaxAgeDays: communityCriminalWindowDays,
         hasArtDoc: Boolean(row.has_art_doc),
         artExpired: Boolean(row.art_expired),
         complianceApproved: Boolean(row.has_approved_compliance),
+        autoVerified: Boolean(row.auto_verified),
         isAllRejected: false,
         isVerifiedMember: Boolean(row.is_verified_member),
       });
 
+      const effectiveHasExpiredDocs = Boolean(trustBadge.has_expired_docs);
+
       return {
         ...row,
+        has_expired_docs: effectiveHasExpiredDocs,
         identity_verified: Boolean(row.identity_verified) || Boolean(row.has_approved_compliance),
+        auto_verified: Boolean(row.auto_verified),
+        is_featured_partner: Boolean(trustBadge.is_featured_partner),
         trust_level: trustBadge.level,
         trust_tier: trustBadge.tier,
         trust_badge: trustBadge,
         is_verified: trustBadge.is_verified,
         can_issue_pass: trustBadge.can_issue_pass,
-        available_today: availableToday,
+        available_today: Boolean(row.has_open_schedule_today) && !effectiveHasExpiredDocs && !hasActiveLocalSuspension,
         community_jobs_count: communityJobsCount,
         community_visits_count: communityVisitsCount,
         community_activity_count: communityActivityCount,
@@ -2146,8 +2378,11 @@ const listVerifiedProviders = async (req, res) => {
       };
     });
 
-    // Ordenar priorizando nivel de confianza (5 -> 4 -> 3 -> 2 -> 1), plan pro, rating y user_id
+    // Ordenar priorizando: 1) Eje Comercial (Destacado en N3–N4), 2) Nivel de Confianza (4 -> 3 -> 2 -> 1), 3) Rating
     enrichedProviders.sort((a, b) => {
+      const aFeat = a.is_featured_partner ? 1 : 0;
+      const bFeat = b.is_featured_partner ? 1 : 0;
+      if (bFeat !== aFeat) return bFeat - aFeat;
       if (b.trust_level !== a.trust_level) return b.trust_level - a.trust_level;
       const aPro = a.membership_tier === 'verified_pro' ? 0 : 1;
       const bPro = b.membership_tier === 'verified_pro' ? 0 : 1;
@@ -2166,6 +2401,7 @@ const listVerifiedProviders = async (req, res) => {
 
     return res.status(200).json({
       count: finalProviders.length,
+      community_criminal_window_days: communityCriminalWindowDays,
       available_review_tags: REVIEW_MICRO_TAGS,
       providers: finalProviders,
     });
@@ -2221,9 +2457,12 @@ const listPublicProviderShowcase = async (req, res) => {
             p.user_id,
             u.first_name,
             u.last_name,
+            COALESCE(u.phone_verified, TRUE) AS phone_verified,
             COALESCE(u.identity_verified, FALSE) AS identity_verified,
+            COALESCE(u.auto_verified, FALSE) AS auto_verified,
             p.status AS profile_status,
             p.criminal_record_url,
+            p.criminal_record_issued_at,
             p.insurance_policy_url,
             p.specialty,
             p.criminal_record_expiry,
@@ -2303,10 +2542,14 @@ const listPublicProviderShowcase = async (req, res) => {
           ) AS answered_questions_count,
           COALESCE(sub.is_verified_member, FALSE) AS is_verified_member,
           sub.plan_code AS membership_tier,
+          BOOL_OR(vp.phone_verified) AS phone_verified,
           BOOL_OR(vp.identity_verified) AS identity_verified,
+          BOOL_OR(vp.auto_verified) AS auto_verified,
           BOOL_OR(vp.profile_status = 'approved'::provider_status) AS has_approved_compliance,
           BOOL_OR(vp.criminal_record_url IS NOT NULL AND BTRIM(vp.criminal_record_url) <> '') AS has_criminal_doc,
           BOOL_OR(vp.insurance_policy_url IS NOT NULL AND BTRIM(vp.insurance_policy_url) <> '') AS has_art_doc,
+          MAX(vp.criminal_record_issued_at) AS criminal_record_issued_at,
+          MAX(vp.criminal_record_expiry) AS criminal_record_expiry,
           BOOL_OR(vp.criminal_record_expiry IS NOT NULL AND vp.criminal_record_expiry < CURRENT_DATE) AS criminal_expired,
           BOOL_OR(vp.insurance_expiry IS NOT NULL AND vp.insurance_expiry < CURRENT_DATE) AS art_expired,
           (
@@ -2372,16 +2615,23 @@ const listPublicProviderShowcase = async (req, res) => {
       const hasExpiredDocs = Boolean(row.has_expired_docs);
       const trustBadge = computeProviderTrustLevel({
         userIsActive: true,
+        phoneVerified: row.phone_verified !== false,
         identityVerified: Boolean(row.identity_verified),
         hasVisibleSpecialty: true,
         hasCriminalDoc: Boolean(row.has_criminal_doc),
         criminalExpired: Boolean(row.criminal_expired),
+        criminalRecordIssuedAt: row.criminal_record_issued_at || null,
+        criminalRecordExpiry: row.criminal_record_expiry || null,
+        criminalRecordMaxAgeDays: DEFAULT_CRIMINAL_WINDOW_DAYS,
         hasArtDoc: Boolean(row.has_art_doc),
         artExpired: Boolean(row.art_expired),
         complianceApproved: Boolean(row.has_approved_compliance),
+        autoVerified: Boolean(row.auto_verified),
         isAllRejected: false,
         isVerifiedMember: Boolean(row.is_verified_member),
       });
+
+      const effectiveHasExpiredDocs = Boolean(trustBadge.has_expired_docs);
 
       const reputation = computeProviderReputation({
         ratingAvg: Number(row.rating_avg || 0),
@@ -2389,7 +2639,7 @@ const listPublicProviderShowcase = async (req, res) => {
         completedJobs: Number(row.completed_jobs || 0),
         totalJobs: Number(row.total_jobs || 0),
         disputesCount: Number(row.disputes_count || 0),
-        hasExpiredDocs,
+        hasExpiredDocs: effectiveHasExpiredDocs,
         hasActiveLocalSuspension: false,
         isVerifiedMember: Boolean(row.is_verified_member),
       });
@@ -2417,9 +2667,11 @@ const listPublicProviderShowcase = async (req, res) => {
         answered_questions_count: Number(row.answered_questions_count || 0),
         top_tags: Array.isArray(row.top_tags) ? row.top_tags : [],
         is_verified_member: Boolean(row.is_verified_member),
+        is_featured_partner: Boolean(trustBadge.is_featured_partner),
         membership_tier: row.membership_tier || null,
-        has_expired_docs: hasExpiredDocs,
-        available_today: Boolean(row.has_open_schedule_today) && !hasExpiredDocs,
+        has_expired_docs: effectiveHasExpiredDocs,
+        available_today: Boolean(row.has_open_schedule_today) && !effectiveHasExpiredDocs,
+        auto_verified: Boolean(row.auto_verified),
         trust_level: trustBadge.level,
         trust_tier: trustBadge.tier,
         trust_badge: trustBadge,
@@ -3403,6 +3655,7 @@ module.exports = {
   updateUserComplianceStatus,
   updateMyIdentityDocument,
   updateUserIdentityVerification,
+  updateUserAutoVerification,
   listVerifiedProviders,
   listPublicProviderShowcase,
   listFavoriteProviders,

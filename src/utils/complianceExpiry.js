@@ -1,10 +1,28 @@
 /**
  * @file complianceExpiry.js
  * @description Helper centralizado para evaluar vencimientos documentales obligatorios
- * (Antecedentes Penales, Póliza ART/Seguro Personal y ART de ayudantes de cuadrilla)
+ * (Antecedentes Penales con ventana configurable por barrio de 30/90/180/365 días desde fecha de emisión,
+ * Póliza ART / Seguro de Accidentes Personales y ART de ayudantes de cuadrilla)
  * al emitir pases QR o validarlos en garita / API externa.
  * @location /trustlink-backend/src/utils/complianceExpiry.js
  */
+
+/** Ventanas oficiales permitidas por comunidad para la antigüedad máxima de Antecedentes Penales. */
+const ALLOWED_CRIMINAL_WINDOW_DAYS = [30, 90, 180, 365];
+
+/** Ventana estándar de la red cuando un barrio no define una política distinta. */
+const DEFAULT_CRIMINAL_WINDOW_DAYS = 180;
+
+/**
+ * Normaliza la ventana de vigencia de Antecedentes Penales de una comunidad.
+ * @param {number|string|null|undefined} rawDays - Días configurados en `countries.criminal_record_max_age_days`.
+ * @returns {number} Ventana válida (`30`, `90`, `180` o `365`).
+ */
+function normalizeCriminalWindowDays(rawDays) {
+  const num = Number(rawDays);
+  if (ALLOWED_CRIMINAL_WINDOW_DAYS.includes(num)) return num;
+  return DEFAULT_CRIMINAL_WINDOW_DAYS;
+}
 
 /**
  * Normaliza una fecha `DATE`, cadena ISO o instancia `Date` al formato `YYYY-MM-DD` (UTC).
@@ -16,7 +34,6 @@ function toIsoDateOnly(rawDate) {
   if (!rawDate) return null;
   if (typeof rawDate === 'string') {
     const trimmed = rawDate.trim();
-    // Si ya comienza con YYYY-MM-DD, evita desfases por zona horaria local
     if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
       return trimmed.slice(0, 10);
     }
@@ -24,6 +41,43 @@ function toIsoDateOnly(rawDate) {
   const parsed = rawDate instanceof Date ? rawDate : new Date(rawDate);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString().slice(0, 10);
+}
+
+/**
+ * Suma una cantidad de días calendario a una fecha `YYYY-MM-DD` (UTC) y devuelve `YYYY-MM-DD`.
+ * @param {string|Date|null|undefined} rawDate - Fecha base de emisión.
+ * @param {number} days - Cantidad de días a sumar.
+ * @returns {string|null} Fecha resultante `YYYY-MM-DD` o `null`.
+ */
+function addDaysToIsoDate(rawDate, days) {
+  const iso = toIsoDateOnly(rawDate);
+  if (!iso) return null;
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + Number(days || 0)));
+  if (Number.isNaN(dt.getTime())) return null;
+  return dt.toISOString().slice(0, 10);
+}
+
+/**
+ * Calcula la fecha efectiva de vencimiento de Antecedentes Penales:
+ * - Si existe `criminalRecordIssuedAt` (modelo N3 con fecha de emisión), aplica `issuedAt + maxAgeDays`.
+ * - En registros heredados sin `issuedAt`, utiliza `criminalRecordExpiry` directamente.
+ *
+ * @param {object} params
+ * @param {string|Date|null|undefined} [params.criminalRecordIssuedAt]
+ * @param {string|Date|null|undefined} [params.criminalRecordExpiry]
+ * @param {number|null|undefined} [params.maxAgeDays]
+ * @returns {string|null} Fecha efectiva de vencimiento `YYYY-MM-DD` o `null`.
+ */
+function computeEffectiveCriminalRecordExpiry({
+  criminalRecordIssuedAt = null,
+  criminalRecordExpiry = null,
+  maxAgeDays = DEFAULT_CRIMINAL_WINDOW_DAYS,
+} = {}) {
+  if (criminalRecordIssuedAt) {
+    return addDaysToIsoDate(criminalRecordIssuedAt, normalizeCriminalWindowDays(maxAgeDays));
+  }
+  return toIsoDateOnly(criminalRecordExpiry);
 }
 
 /**
@@ -51,25 +105,22 @@ function isExpiryDatePassed(rawDate, referenceDate = new Date()) {
 
 /**
  * Evalúa secuencialmente si existe alguna infracción por documentación vencida del prestador
- * o de los ayudantes incluidos en el pase.
- *
- * Orden de prioridad de validación:
- * 1. Antecedentes Penales del prestador (`CRIMINAL_RECORD_EXPIRED`).
- * 2. Póliza ART / Seguro Personal del prestador (`INSURANCE_EXPIRED`).
- * 3. Póliza ART individual de cada ayudante autorizado (`CREW_INSURANCE_EXPIRED`).
- *
- * Devuelve `null` si toda la documentación declarada con fecha se encuentra vigente.
+ * o de los ayudantes incluidos en el pase (incluyendo la ventana de Antecedentes del barrio).
  *
  * @param {object} [params]
- * @param {string|Date|null|undefined} [params.criminalRecordExpiry] - Vencimiento de antecedentes penales.
- * @param {string|Date|null|undefined} [params.insuranceExpiry] - Vencimiento de póliza ART/seguro personal.
- * @param {Array<{id?: number, full_name?: string, insurance_expiry?: string|Date|null}>} [params.authorizedEmployees] - Nómina de ayudantes del pase.
- * @param {'create'|'gate'} [params.context] - Contexto del mensaje (`create` al emitir pase, `gate` en garita).
- * @param {Date} [params.referenceDate] - Fecha de referencia para la comparación.
+ * @param {string|Date|null|undefined} [params.criminalRecordIssuedAt] - Fecha de emisión de antecedentes (N3).
+ * @param {string|Date|null|undefined} [params.criminalRecordExpiry] - Vencimiento directo/heredado de antecedentes.
+ * @param {number|null|undefined} [params.criminalRecordMaxAgeDays] - Ventana de días configurada por el barrio.
+ * @param {string|Date|null|undefined} [params.insuranceExpiry] - Vencimiento de Seguro AP / Póliza ART.
+ * @param {Array<{id?: number, full_name?: string, insurance_expiry?: string|Date|null}>} [params.authorizedEmployees]
+ * @param {'create'|'gate'} [params.context]
+ * @param {Date} [params.referenceDate]
  * @returns {null|{code: string, field: string, expiry_date: string, employee_name?: string, message: string}}
  */
 function findComplianceExpiryViolation({
+  criminalRecordIssuedAt = null,
   criminalRecordExpiry = null,
+  criminalRecordMaxAgeDays = DEFAULT_CRIMINAL_WINDOW_DAYS,
   insuranceExpiry = null,
   authorizedEmployees = [],
   context = 'gate',
@@ -80,25 +131,33 @@ function findComplianceExpiryViolation({
       ? 'No se puede emitir el pase QR:'
       : 'Ingreso bloqueado en garita:';
 
-  // 1. Verificar vigencia de Antecedentes Penales del prestador titular
-  if (isExpiryDatePassed(criminalRecordExpiry, referenceDate)) {
-    const expiryDate = toIsoDateOnly(criminalRecordExpiry);
+  // 1. Verificar vigencia de Antecedentes Penales según fecha de emisión y ventana del barrio
+  const windowDays = normalizeCriminalWindowDays(criminalRecordMaxAgeDays);
+  const effectiveCriminalExpiry = computeEffectiveCriminalRecordExpiry({
+    criminalRecordIssuedAt,
+    criminalRecordExpiry,
+    maxAgeDays: windowDays,
+  });
+
+  if (isExpiryDatePassed(effectiveCriminalExpiry, referenceDate)) {
     return {
       code: 'CRIMINAL_RECORD_EXPIRED',
       field: 'criminal_record_expiry',
-      expiry_date: expiryDate,
-      message: `${prefix} los Antecedentes Penales del prestador están vencidos (venció el ${expiryDate}).`,
+      expiry_date: effectiveCriminalExpiry,
+      message: criminalRecordIssuedAt
+        ? `${prefix} los Antecedentes Penales superan la vigencia máxima de ${windowDays} días configurada para este barrio (venció el ${effectiveCriminalExpiry}).`
+        : `${prefix} los Antecedentes Penales del prestador están vencidos (venció el ${effectiveCriminalExpiry}).`,
     };
   }
 
-  // 2. Verificar vigencia de Póliza ART / Seguro Personal del prestador titular
+  // 2. Verificar vigencia de Seguro de Accidentes Personales / Póliza ART del prestador titular
   if (isExpiryDatePassed(insuranceExpiry, referenceDate)) {
     const expiryDate = toIsoDateOnly(insuranceExpiry);
     return {
       code: 'INSURANCE_EXPIRED',
       field: 'insurance_expiry',
       expiry_date: expiryDate,
-      message: `${prefix} la Póliza ART / Seguro Personal del prestador está vencida (venció el ${expiryDate}).`,
+      message: `${prefix} el Seguro AP / Póliza ART del prestador está vencido (venció el ${expiryDate}).`,
     };
   }
 
@@ -125,9 +184,6 @@ function findComplianceExpiryViolation({
 /**
  * Enriquece el snapshot JSONB de ayudantes guardado en un pase QR consultando sus fechas
  * actuales en `public.provider_employees`.
- * De esta manera, si un ayudante renovó o venció su ART luego de emitido el pase, prevalece
- * el estado vigente en base de datos al momento de la validación en garita. Ante errores de DB,
- * conserva el snapshot original como respaldo.
  *
  * @param {object} db - Cliente/pool de PostgreSQL con método `query`.
  * @param {Array<object>} authorizedEmployees - Snapshot de ayudantes almacenado en `access_passes`.
@@ -167,7 +223,12 @@ async function hydrateAuthorizedEmployeesExpiry(db, authorizedEmployees) {
 }
 
 module.exports = {
+  ALLOWED_CRIMINAL_WINDOW_DAYS,
+  DEFAULT_CRIMINAL_WINDOW_DAYS,
+  normalizeCriminalWindowDays,
   toIsoDateOnly,
+  addDaysToIsoDate,
+  computeEffectiveCriminalRecordExpiry,
   getTodayIsoDate,
   isExpiryDatePassed,
   findComplianceExpiryViolation,

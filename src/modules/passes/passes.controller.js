@@ -1581,7 +1581,7 @@ const createPass = async (req, res) => {
     }
 
     const providerCheck = await db.query(
-      `SELECT p.id, p.criminal_record_expiry, p.insurance_expiry, u.country_id
+      `SELECT p.id, p.criminal_record_expiry, p.criminal_record_issued_at, p.insurance_expiry, u.country_id
        FROM providers p
        LEFT JOIN users u ON u.id = p.user_id
        WHERE p.id = $1
@@ -1599,6 +1599,20 @@ const createPass = async (req, res) => {
       return res.status(400).json({ error: locationResult.error });
     }
 
+    // Etapa 2.5: Consultar ventana de vigencia de Antecedentes Penales configurada por la comunidad del residente
+    const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
+    let communityCriminalWindowDays = 180;
+    if (effectiveCountryId) {
+      const countryWinRes = await db
+        .query('SELECT COALESCE(criminal_record_max_age_days, 180) AS max_days FROM countries WHERE id = $1 LIMIT 1', [
+          Number(effectiveCountryId),
+        ])
+        .catch(() => ({ rows: [] }));
+      if (countryWinRes.rows[0]?.max_days) {
+        communityCriminalWindowDays = Number(countryWinRes.rows[0].max_days);
+      }
+    }
+
     // Etapa 3: Construir snapshot de ayudantes y bloquear emisión ante vencimiento documental (titular o cuadrilla)
     const authorizedEmployees = await resolveAuthorizedEmployeesSnapshot(
       Number(provider_id),
@@ -1606,7 +1620,9 @@ const createPass = async (req, res) => {
     );
 
     const expiryViolation = findComplianceExpiryViolation({
+      criminalRecordIssuedAt: providerCheck.rows[0].criminal_record_issued_at,
       criminalRecordExpiry: providerCheck.rows[0].criminal_record_expiry,
+      criminalRecordMaxAgeDays: communityCriminalWindowDays,
       insuranceExpiry: providerCheck.rows[0].insurance_expiry,
       authorizedEmployees,
       context: 'create',
@@ -1620,7 +1636,6 @@ const createPass = async (req, res) => {
     }
 
     // Etapa 4: Generar token QR seguro e insertar el pase adaptándose a la existencia de `vehicle_plate`
-    const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
     const qrToken = crypto.randomBytes(32).toString('hex');
     const supportsPlate = await hasVehiclePlateColumn();
 
@@ -2101,8 +2116,10 @@ const verifyPassByQR = async (req, res) => {
         u_prov.phone AS provider_phone,
         p.specialty AS provider_specialty,
         p.status AS compliance_status,
+        p.criminal_record_issued_at,
         p.criminal_record_expiry,
         p.insurance_expiry,
+        COALESCE(c_pass.criminal_record_max_age_days, 180) AS criminal_record_max_age_days,
         u_owner.first_name AS owner_first_name,
         u_owner.last_name AS owner_last_name,
         u_owner.phone AS owner_phone,
@@ -2115,6 +2132,7 @@ const verifyPassByQR = async (req, res) => {
       JOIN providers p ON ap.provider_id = p.id
       JOIN users u_prov ON p.user_id = u_prov.id
       JOIN users u_owner ON ap.owner_id = u_owner.id
+      LEFT JOIN countries c_pass ON c_pass.id = ap.country_id
       LEFT JOIN provider_vehicles pv ON pv.provider_id = p.id
         AND (${supportsPlate ? 'ap.vehicle_plate IS NULL OR UPPER(pv.plate) = UPPER(ap.vehicle_plate)' : 'TRUE'})
       WHERE ap.qr_token = $1
@@ -2171,7 +2189,9 @@ const verifyPassByQR = async (req, res) => {
     const parsedCrew = parseAuthorizedEmployeesArray(passInfo.authorized_employees);
     const hydratedCrew = await hydrateAuthorizedEmployeesExpiry(db, parsedCrew);
     const expiryViolation = findComplianceExpiryViolation({
+      criminalRecordIssuedAt: passInfo.criminal_record_issued_at,
       criminalRecordExpiry: passInfo.criminal_record_expiry,
+      criminalRecordMaxAgeDays: passInfo.criminal_record_max_age_days,
       insuranceExpiry: passInfo.insurance_expiry,
       authorizedEmployees: hydratedCrew,
       context: 'gate',

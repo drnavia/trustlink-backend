@@ -67,7 +67,7 @@ async function ensureEvolutionSchema() {
 
   schemaPromise = (async () => {
     try {
-      // 1. Columnas de ubicación estructurada, capacidades duales, portal principal, rol inicial e identidad validada en `users`
+      // 1. Columnas de ubicación estructurada, capacidades duales, portal principal, rol inicial e identidad/N0–N4 en `users`
       await db.query(`
         ALTER TABLE users
         ADD COLUMN IF NOT EXISTS fraction_type VARCHAR(20) NOT NULL DEFAULT 'na',
@@ -78,8 +78,20 @@ async function ensureEvolutionSchema() {
         ADD COLUMN IF NOT EXISTS initial_role VARCHAR(30) NULL,
         ADD COLUMN IF NOT EXISTS identity_verified BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS identity_verified_at TIMESTAMP WITHOUT TIME ZONE NULL,
-        ADD COLUMN IF NOT EXISTS dni_document_url TEXT NULL
+        ADD COLUMN IF NOT EXISTS dni_document_url TEXT NULL,
+        ADD COLUMN IF NOT EXISTS dni_back_url TEXT NULL,
+        ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN NOT NULL DEFAULT TRUE,
+        ADD COLUMN IF NOT EXISTS phone_verified_at TIMESTAMP WITHOUT TIME ZONE NULL,
+        ADD COLUMN IF NOT EXISTS phone_otp_code VARCHAR(10) NULL,
+        ADD COLUMN IF NOT EXISTS phone_otp_expires_at TIMESTAMP WITHOUT TIME ZONE NULL,
+        ADD COLUMN IF NOT EXISTS accepts_whatsapp_contact BOOLEAN NOT NULL DEFAULT TRUE,
+        ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(30) NOT NULL DEFAULT 'email',
+        ADD COLUMN IF NOT EXISTS auto_verified BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS auto_verified_at TIMESTAMP WITHOUT TIME ZONE NULL
       `);
+
+      // Permitir registro N0 de prestadores sin DNI inicial (el DNI se carga y valida en N1)
+      await db.query(`ALTER TABLE users ALTER COLUMN dni DROP NOT NULL`).catch(() => {});
 
       // Backfill idempotente de `initial_role` para cuentas creadas antes de la migración 022
       await db.query(`
@@ -170,13 +182,14 @@ async function ensureEvolutionSchema() {
         ON public.provider_subscriptions (user_id, status, ends_at DESC)
       `);
 
-      // 5. Asegurar columnas de licenciamiento B2B en `countries`
+      // 5. Asegurar columnas de licenciamiento B2B y ventana de Antecedentes Penales por barrio en `countries`
       await db.query(`
         ALTER TABLE public.countries
         ADD COLUMN IF NOT EXISTS plan_code VARCHAR(40) NOT NULL DEFAULT 'pilot',
         ADD COLUMN IF NOT EXISTS billing_status VARCHAR(20) NOT NULL DEFAULT 'active',
         ADD COLUMN IF NOT EXISTS subscription_ends_at TIMESTAMP WITHOUT TIME ZONE NULL,
-        ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL
+        ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL,
+        ADD COLUMN IF NOT EXISTS criminal_record_max_age_days INTEGER NOT NULL DEFAULT 180
       `);
 
       // 6. Asegurar columnas de Mercado Pago Checkout Pro en `transactions`
@@ -267,11 +280,15 @@ async function ensureEvolutionSchema() {
       `);
 
       // 11. Asegurar columnas de catálogo estándar vs especialidad personalizada moderada (Fase 5.3)
+      //     y metadatos estructurados de Seguro AP/ART + Antecedentes Penales (Modelo N0–N4 v2)
       await db.query(`
         ALTER TABLE public.providers
         ADD COLUMN IF NOT EXISTS is_custom_specialty BOOLEAN NOT NULL DEFAULT FALSE,
         ADD COLUMN IF NOT EXISTS custom_specialty_description TEXT NULL,
-        ADD COLUMN IF NOT EXISTS specialty_approval_status VARCHAR(20) NOT NULL DEFAULT 'approved'
+        ADD COLUMN IF NOT EXISTS specialty_approval_status VARCHAR(20) NOT NULL DEFAULT 'approved',
+        ADD COLUMN IF NOT EXISTS insurance_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        ADD COLUMN IF NOT EXISTS criminal_record_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        ADD COLUMN IF NOT EXISTS criminal_record_issued_at DATE NULL
       `);
 
       // 12. Asegurar tablas de agenda semanal y ventana de visitas (Fase 5.4) para consultas de analítica

@@ -73,7 +73,8 @@ const ensureCountriesColumns = async () => {
       ADD COLUMN IF NOT EXISTS plan_code VARCHAR(40) NOT NULL DEFAULT 'pilot',
       ADD COLUMN IF NOT EXISTS billing_status VARCHAR(20) NOT NULL DEFAULT 'active',
       ADD COLUMN IF NOT EXISTS subscription_ends_at TIMESTAMP WITHOUT TIME ZONE NULL,
-      ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL;
+      ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL,
+      ADD COLUMN IF NOT EXISTS criminal_record_max_age_days INTEGER NOT NULL DEFAULT 180;
   `);
 
   // Paso 2: Inspeccionar columnas reales para soportar esquemas legacy con `locality` o `location`
@@ -688,6 +689,7 @@ const listCountries = async (req, res) => {
           c.billing_status,
           c.subscription_ends_at,
           c.monthly_pass_quota,
+          COALESCE(c.criminal_record_max_age_days, 180) AS criminal_record_max_age_days,
           c.created_at,
           (SELECT COUNT(*)::int FROM country_integrations ci WHERE ci.country_id = c.id AND ci.is_active = TRUE) AS active_keys_count,
           (
@@ -840,6 +842,19 @@ const updateCountry = async (req, res) => {
         ? String(req.body.province).trim() || null
         : current.province;
 
+    // Ventana configurable de vigencia de Antecedentes Penales por barrio (30 / 90 / 180 / 365 días)
+    const ALLOWED_CRIMINAL_WINDOWS = [30, 90, 180, 365];
+    let criminalRecordMaxAgeDays = Number(current.criminal_record_max_age_days || 180);
+    if (req.body?.criminal_record_max_age_days !== undefined) {
+      const parsedDays = parseInt(req.body.criminal_record_max_age_days, 10);
+      if (!ALLOWED_CRIMINAL_WINDOWS.includes(parsedDays)) {
+        return res.status(400).json({
+          error: 'La vigencia máxima de Antecedentes Penales debe ser 30, 90, 180 o 365 días.',
+        });
+      }
+      criminalRecordMaxAgeDays = parsedDays;
+    }
+
     // Etapa 3: Persistir cambios en `countries`
     const updated = await db.query(
       `
@@ -848,11 +863,12 @@ const updateCountry = async (req, res) => {
             address = $2,
             postal_code = $3,
             city = $4,
-            province = $5
-        WHERE id = $6
-        RETURNING id, name, address, postal_code, city, province, is_active, created_at
+            province = $5,
+            criminal_record_max_age_days = $6
+        WHERE id = $7
+        RETURNING id, name, address, postal_code, city, province, is_active, criminal_record_max_age_days, created_at
       `,
-      [name, address, postalCode, city, province, countryId]
+      [name, address, postalCode, city, province, criminalRecordMaxAgeDays, countryId]
     );
 
     return res.status(200).json({

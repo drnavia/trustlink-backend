@@ -11,6 +11,7 @@ const {
   listPublicCountries,
   register,
   login,
+  verifyPhoneOtp,
   forgotPassword,
   resetPassword,
   createPrivilegedUser,
@@ -19,6 +20,7 @@ const {
   getUsersAnalytics,
   getCommunityUsers,
   toggleCommunityUserStatus,
+  verifyCommunityUserPhone,
 } = require('./auth.controller');
 const { verifyToken, verifyRole } = require('../../middlewares/auth.middleware');
 const { createRateLimiter } = require('../../middlewares/security.middleware');
@@ -60,6 +62,7 @@ router.get('/countries', listPublicCountries);
 
 // Registro público (solo roles estándar), inicio de sesión JWT y flujo de recuperación
 router.post('/register', registerLimiter, register);
+router.post('/verify-phone', registerLimiter, verifyPhoneOtp);
 router.post('/login', loginLimiter, login);
 router.post('/forgot-password', resetLimiter, forgotPassword);
 router.post('/reset-password', resetLimiter, resetPassword);
@@ -71,6 +74,7 @@ router.post('/reset-password', resetLimiter, resetPassword);
 router.get('/users/analytics', verifyToken, verifyRole(['superadmin']), getUsersAnalytics);
 router.get('/users/community', verifyToken, verifyRole(['superadmin']), getCommunityUsers);
 router.patch('/users/community/:id/toggle', verifyToken, verifyRole(['superadmin']), toggleCommunityUserStatus);
+router.patch('/users/community/:id/verify-phone', verifyToken, verifyRole(['superadmin']), verifyCommunityUserPhone);
 router.get('/users/privileged', verifyToken, verifyRole(['superadmin']), getPrivilegedUsers);
 router.post('/users/privileged', verifyToken, verifyRole(['superadmin']), createPrivilegedUser);
 router.patch('/users/privileged/:id', verifyToken, verifyRole(['superadmin']), updatePrivilegedUser);

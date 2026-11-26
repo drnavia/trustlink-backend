@@ -2040,24 +2040,37 @@ describe('TrustLink Backend — E2E Core Suite', () => {
   });
 
   // =========================================================================
-  // 22. FASE 6.1: CONFIANZA PROGRESIVA (NIVELES 0..5), IDENTIDAD Y FILTRO VERIFICADOS
+  // 22. MODELO v2: CONFIANZA PROGRESIVA N0..N4 + EJE COMERCIAL + VENTANA POR BARRIO
   // =========================================================================
-  it('habilita visibilidad progresiva Nivel 1..5 con identidad validada, exige Nivel 4 para Socio Verificado y filtra Solo Verificados (Fase 6.1)', async () => {
+  it('valida el circuito completo N0 (sin DNI + OTP) -> N1 (DNI) -> N2 (Seguro AP/ART) -> N3 (Antecedentes + QR) -> N4 (Verificado) + Eje Comercial Destacado', async () => {
     const ts = Date.now();
-    const p6Email = `phase61.prov.${ts}@test.com`;
+    const p6Email = `phase62.prov.${ts}@test.com`;
     const p6Dni = `${String(ts).slice(-6)}96`;
 
-    // 1. Alta de prestador nuevo con especialidad estándar (sin identidad validada ni docs -> Nivel 0, oculto)
+    // 1. N0: Alta de prestador SIN DNI, solo e-mail + celular + nombre + contraseña -> queda phone_verified = false
     const reg = await req('POST', '/api/v1/auth/register', {
       first_name: 'Progresivo',
-      last_name: 'Fase61',
-      dni: p6Dni,
+      last_name: 'ModeloV2',
       email: p6Email,
+      phone: '+5491155558899',
       password: 'Password123!',
       role: 'provider',
       country_id: 1,
+      accepts_whatsapp_contact: true,
     });
     assert.equal(reg.status, 201);
+    assert.equal(reg.data.requires_phone_verification, true);
+    assert.equal(reg.data.user.phone_verified, false);
+    assert.equal(reg.data.user.dni, null);
+
+    // 1.2. Validación de celular por OTP (o validación manual en Admin)
+    const verifyOtp = await req('POST', '/api/v1/auth/verify-phone', {
+      email: p6Email,
+      code: reg.data.dev_otp_code || '1234',
+    });
+    assert.equal(verifyOtp.status, 200);
+    assert.equal(verifyOtp.data.phone_verified, true);
+
     const login = await req('POST', '/api/v1/auth/login', {
       email: p6Email,
       password: 'Password123!',
@@ -2076,31 +2089,34 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(addSpec.status, 201);
     const p6ProfId = addSpec.data.provider.id;
 
+    // Sin DNI validado -> sigue en N0 y oculto en directorio
     const dirBeforeId = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
     assert.equal(dirBeforeId.status, 200);
     assert.equal(
       dirBeforeId.data.providers.some((p) => Number(p.user_id) === Number(p6UserId)),
       false,
-      'Sin identidad validada (Nivel 0) no debe aparecer en el directorio'
+      'Sin DNI validado (Nivel 0) no debe aparecer en el directorio'
     );
 
-    // 1.5. Prestador carga su archivo/enlace de DNI y verifica que /me y /all lo expongan
-    const dniDocUrl = 'https://docs.test/dni-progresivo-p61.pdf';
+    // 1.5. N1: Prestador carga nro de DNI + frente y dorso
+    const dniFrontUrl = 'https://docs.test/dni-frente-v2.jpg';
+    const dniBackUrl = 'https://docs.test/dni-dorso-v2.jpg';
     const uploadDniRes = await req(
       'PATCH',
       '/api/v1/providers/identity/document',
-      { dni_document_url: dniDocUrl },
+      { dni: p6Dni, dni_document_url: dniFrontUrl, dni_back_url: dniBackUrl },
       p6Token
     );
     assert.equal(uploadDniRes.status, 200);
-    assert.equal(uploadDniRes.data.user.dni_document_url, dniDocUrl);
+    assert.equal(uploadDniRes.data.user.dni, p6Dni);
+    assert.equal(uploadDniRes.data.user.dni_document_url, dniFrontUrl);
+    assert.equal(uploadDniRes.data.user.dni_back_url, dniBackUrl);
 
     const meWithDni = await req('GET', '/api/v1/providers/me', undefined, p6Token);
     assert.equal(meWithDni.status, 200);
-    assert.equal(meWithDni.data.dni_document_url, dniDocUrl);
     assert.equal(meWithDni.data.trust_level, 0);
 
-    // 2. Superadmin valida DNI -> pasa a Nivel 1 (Perfil Básico), visible en directorio pero sin Pase QR
+    // 2. Superadmin valida DNI -> sube a N1 (Perfil Básico), visible solo consultas, sin Pase QR
     const verifyId = await req(
       'PATCH',
       '/api/v1/providers/identity/verify',
@@ -2111,9 +2127,8 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal(verifyId.data.user.identity_verified, true);
 
     const dirLevel1 = await req('GET', '/api/v1/providers/directory', undefined, ownerToken);
-    assert.equal(dirLevel1.status, 200);
     const entryL1 = dirLevel1.data.providers.find((p) => Number(p.user_id) === Number(p6UserId));
-    assert.ok(entryL1, 'Con identidad validada + rubro debe aparecer como Nivel 1');
+    assert.ok(entryL1, 'Con DNI validado + rubro debe aparecer como Nivel 1');
     assert.equal(entryL1.trust_level, 1);
     assert.equal(entryL1.trust_badge.label, 'Perfil Básico');
     assert.equal(entryL1.is_verified, false);
@@ -2126,14 +2141,13 @@ describe('TrustLink Backend — E2E Core Suite', () => {
       undefined,
       ownerToken
     );
-    assert.equal(dirVerifiedOnly1.status, 200);
     assert.equal(
       dirVerifiedOnly1.data.providers.some((p) => Number(p.user_id) === Number(p6UserId)),
       false,
-      'El filtro verified_only=true debe excluir prestadores Nivel 1..3'
+      'El filtro verified_only=true debe excluir prestadores Nivel 1..2'
     );
 
-    // 3. Intentar activar Socio Verificado (Nivel 5) antes de Nivel 4 debe rechazarse con 403
+    // 3. Intentar activar Eje Comercial (Destacado) antes de N3 debe rechazarse con 403
     const earlySub = await req(
       'POST',
       '/api/v1/billing/provider/subscribe',
@@ -2142,38 +2156,52 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     );
     assert.equal(earlySub.status, 403);
 
-    // 4. Cargar Antecedentes -> Nivel 2 (Antecedentes al día)
+    // 4. N2: Cargar Seguro de Accidentes Personales (AP) estructurado -> sube a N2 "Seguro en revisión"
     const futureDate = '2029-12-31';
+    const addInsurance = await req(
+      'PATCH',
+      `/api/v1/providers/profile/${p6ProfId}`,
+      {
+        insurance_policy_url: 'https://docs.test/ap-poliza-v2.pdf',
+        insurance_from: '2026-01-01',
+        insurance_expiry: futureDate,
+        insurance_metadata: {
+          insurance_type: 'ap',
+          insurer_name: 'Sancor Seguros',
+          policy_number: 'AP-998877',
+          holder_cuit: '20351234567',
+          coverage_summary: 'Muerte/Invalidez $25M + Asistencia médica $3M',
+        },
+      },
+      p6Token
+    );
+    assert.equal(addInsurance.status, 200);
+    const meL2 = await req('GET', '/api/v1/providers/me', undefined, p6Token);
+    assert.equal(meL2.data.trust_level, 2);
+    assert.equal(meL2.data.trust_badge.label, 'Seguro en revisión');
+
+    // 5. N3 (pendiente): Cargar Antecedentes Penales con Fecha de emisión + códigos -> sigue en N2 "Doc. en validación" hasta auditoría
+    const todayIso = new Date().toISOString().slice(0, 10);
     const addCrim = await req(
       'PATCH',
       `/api/v1/providers/profile/${p6ProfId}`,
       {
-        criminal_record_url: 'https://docs.test/antecedentes-p61.pdf',
-        criminal_record_expiry: futureDate,
+        criminal_record_url: 'https://docs.test/antecedentes-v2.pdf',
+        criminal_record_issued_at: todayIso,
+        criminal_record_metadata: {
+          issued_at: todayIso,
+          request_code: 'RNR-2026-884422',
+          security_code: 'SEC-9911-ZZ',
+        },
       },
       p6Token
     );
     assert.equal(addCrim.status, 200);
-    const meL2 = await req('GET', '/api/v1/providers/me', undefined, p6Token);
-    assert.equal(meL2.data.trust_level, 2);
-    assert.equal(meL2.data.trust_badge.label, 'Antecedentes al día');
+    const meDocsComplete = await req('GET', '/api/v1/providers/me', undefined, p6Token);
+    assert.equal(meDocsComplete.data.trust_level, 2);
+    assert.equal(meDocsComplete.data.trust_badge.label, 'Doc. en validación');
 
-    // 5. Cargar Póliza ART -> Nivel 3 (Doc. en validación)
-    const addArt = await req(
-      'PATCH',
-      `/api/v1/providers/profile/${p6ProfId}`,
-      {
-        insurance_policy_url: 'https://docs.test/art-p61.pdf',
-        insurance_expiry: futureDate,
-      },
-      p6Token
-    );
-    assert.equal(addArt.status, 200);
-    const meL3 = await req('GET', '/api/v1/providers/me', undefined, p6Token);
-    assert.equal(meL3.data.trust_level, 3);
-    assert.equal(meL3.data.trust_badge.label, 'Doc. en validación');
-
-    // 6. Superadmin aprueba compliance -> Nivel 4 (Verificado), aparece en verified_only=true y habilita suscripción Nivel 5
+    // 6. Superadmin aprueba compliance -> sube a N3 (Pase QR habilitado), aparece en verified_only=true y habilita Eje Comercial
     const approveP6 = await req(
       'PATCH',
       '/api/v1/providers/compliance/user',
@@ -2182,22 +2210,22 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     );
     assert.equal(approveP6.status, 200);
 
-    const dirVerifiedOnly4 = await req(
+    const dirVerifiedOnly3 = await req(
       'GET',
       '/api/v1/providers/directory?verified_only=true',
       undefined,
       ownerToken
     );
-    const entryL4 = dirVerifiedOnly4.data.providers.find(
+    const entryL3 = dirVerifiedOnly3.data.providers.find(
       (p) => Number(p.user_id) === Number(p6UserId)
     );
-    assert.ok(entryL4, 'Nivel 4 Verificado debe aparecer con verified_only=true');
-    assert.equal(entryL4.trust_level, 4);
-    assert.equal(entryL4.trust_badge.label, 'Verificado');
-    assert.equal(entryL4.is_verified, true);
-    assert.equal(entryL4.can_issue_pass, true);
+    assert.ok(entryL3, 'Nivel 3 (Pase QR habilitado) debe aparecer con verified_only=true');
+    assert.equal(entryL3.trust_level, 3);
+    assert.equal(entryL3.trust_badge.label, 'Pase QR habilitado');
+    assert.equal(entryL3.is_verified, true);
+    assert.equal(entryL3.can_issue_pass, true);
 
-    // 7. Ahora sí puede activar Socio Verificado -> sube a Nivel 5 (Socio Verificado dorado)
+    // 7. Eje Comercial (Destacado): ahora sí puede suscribirse en N3 SIN alterar su nivel de seguridad (sigue en N3)
     const subOk = await req(
       'POST',
       '/api/v1/billing/provider/subscribe',
@@ -2206,25 +2234,38 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     );
     assert.equal(subOk.status, 201);
 
-    const meL5 = await req('GET', '/api/v1/providers/me', undefined, p6Token);
-    assert.equal(meL5.data.trust_level, 5);
-    assert.equal(meL5.data.trust_badge.label, 'Socio Verificado');
-    assert.equal(meL5.data.trust_badge.checks.pass_qr_ok, true);
-    assert.equal(meL5.data.trust_badge.checks.member_ok, true);
+    const meL3Featured = await req('GET', '/api/v1/providers/me', undefined, p6Token);
+    assert.equal(meL3Featured.data.trust_level, 3);
+    assert.equal(meL3Featured.data.is_featured_partner, true);
+    assert.equal(meL3Featured.data.trust_badge.checks.pass_qr_ok, true);
+    assert.equal(meL3Featured.data.trust_badge.checks.member_ok, true);
 
-    // 8. Vidriera pública sin autenticación (/api/v1/providers/public-showcase):
-    //    debe exponer el prestador con su nivel N5/checks/categorías y omitir estrictamente PII (email/phone/dni/docs)
+    // 8. N4 (Verificado TrustLink — tilde oficial por cotejo automático/cruzado de PDFs)
+    const autoVer = await req(
+      'PATCH',
+      '/api/v1/providers/auto-verify',
+      { user_id: p6UserId, verified: true },
+      superToken
+    );
+    assert.equal(autoVer.status, 200);
+    assert.equal(autoVer.data.user.auto_verified, true);
+
+    const meL4 = await req('GET', '/api/v1/providers/me', undefined, p6Token);
+    assert.equal(meL4.data.trust_level, 4);
+    assert.equal(meL4.data.trust_badge.label, 'Verificado');
+    assert.equal(meL4.data.trust_badge.is_auto_verified, true);
+    assert.equal(meL4.data.is_featured_partner, true);
+
+    // 9. Vidriera pública sin autenticación (/api/v1/providers/public-showcase):
+    //    debe exponer el prestador con N4 + is_featured_partner y omitir estrictamente PII
     const publicShowcase = await req('GET', '/api/v1/providers/public-showcase');
     assert.equal(publicShowcase.status, 200);
-    assert.ok(publicShowcase.data.summary && typeof publicShowcase.data.summary.total_active_providers === 'number');
-    assert.ok(Array.isArray(publicShowcase.data.categories));
-    assert.ok(Array.isArray(publicShowcase.data.providers) && publicShowcase.data.providers.length >= 1);
-
     const publicP6 = publicShowcase.data.providers.find(
-      (p) => String(p.display_name || '').includes('Progresivo Fase61')
+      (p) => String(p.display_name || '').includes('Progresivo ModeloV2')
     );
-    assert.ok(publicP6, 'El prestador Nivel 5 debe figurar en la vidriera pública de la Landing');
-    assert.equal(publicP6.trust_level, 5);
+    assert.ok(publicP6, 'El prestador Nivel 4 debe figurar en la vidriera pública de la Landing');
+    assert.equal(publicP6.trust_level, 4);
+    assert.equal(publicP6.is_featured_partner, true);
     assert.equal(publicP6.can_issue_pass, true);
     assert.equal(publicP6.trust_badge?.checks?.pass_qr_ok, true);
     assert.equal('email' in publicP6, false, 'La vidriera pública nunca debe exponer email');

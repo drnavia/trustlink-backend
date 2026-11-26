@@ -36,7 +36,15 @@ Estos ítems quedan registrados como **pendientes diferidos** (para retomar en l
 
 ## 3. Evolución de Producto / Marketplace (Backlog Futuro)
 - [ ] **Servicios / Paquetes con Precio de Referencia (estilo publicaciones de Marketplace):**
-  - Mantener el **Directorio principal centrado en el Prestador** (1 tarjeta por persona con reputación general consolidada, nivel `N1–N5` y rubros habilitados, ideal para oficios con visita y presupuesto in situ).
-  - En una fase evolutiva posterior, habilitar a prestadores verificados a publicar **servicios/paquetes estandarizados con precio de referencia o precio cerrado** (ej.: *Limpieza de aire split*, *Mantenimiento mensual de pileta*, *Corte de césped lote estándar*, *Instalación básica*), indicando alcance, duración estimada, si incluye materiales y modalidad de pago.
-  - Permitir que estos paquetes convivan como una sección o pestaña dedicada dentro del Portal Residente y en la ficha del prestador, manteniendo las mismas reglas de compliance (`N4–N5` para emisión de Pase QR en garita) y reputación consolidada por persona.
+  - Mantener el **Directorio principal centrado en el Prestador** (1 tarjeta por persona con reputación general consolidada, nivel `N1–N4`, insignia comercial `Destacado` opcional y rubros habilitados, ideal para oficios con visita y presupuesto in situ).
+  - En una fase evolutiva posterior, habilitar a prestadores habilitados (`N3–N4`) a publicar **servicios/paquetes estandarizados con precio de referencia o precio cerrado** (ej.: *Limpieza de aire split*, *Mantenimiento mensual de pileta*, *Corte de césped lote estándar*, *Instalación básica*), indicando alcance, duración estimada, si incluye materiales y modalidad de pago.
+  - Permitir que estos paquetes convivan como una sección o pestaña dedicada dentro del Portal Residente y en la ficha del prestador, manteniendo las mismas reglas de compliance (`N3–N4` para emisión de Pase QR en garita) y reputación consolidada por persona.
   - *(Complemento UX liviano opcional)* Pre-seleccionar automáticamente el rubro buscado/filtrado por el residente al abrir el modal de `Solicitar Visita`.
+- [ ] **Matrículas Profesionales por Especialidad Regulada:**
+  - Permitir cargar número de matrícula, entidad emisora (ej. ENARGAS, COPIME, colegio profesional) y credencial respaldatoria en rubros regulados (*Gasista matriculado*, *Electricista matriculado*, etc.), mostrando sub-insignia `Matriculado ✓` tras validación.
+- [ ] **Automatización Productiva de N0, N1 y N4 (Servicios Externos):**
+  - **N0:** Conectar **Google OAuth 2.0 real** (`GOOGLE_CLIENT_ID`) y proveedor real de **SMS / WhatsApp OTP** (Twilio / Meta Cloud API) reemplazando el modo `mock` / validación manual MVP.
+  - **N1:** Integrar **KYC con cámara de celular + prueba de vida (*liveness*) + RENAPER** (ej. Didit, Truora, Metamap o VU Security) vía webhook para marcar `identity_verified = TRUE` automáticamente.
+  - **N4:** Integrar **motor OCR/IA de cotejo automático de PDFs** (Gemini Vision / PDF417 + validación oficial de códigos de Reincidencia) para auto-promover `N3 → N4 (Verificado TrustLink)` cuando todos los PDFs coincidan con los datos declarados.
+- [ ] **Eje Comercial Avanzado (Banners y Publicidad Segmentada):**
+  - Espacios de banners patrocinados y campañas por comunidad/temporada habilitados exclusivamente para prestadores con `N3` o `N4` vigente (desacoplados de la escala de seguridad `N1–N4`).

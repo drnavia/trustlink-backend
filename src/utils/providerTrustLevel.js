@@ -1,19 +1,35 @@
 /**
  * @file providerTrustLevel.js
- * @description Motor puro de Confianza Progresiva por Niveles (Fase 6.1) para TrustLink.
- * Calcula de forma determinista el nivel de respaldo (`0..5`), la insignia visible en todos
+ * @description Motor puro de Confianza Progresiva por Niveles v2 (`N0 → N4`) + Eje Comercial desacoplado.
+ * Calcula de forma determinista el nivel de respaldo (`0..4`), la insignia visible en todos
  * los portales, la elegibilidad para figurar en el directorio del Portal Residente y la
- * habilitación para emitir/validar Pases QR en garita (manteniendo estricto el control perimetral).
+ * habilitación para emitir/validar Pases QR en garita (desde `N3` vigente).
+ *
+ * Escala oficial v2 (Eje de Confianza y Seguridad — nunca se compra):
+ * - `N0 · Cuenta creada` *(oculto)*: falta celular validado, DNI validado o especialidad visible.
+ * - `N1 · Perfil Básico` *(visible · solo consultas)*: celular + DNI validado + ≥ 1 especialidad visible.
+ * - `N2 · Seguro en revisión` / `Doc. en validación` *(visible · solo consultas)*: N1 + Seguro AP o ART vigente cargado (y opcionalmente Antecedentes cargados esperando auditoría).
+ * - `N3 · Habilitado · Pase QR` *(visible · Pase QR habilitado)*: N2 + Antecedentes Penales vigentes dentro de la ventana del barrio + aprobación documental de TrustLink.
+ * - `N4 · Verificado` *(tilde oficial estilo X/Instagram)*: N3 + cotejo automático/cruzado de PDFs (`autoVerified = true`).
+ *
+ * Eje Comercial paralelo (`is_featured_partner`): membresía/destacado habilitada exclusivamente desde `N3` o `N4` vigente, sin alterar el nivel de seguridad.
  * @location /trustlink-backend/src/utils/providerTrustLevel.js
  */
 
-/** Catálogo ordenado de niveles progresivos de confianza (Eje A — separado de Reputación). */
+const {
+  DEFAULT_CRIMINAL_WINDOW_DAYS,
+  normalizeCriminalWindowDays,
+  computeEffectiveCriminalRecordExpiry,
+  isExpiryDatePassed,
+} = require('./complianceExpiry');
+
+/** Catálogo ordenado de niveles progresivos de confianza (`0..4`). */
 const TRUST_LEVEL_CATALOG = [
   {
     level: 0,
     tier: 'incomplete',
     label: 'Sin habilitar',
-    short_label: 'Nivel 0 · Incompleto',
+    short_label: 'Nivel 0 · Cuenta creada',
     tone: 'slate',
   },
   {
@@ -25,112 +41,104 @@ const TRUST_LEVEL_CATALOG = [
   },
   {
     level: 2,
-    tier: 'partial_docs',
-    label: 'Respaldo Parcial',
-    short_label: 'Nivel 2 · Parcial',
+    tier: 'insurance_review',
+    label: 'Seguro en revisión',
+    short_label: 'Nivel 2 · Cobertura cargada',
     tone: 'sky',
   },
   {
     level: 3,
-    tier: 'docs_complete',
-    label: 'Doc. en validación',
-    short_label: 'Nivel 3 · Doc. Completa',
+    tier: 'qr_enabled',
+    label: 'Pase QR habilitado',
+    short_label: 'Nivel 3 · Pase QR',
     tone: 'teal',
   },
   {
     level: 4,
-    tier: 'verified',
+    tier: 'auto_verified',
     label: 'Verificado',
     short_label: 'Nivel 4 · Verificado',
     tone: 'emerald',
   },
-  {
-    level: 5,
-    tier: 'verified_partner',
-    label: 'Socio Verificado',
-    short_label: 'Nivel 5 · Socio Verificado',
-    tone: 'gold',
-  },
 ];
 
 /**
- * Evalúa si una fecha de vencimiento (`YYYY-MM-DD` o Date) se encuentra vencida respecto
- * a la fecha de referencia (`now`, por defecto hoy a las 00:00 UTC/local).
- *
- * @param {string|Date|null|undefined} rawDate - Fecha de vencimiento a evaluar.
- * @param {Date} [now=new Date()] - Fecha de referencia.
- * @returns {boolean} `true` si la fecha existe y ya venció.
+ * Evalúa si una fecha de vencimiento (`YYYY-MM-DD` o Date) ya venció.
+ * @param {string|Date|null|undefined} rawDate
+ * @param {Date} [now=new Date()]
+ * @returns {boolean}
  */
 function isExpiryDatePast(rawDate, now = new Date()) {
-  if (!rawDate) return false;
-  const toDayKey = (val) => {
-    if (typeof val === 'string') {
-      const m = /^(\d{4}-\d{2}-\d{2})/.exec(val.trim());
-      if (m) return m[1];
-    }
-    const d = val instanceof Date ? val : new Date(val);
-    if (Number.isNaN(d.getTime())) return null;
-    const yyyy = d.getUTCFullYear();
-    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const dd = String(d.getUTCDate()).padStart(2, '0');
-    return `${yyyy}-${mm}-${dd}`;
-  };
-  const expDay = toDayKey(rawDate);
-  const refDay = toDayKey(now);
-  if (!expDay || !refDay) return false;
-  return expDay < refDay;
+  return isExpiryDatePassed(rawDate, now);
 }
 
 /**
- * Calcula el nivel progresivo de confianza (`0..5`) y todos los metadatos de insignia,
- * visibilidad en directorio y habilitación de Pase QR en garita.
+ * Calcula el nivel progresivo de confianza (`0..4`) y el estado del Eje Comercial separado.
  *
- * Reglas de negocio (Fase 6.1):
- * - Nivel 0 (oculto): cuenta inactiva, rechazada, sin identidad validada o sin especialidad visible.
- * - Nivel 1 (`Perfil Básico`): identidad validada + ≥ 1 especialidad visible (sin docs aún). Visible en directorio, sin Pase QR.
- * - Nivel 2 (`Antecedentes al día` / `ART al día`): Nivel 1 + 1 documento personal vigente. Visible en directorio, sin Pase QR.
- * - Nivel 3 (`Doc. en validación`): Nivel 1 + Antecedentes vigentes + ART vigente cargados (esperando aprobación). Visible en directorio, sin Pase QR.
- * - Nivel 4 (`Verificado`): compliance aprobado + documentación personal vigente + ≥ 1 especialidad aprobada y visible. Habilita Pase QR y filtro *Solo Verificados*.
- * - Nivel 5 (`Socio Verificado`): **exige Nivel 4 obligatorio** + membresía activa. Máxima prioridad e insignia dorada.
- *
- * @param {Object} input - Datos consolidados del prestador.
- * @param {boolean} [input.userIsActive=true] - Si la cuenta de usuario está activa.
- * @param {boolean} [input.identityVerified=false] - Si la identidad (DNI) fue validada.
- * @param {boolean} [input.hasVisibleSpecialty=false] - Si posee al menos 1 especialidad activa y visible (no rechazada, custom aprobada).
- * @param {boolean} [input.hasCriminalDoc=false] - Si cargó archivo/URL de Antecedentes Penales.
- * @param {boolean} [input.criminalExpired=false] - Si los Antecedentes Penales están vencidos.
- * @param {boolean} [input.hasArtDoc=false] - Si cargó archivo/URL de Póliza ART / Seguro.
- * @param {boolean} [input.artExpired=false] - Si la Póliza ART está vencida.
- * @param {boolean} [input.complianceApproved=false] - Si tiene compliance personal aprobado por Ops/TrustLink.
- * @param {boolean} [input.isAllRejected=false] - Si todas sus solicitudes fueron rechazadas.
- * @param {boolean} [input.isVerifiedMember=false] - Si tiene membresía paga activa.
- * @returns {Object} Resultado normalizado de nivel e insignia.
+ * @param {Object} input
+ * @param {boolean} [input.userIsActive=true]
+ * @param {boolean} [input.phoneVerified=true]
+ * @param {boolean} [input.identityVerified=false]
+ * @param {boolean} [input.hasVisibleSpecialty=false]
+ * @param {boolean} [input.hasArtDoc=false] - Seguro de Accidentes Personales (AP) o Póliza ART cargada.
+ * @param {boolean} [input.artExpired=false]
+ * @param {boolean} [input.hasCriminalDoc=false] - Certificado de Antecedentes Penales cargado.
+ * @param {boolean} [input.criminalExpired=false]
+ * @param {string|Date|null} [input.criminalRecordIssuedAt=null] - Fecha de emisión de Antecedentes (para cálculo dinámico por barrio).
+ * @param {string|Date|null} [input.criminalRecordExpiry=null] - Fecha de vencimiento directa/heredada.
+ * @param {number} [input.criminalRecordMaxAgeDays=180] - Ventana de días configurada por la comunidad (`30|90|180|365`).
+ * @param {boolean} [input.complianceApproved=false] - Aprobación documental de TrustLink para habilitar N3 (Pase QR).
+ * @param {boolean} [input.autoVerified=false] - Cotejo automático/cruzado de PDFs validado para habilitar N4 (Verificado).
+ * @param {boolean} [input.isAllRejected=false]
+ * @param {boolean} [input.isVerifiedMember=false] - Suscripción activa en el Eje Comercial (`Destacado`).
+ * @param {Date} [input.now=new Date()]
+ * @returns {Object} Metadatos normalizados de nivel, controles y Eje Comercial.
  */
 function computeProviderTrustLevel({
   userIsActive = true,
+  phoneVerified = true,
   identityVerified = false,
   hasVisibleSpecialty = false,
   hasCriminalDoc = false,
   criminalExpired = false,
+  criminalRecordIssuedAt = null,
+  criminalRecordExpiry = null,
+  criminalRecordMaxAgeDays = DEFAULT_CRIMINAL_WINDOW_DAYS,
   hasArtDoc = false,
   artExpired = false,
   complianceApproved = false,
+  autoVerified = false,
   isAllRejected = false,
   isVerifiedMember = false,
+  now = new Date(),
 } = {}) {
-  const criminalOk = Boolean(hasCriminalDoc) && !Boolean(criminalExpired);
+  const windowDays = normalizeCriminalWindowDays(criminalRecordMaxAgeDays);
+  const effectiveCriminalExpiry = computeEffectiveCriminalRecordExpiry({
+    criminalRecordIssuedAt,
+    criminalRecordExpiry,
+    maxAgeDays: windowDays,
+  });
+  const computedCriminalExpired =
+    Boolean(criminalExpired) ||
+    (Boolean(effectiveCriminalExpiry) && isExpiryDatePassed(effectiveCriminalExpiry, now));
+
+  const criminalOk = Boolean(hasCriminalDoc) && !computedCriminalExpired;
   const artOk = Boolean(hasArtDoc) && !Boolean(artExpired);
-  const hasExpiredDocs = Boolean(criminalExpired) || Boolean(artExpired);
+  const hasExpiredDocs = Boolean(computedCriminalExpired) || Boolean(artExpired);
   const effectiveIdentity = Boolean(identityVerified) || Boolean(complianceApproved);
+  const effectivePhone = Boolean(phoneVerified) || Boolean(complianceApproved);
+
   const baseChecks = {
+    phone_ok: effectivePhone,
     identity_ok: effectiveIdentity,
     specialty_ok: Boolean(hasVisibleSpecialty),
-    criminal_ok: criminalOk,
-    criminal_expired: Boolean(criminalExpired),
     art_ok: artOk,
     art_expired: Boolean(artExpired),
+    criminal_ok: criminalOk,
+    criminal_expired: computedCriminalExpired,
     compliance_ok: false,
     pass_qr_ok: false,
+    auto_verified_ok: false,
     member_ok: false,
   };
 
@@ -138,6 +146,7 @@ function computeProviderTrustLevel({
   if (!userIsActive || isAllRejected) {
     return {
       level: 0,
+      max_level: 4,
       tier: isAllRejected ? 'rejected' : 'suspended',
       label: isAllRejected ? 'Rechazado' : 'Cuenta suspendida',
       sublabel: isAllRejected
@@ -145,10 +154,14 @@ function computeProviderTrustLevel({
         : 'Cuenta deshabilitada por Administración',
       tone: 'danger',
       is_verified: false,
+      is_auto_verified: false,
+      is_featured_partner: false,
       visible_in_directory: false,
       can_issue_pass: false,
       can_subscribe_verified_partner: false,
       has_expired_docs: hasExpiredDocs,
+      criminal_window_days: windowDays,
+      effective_criminal_expiry: effectiveCriminalExpiry,
       checks: { ...baseChecks },
       next_step_hint: isAllRejected
         ? 'Actualizá tus documentos o especialidad para solicitar una nueva revisión.'
@@ -156,135 +169,175 @@ function computeProviderTrustLevel({
     };
   }
 
-  // Nivel 0: falta identidad validada o especialidad visible
-  if (!effectiveIdentity || !hasVisibleSpecialty) {
+  // Nivel 0: falta celular validado, DNI validado o al menos 1 especialidad visible
+  if (!effectivePhone || !effectiveIdentity || !hasVisibleSpecialty) {
     const missing = [];
+    if (!effectivePhone) missing.push('validación de celular (SMS)');
     if (!effectiveIdentity) missing.push('validación de identidad (DNI)');
     if (!hasVisibleSpecialty) missing.push('al menos 1 especialidad visible');
     return {
       level: 0,
+      max_level: 4,
       tier: 'incomplete',
-      label: 'Sin habilitar',
+      label: !effectivePhone ? 'Cuenta creada' : 'Sin habilitar',
       sublabel: `Falta ${missing.join(' y ')}`,
       tone: 'slate',
       is_verified: false,
+      is_auto_verified: false,
+      is_featured_partner: false,
       visible_in_directory: false,
       can_issue_pass: false,
       can_subscribe_verified_partner: false,
       has_expired_docs: hasExpiredDocs,
+      criminal_window_days: windowDays,
+      effective_criminal_expiry: effectiveCriminalExpiry,
       checks: { ...baseChecks },
-      next_step_hint: !hasVisibleSpecialty
-        ? 'Agregá al menos 1 especialidad visible para comenzar a figurar al validar tu identidad.'
-        : 'Tu identidad (DNI) está pendiente de validación por Administración para habilitar tu Perfil Básico.',
+      next_step_hint: !effectivePhone
+        ? 'Validá tu número de celular por SMS (o solicitá validación en Administración) para continuar al Nivel 1.'
+        : !effectiveIdentity
+          ? 'Cargá tu número de DNI y fotos frente/dorso (o PDF) para validación y habilitar tu Perfil Básico (N1).'
+          : 'Agregá al menos 1 especialidad visible para aparecer en el directorio (N1).',
     };
   }
 
-  // Caso degradado: tenía compliance aprobado pero venció Antecedentes o ART
+  // Caso degradado: tenía compliance aprobado pero venció Seguro AP/ART o Antecedentes (según ventana del barrio)
   if (complianceApproved && hasExpiredDocs) {
     return {
-      level: criminalOk || artOk ? 2 : 1,
+      level: artOk ? 2 : 1,
+      max_level: 4,
       tier: 'docs_expired',
       label: 'Doc. vencida',
-      sublabel: 'Renová ART/Antecedentes para rehabilitar garita',
+      sublabel: computedCriminalExpired && criminalRecordIssuedAt
+        ? `Antecedentes fuera de ventana (${windowDays} días) — renová para habilitar QR`
+        : 'Renová Seguro AP/ART o Antecedentes para rehabilitar garita',
       tone: 'danger',
       is_verified: false,
+      is_auto_verified: false,
+      is_featured_partner: false,
       visible_in_directory: true,
       can_issue_pass: false,
       can_subscribe_verified_partner: false,
       has_expired_docs: true,
+      criminal_window_days: windowDays,
+      effective_criminal_expiry: effectiveCriminalExpiry,
       checks: { ...baseChecks },
-      next_step_hint: 'Renová tu documentación vencida para recuperar tu insignia Verificado y Pases QR.',
+      next_step_hint: computedCriminalExpired && criminalRecordIssuedAt
+        ? `Tus Antecedentes Penales superaron los ${windowDays} días de antigüedad máxima. Renovalos para recuperar Pases QR.`
+        : 'Renová tu documentación vencida para recuperar tu habilitación de Pases QR en garita.',
     };
   }
 
-  // Nivel 5: Socio Verificado (EXIGE Nivel 4 verificado obligatorio + suscripción activa)
-  if (complianceApproved && !hasExpiredDocs && Boolean(isVerifiedMember)) {
-    return {
-      level: 5,
-      tier: 'verified_partner',
-      label: 'Socio Verificado',
-      sublabel: 'Compliance aprobado + suscripción activa',
-      tone: 'gold',
-      is_verified: true,
-      visible_in_directory: true,
-      can_issue_pass: true,
-      can_subscribe_verified_partner: true,
-      has_expired_docs: false,
-      checks: { ...baseChecks, compliance_ok: true, pass_qr_ok: true, member_ok: true },
-      next_step_hint: 'Nivel máximo alcanzado: tenés prioridad destacada y respaldo completo en garita.',
-    };
-  }
-
-  // Nivel 4: Verificado TrustLink (compliance aprobado + documentación vigente)
-  if (complianceApproved && !hasExpiredDocs) {
+  // Nivel 4: Verificado TrustLink (tilde oficial estilo X/Instagram: N3 + cotejo automático/cruzado de PDFs)
+  if (complianceApproved && !hasExpiredDocs && Boolean(autoVerified)) {
+    const featuredPartner = Boolean(isVerifiedMember);
     return {
       level: 4,
-      tier: 'verified',
+      max_level: 4,
+      tier: 'auto_verified',
       label: 'Verificado',
-      sublabel: 'Identidad y documentación validadas',
+      sublabel: 'PDFs cotejados y Pases QR habilitados',
       tone: 'emerald',
       is_verified: true,
+      is_auto_verified: true,
+      is_featured_partner: featuredPartner,
       visible_in_directory: true,
       can_issue_pass: true,
       can_subscribe_verified_partner: true,
       has_expired_docs: false,
-      checks: { ...baseChecks, compliance_ok: true, pass_qr_ok: true },
-      next_step_hint: 'Ya sos Verificado. Podés activar Socio Verificado para obtener prioridad máxima e insignia dorada.',
+      criminal_window_days: windowDays,
+      effective_criminal_expiry: effectiveCriminalExpiry,
+      checks: {
+        ...baseChecks,
+        compliance_ok: true,
+        pass_qr_ok: true,
+        auto_verified_ok: true,
+        member_ok: featuredPartner,
+      },
+      next_step_hint: featuredPartner
+        ? 'Nivel máximo de confianza (N4 Verificado) + Destacado comercial activo.'
+        : 'Alcanzaste el nivel máximo de confianza (N4 Verificado). Podés sumar un plan Destacado si deseás priorizar tu perfil.',
     };
   }
 
-  // Nivel 3: Documentación Completa (Antecedentes + ART vigentes cargados, pendiente de validación Ops/IA)
-  if (criminalOk && artOk) {
+  // Nivel 3: Habilitado · Pase QR (DNI + Seguro AP/ART + Antecedentes aprobados y vigentes)
+  if (complianceApproved && !hasExpiredDocs) {
+    const featuredPartner = Boolean(isVerifiedMember);
     return {
       level: 3,
-      tier: 'docs_complete',
-      label: 'Doc. en validación',
-      sublabel: 'ART + Antecedentes cargados',
+      max_level: 4,
+      tier: 'qr_enabled',
+      label: 'Pase QR habilitado',
+      sublabel: 'Documentación validada para ingreso en garita',
       tone: 'teal',
-      is_verified: false,
+      is_verified: true,
+      is_auto_verified: false,
+      is_featured_partner: featuredPartner,
       visible_in_directory: true,
-      can_issue_pass: false,
-      can_subscribe_verified_partner: false,
+      can_issue_pass: true,
+      can_subscribe_verified_partner: true,
       has_expired_docs: false,
-      checks: { ...baseChecks },
-      next_step_hint: 'Cargaste toda tu documentación. Al aprobarse por TrustLink subirás a Nivel 4 (Verificado).',
+      criminal_window_days: windowDays,
+      effective_criminal_expiry: effectiveCriminalExpiry,
+      checks: {
+        ...baseChecks,
+        compliance_ok: true,
+        pass_qr_ok: true,
+        auto_verified_ok: false,
+        member_ok: featuredPartner,
+      },
+      next_step_hint:
+        'Ya estás habilitado para recibir Pases QR en garita (N3). Al completar el cotejo automático de tus PDFs obtendrás el sello N4 Verificado.',
     };
   }
 
-  // Nivel 2: Respaldo Parcial (solo 1 de los 2 documentos personales vigente)
-  if (criminalOk || artOk) {
+  // Nivel 2: Seguro AP/ART cargado (en revisión) — y si además cargó Antecedentes, queda listo para auditoría N3
+  if (artOk) {
+    const hasBothDocs = criminalOk;
     return {
       level: 2,
-      tier: 'partial_docs',
-      label: criminalOk ? 'Antecedentes al día' : 'ART al día',
-      sublabel: criminalOk ? 'Falta cargar Póliza ART' : 'Falta cargar Antecedentes',
+      max_level: 4,
+      tier: hasBothDocs ? 'docs_in_review' : 'insurance_review',
+      label: hasBothDocs ? 'Doc. en validación' : 'Seguro en revisión',
+      sublabel: hasBothDocs
+        ? 'Seguro + Antecedentes cargados (en revisión)'
+        : 'Seguro AP/ART cargado — falta Antecedentes',
       tone: 'sky',
       is_verified: false,
+      is_auto_verified: false,
+      is_featured_partner: false,
       visible_in_directory: true,
       can_issue_pass: false,
       can_subscribe_verified_partner: false,
       has_expired_docs: hasExpiredDocs,
+      criminal_window_days: windowDays,
+      effective_criminal_expiry: effectiveCriminalExpiry,
       checks: { ...baseChecks },
-      next_step_hint: criminalOk
-        ? 'Cargá tu Póliza ART vigente para alcanzar Nivel 3 y pasar a verificación.'
-        : 'Cargá tus Antecedentes Penales vigentes para alcanzar Nivel 3 y pasar a verificación.',
+      next_step_hint: hasBothDocs
+        ? 'Cargaste Seguro y Antecedentes Penales. Al aprobarse por TrustLink subirás a Nivel 3 (Pase QR habilitado).'
+        : 'Cargá tus Antecedentes Penales (Fecha de emisión, Código de Solicitud, Código de Seguridad y PDF) para avanzar a Nivel 3 y habilitar Pases QR.',
     };
   }
 
-  // Nivel 1: Perfil Básico (identidad validada + especialidad visible, sin documentación de compliance aún)
+  // Nivel 1: Perfil Básico (DNI validado + Especialidad visible, sin seguro vigente aún)
   return {
     level: 1,
+    max_level: 4,
     tier: 'basic',
     label: 'Perfil Básico',
-    sublabel: 'Identidad validada · sin compliance aún',
+    sublabel: 'Identidad validada · Solo consultas',
     tone: 'slate',
     is_verified: false,
+    is_auto_verified: false,
+    is_featured_partner: false,
     visible_in_directory: true,
     can_issue_pass: false,
     can_subscribe_verified_partner: false,
     has_expired_docs: hasExpiredDocs,
+    criminal_window_days: windowDays,
+    effective_criminal_expiry: effectiveCriminalExpiry,
     checks: { ...baseChecks },
-    next_step_hint: 'Cargá tu Póliza ART y Antecedentes Penales vigentes para subir de nivel y habilitar Pases QR.',
+    next_step_hint:
+      'Cargá tu Seguro de Accidentes Personales (si trabajás solo) o Póliza de ART (si tenés ayudantes) para avanzar a Nivel 2.',
   };
 }
 

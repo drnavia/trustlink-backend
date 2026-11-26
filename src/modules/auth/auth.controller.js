@@ -96,28 +96,39 @@ const register = async (req, res) => {
       fraction,
       lot_number,
       driver_license_url,
+      accepts_whatsapp_contact,
+      auth_provider,
+      require_phone_otp,
     } = req.body;
 
     // 2. Validar campos obligatorios y verificar que el rol esté permitido en registro público
-    if (!role || !first_name || !last_name || !dni || !email || !password) {
-      return res.status(400).json({ error: 'Faltan campos obligatorios para el registro.' });
-    }
-
-    const normalizedRole = String(role).trim().toLowerCase();
-    if (!PUBLIC_ALLOWED_ROLES.includes(normalizedRole)) {
+    // Regla N0: para `provider` el DNI es opcional al registrarse (se carga y valida recién en N1).
+    const normalizedRole = String(role || '').trim().toLowerCase();
+    if (!normalizedRole || !PUBLIC_ALLOWED_ROLES.includes(normalizedRole)) {
       return res.status(403).json({
         error: 'El rol solicitado no está habilitado para registro público.',
       });
     }
 
-    // 3. Sanitizar identificadores y validar unicidad de email (insensible a mayúsculas) o DNI
-    const cleanEmail = String(email).trim().toLowerCase();
-    const cleanDni = String(dni).trim();
+    const isProviderRole = normalizedRole === 'provider';
+    const cleanDni = dni !== undefined && dni !== null && String(dni).trim() !== '' ? String(dni).trim() : null;
+    const cleanPhone = phone !== undefined && phone !== null && String(phone).trim() !== '' ? String(phone).trim() : null;
 
-    const userExists = await db.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) OR dni = $2', [
-      cleanEmail,
-      cleanDni,
-    ]);
+    if (!first_name || !last_name || !email || !password || (!isProviderRole && !cleanDni)) {
+      return res.status(400).json({ error: 'Faltan campos obligatorios para el registro.' });
+    }
+    if (isProviderRole && !cleanDni && !cleanPhone) {
+      return res.status(400).json({ error: 'Ingresá tu número de celular para crear tu cuenta de prestador.' });
+    }
+
+    // 3. Sanitizar identificadores y validar unicidad de email (insensible a mayúsculas) o DNI (si fue provisto)
+    const cleanEmail = String(email).trim().toLowerCase();
+    const userExists = cleanDni
+      ? await db.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) OR dni = $2', [
+          cleanEmail,
+          cleanDni,
+        ])
+      : await db.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [cleanEmail]);
     if (userExists.rows.length > 0) {
       return res.status(400).json({ error: 'Ya existe un usuario registrado con ese correo electrónico o DNI.' });
     }
@@ -151,17 +162,33 @@ const register = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    // 6. Insertar registro en `users` con `initial_role` inmutable y `portals_configured = TRUE`
+    // 6. Insertar registro en `users` con `initial_role` inmutable, `portals_configured = TRUE` y soporte N0 OTP
+    const needsPhoneOtp = Boolean(require_phone_otp) || (isProviderRole && !cleanDni);
+    const otpCode = needsPhoneOtp
+      ? String(process.env.SMS_MOCK_CODE || '1234').slice(0, 6)
+      : null;
+    const otpExpiresAt = needsPhoneOtp ? new Date(Date.now() + 30 * 60 * 1000).toISOString() : null;
+    const cleanAuthProvider =
+      String(auth_provider || 'email').trim().toLowerCase() === 'google' ? 'google' : 'email';
+    const acceptsWhatsapp =
+      accepts_whatsapp_contact !== undefined ? Boolean(accepts_whatsapp_contact) : true;
+
     const query = `
       INSERT INTO users (
         country_id, role, initial_role, first_name, last_name, dni, email, password_hash, phone,
         fraction_type, fraction_number, lot_number, driver_license_url,
-        primary_portal, can_use_resident, can_use_provider, portals_configured
+        primary_portal, can_use_resident, can_use_provider, portals_configured,
+        phone_verified, phone_verified_at, phone_otp_code, phone_otp_expires_at,
+        accepts_whatsapp_contact, auth_provider
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, TRUE)
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, TRUE,
+        $17, CASE WHEN $17 THEN NOW() ELSE NULL END, $18, $19, $20, $21
+      )
       RETURNING id, country_id, role, initial_role, first_name, last_name, dni, email, phone,
                 fraction_type, fraction_number, lot_number,
                 primary_portal, can_use_resident, can_use_provider,
+                phone_verified, phone_verified_at, accepts_whatsapp_contact, auth_provider,
                 is_active, created_at;
     `;
     const values = [
@@ -173,7 +200,7 @@ const register = async (req, res) => {
       cleanDni,
       cleanEmail,
       passwordHash,
-      phone ? String(phone).trim() : null,
+      cleanPhone,
       resolvedFractionType,
       resolvedFractionNumber,
       resolvedLotNumber,
@@ -181,13 +208,22 @@ const register = async (req, res) => {
       primaryPortal,
       canUseResident,
       canUseProvider,
+      !needsPhoneOtp,
+      otpCode,
+      otpExpiresAt,
+      acceptsWhatsapp,
+      cleanAuthProvider,
     ];
 
     const newUser = await db.query(query, values);
 
     return res.status(201).json({
-      message: 'Usuario registrado exitosamente en la base de datos.',
-      user: newUser.rows[0]
+      message: needsPhoneOtp
+        ? 'Cuenta creada (Nivel 0). Ingresá el código SMS para validar tu celular (o solicitalo desde Administración en MVP).'
+        : 'Usuario registrado exitosamente en la base de datos.',
+      requires_phone_verification: needsPhoneOtp,
+      dev_otp_code: needsPhoneOtp && process.env.SMS_GATEWAY_MODE !== 'live' ? otpCode : undefined,
+      user: newUser.rows[0],
     });
   } catch (error) {
     console.error('Error en el registro:', error);
@@ -334,6 +370,8 @@ const login = async (req, res) => {
         primary_portal: user.primary_portal || getDefaultPrimaryPortal(user.role),
         can_use_resident: Boolean(user.can_use_resident),
         can_use_provider: Boolean(user.can_use_provider),
+        phone_verified: user.phone_verified !== false,
+        auth_provider: user.auth_provider || 'email',
       }
     });
   } catch (error) {
@@ -1120,6 +1158,9 @@ const getCommunityUsers = async (req, res) => {
         u.fraction_number,
         u.lot_number,
         u.is_active,
+        COALESCE(u.phone_verified, TRUE) AS phone_verified,
+        u.phone_verified_at,
+        COALESCE(u.auth_provider, 'email') AS auth_provider,
         u.created_at,
         (SELECT COUNT(*)::int FROM providers p WHERE p.user_id = u.id) AS provider_specialties_count,
         EXISTS (
@@ -1203,10 +1244,115 @@ const toggleCommunityUserStatus = async (req, res) => {
   }
 };
 
+/**
+ * Valida el código SMS/OTP de una cuenta recién creada en Nivel 0 (`phone_verified = TRUE`).
+ * En modo MVP (`SMS_GATEWAY_MODE !== 'live'`), acepta el código almacenado o `SMS_MOCK_CODE` (`1234`).
+ * POST /api/v1/auth/verify-phone
+ */
+const verifyPhoneOtp = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const cleanEmail = String(req.body?.email || '').trim().toLowerCase();
+    const cleanCode = String(req.body?.code || '').trim();
+
+    if (!cleanEmail || !cleanCode) {
+      return res.status(400).json({ error: 'Ingresá tu e-mail y el código de verificación.' });
+    }
+
+    const userRes = await db.query(
+      `SELECT id, email, phone, phone_verified, phone_otp_code, phone_otp_expires_at
+       FROM users
+       WHERE LOWER(email) = LOWER($1)
+       LIMIT 1`,
+      [cleanEmail]
+    );
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: 'No encontramos una cuenta con ese correo electrónico.' });
+    }
+
+    const u = userRes.rows[0];
+    if (u.phone_verified) {
+      return res.status(200).json({ message: 'El número de celular ya estaba validado.', phone_verified: true });
+    }
+
+    const mockAllowed =
+      process.env.SMS_GATEWAY_MODE !== 'live' &&
+      cleanCode === String(process.env.SMS_MOCK_CODE || '1234');
+    const codeMatches = Boolean(u.phone_otp_code && String(u.phone_otp_code) === cleanCode) || mockAllowed;
+    const isExpired =
+      u.phone_otp_expires_at && new Date(u.phone_otp_expires_at).getTime() < Date.now() && !mockAllowed;
+
+    if (!codeMatches || isExpired) {
+      return res.status(400).json({ error: 'Código inválido o vencido. Verificá los dígitos e intentá nuevamente.' });
+    }
+
+    const upd = await db.query(
+      `UPDATE users
+       SET phone_verified = TRUE,
+           phone_verified_at = NOW(),
+           phone_otp_code = NULL,
+           phone_otp_expires_at = NULL
+       WHERE id = $1
+       RETURNING id, email, phone, phone_verified, phone_verified_at`,
+      [u.id]
+    );
+
+    return res.status(200).json({
+      message: 'Celular validado correctamente. Ya podés ingresar y completar tu Nivel 1.',
+      phone_verified: true,
+      user: upd.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al validar código SMS:', error);
+    return res.status(500).json({ error: 'Error interno al validar el código SMS.' });
+  }
+};
+
+/**
+ * Permite a Superadmin validar o revocar manualmente el celular de un usuario comunitario (soporte MVP N0).
+ * PATCH /api/v1/auth/users/community/:id/verify-phone
+ */
+const verifyCommunityUserPhone = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+    const userId = Number(req.params?.id);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'ID de usuario inválido.' });
+    }
+    const verified = req.body?.verified !== undefined ? Boolean(req.body.verified) : true;
+
+    const result = await db.query(
+      `UPDATE users
+       SET phone_verified = $1,
+           phone_verified_at = CASE WHEN $1 THEN COALESCE(phone_verified_at, NOW()) ELSE NULL END,
+           phone_otp_code = CASE WHEN $1 THEN NULL ELSE phone_otp_code END
+       WHERE id = $2
+         AND LOWER(role::text) NOT IN ('superadmin', 'admin', 'security')
+       RETURNING id, first_name, last_name, email, phone, phone_verified, phone_verified_at`,
+      [verified, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Cuenta comunitaria no encontrada.' });
+    }
+
+    return res.status(200).json({
+      message: verified
+        ? 'Celular validado manualmente por Administración (Nivel 0 completado).'
+        : 'Validación de celular revocada.',
+      user: result.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al validar celular desde Administración:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar validación de celular.' });
+  }
+};
+
 module.exports = {
   listPublicCountries,
   register,
   login,
+  verifyPhoneOtp,
   forgotPassword,
   resetPassword,
   createPrivilegedUser,
@@ -1215,4 +1361,5 @@ module.exports = {
   getUsersAnalytics,
   getCommunityUsers,
   toggleCommunityUserStatus,
+  verifyCommunityUserPhone,
 };
