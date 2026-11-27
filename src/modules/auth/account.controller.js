@@ -163,7 +163,8 @@ async function getMyAccount(req, res) {
          COALESCE(u.fraction_type, 'na') AS fraction_type,
          u.fraction_number,
          u.lot_number,
-         c.name AS country_name
+         c.name AS country_name,
+         COALESCE(c.approval_status, 'approved') AS country_approval_status
        FROM users u
        LEFT JOIN countries c ON c.id = u.country_id
        WHERE u.id = $1`,
@@ -174,12 +175,13 @@ async function getMyAccount(req, res) {
       return res.status(404).json({ error: 'Cuenta de usuario no encontrada.' });
     }
 
-    // 3. Consultar comunidades activas para el selector de cambio de barrio en "Mi Perfil"
+    // 3. Consultar comunidades activas y aprobadas para el selector de cambio de barrio en "Mi Perfil"
     const countriesRes = await db.query(
-      `SELECT id, name
+      `SELECT id, name, city, province
        FROM countries
        WHERE is_active = TRUE
-       ORDER BY id ASC`
+         AND COALESCE(approval_status, 'approved') = 'approved'
+       ORDER BY LOWER(name) ASC, id ASC`
     );
 
     return res.json({
@@ -217,6 +219,7 @@ async function updateMyProfile(req, res) {
       last_name,
       phone,
       country_id,
+      proposed_country,
       fraction_type,
       fraction_number,
       lot_number,
@@ -253,11 +256,71 @@ async function updateMyProfile(req, res) {
     const cleanLastName =
       last_name !== undefined ? String(last_name).trim() : current.last_name;
     const cleanPhone = phone !== undefined ? String(phone).trim() : current.phone;
-    const cleanCountryId =
+    let cleanCountryId =
       country_id !== undefined && country_id !== '' ? Number(country_id) : current.country_id;
+    let proposedCountryCreated = false;
 
     if (!cleanFirstName || !cleanLastName) {
       return res.status(400).json({ error: 'Nombre y apellido son obligatorios.' });
+    }
+
+    // 3b. Soporte de propuesta de nueva comunidad/barrio por el residente (queda pendiente de validación TrustLink)
+    if (proposed_country && typeof proposed_country === 'object') {
+      const proposedName = String(proposed_country.name || '').trim();
+      const proposedCity = String(proposed_country.city || '').trim() || null;
+      const proposedProvince = String(proposed_country.province || '').trim() || null;
+
+      if (proposedName.length < 2) {
+        return res.status(400).json({
+          error: 'Ingresá el nombre de tu barrio o comunidad (mínimo 2 caracteres).',
+        });
+      }
+
+      // Si ya existe un barrio aprobado o propuesto con el mismo nombre exacto, reutilizarlo
+      const dupRes = await db.query(
+        `SELECT id, COALESCE(approval_status, 'approved') AS approval_status
+         FROM countries
+         WHERE LOWER(BTRIM(name)) = LOWER(BTRIM($1))
+           AND COALESCE(approval_status, 'approved') <> 'rejected'
+         LIMIT 1`,
+        [proposedName]
+      );
+
+      if (dupRes.rows.length > 0) {
+        cleanCountryId = dupRes.rows[0].id;
+        proposedCountryCreated = dupRes.rows[0].approval_status === 'pending';
+      } else {
+        // Adaptarse a columna legacy `location` si existe en PostgreSQL
+        const colsRes = await db.query(
+          `SELECT column_name FROM information_schema.columns
+           WHERE table_schema = 'public' AND table_name = 'countries'`
+        );
+        const hasLocationCol = colsRes.rows.some((r) => r.column_name === 'location');
+        const locationFallback = [proposedCity, proposedProvince].filter(Boolean).join(', ') || 'A confirmar';
+
+        const insertedCountry = hasLocationCol
+          ? await db.query(
+              `INSERT INTO countries (
+                 name, location, city, province, is_active,
+                 plan_code, billing_status, approval_status, requested_by_user_id
+               )
+               VALUES ($1, $2, $3, $4, TRUE, 'pilot', 'trial', 'pending', $5)
+               RETURNING id`,
+              [proposedName, locationFallback, proposedCity, proposedProvince, userId]
+            )
+          : await db.query(
+              `INSERT INTO countries (
+                 name, city, province, is_active,
+                 plan_code, billing_status, approval_status, requested_by_user_id
+               )
+               VALUES ($1, $2, $3, TRUE, 'pilot', 'trial', 'pending', $4)
+               RETURNING id`,
+              [proposedName, proposedCity, proposedProvince, userId]
+            );
+
+        cleanCountryId = insertedCountry.rows[0].id;
+        proposedCountryCreated = true;
+      }
     }
 
     // 4. Resolver habilitación de portales: todo usuario estándar debe mantener al menos un portal activo
@@ -341,24 +404,33 @@ async function updateMyProfile(req, res) {
       ]
     );
 
-    // 8. Resolver nombre de comunidad actualizada y emitir JWT refrescado con los nuevos claims
+    // 8. Resolver nombre y estado de aprobación de la comunidad actualizada y emitir JWT refrescado
     const updatedRow = updated.rows[0];
     let countryName = null;
+    let countryApprovalStatus = null;
     if (updatedRow.country_id) {
-      const cRes = await db.query('SELECT name FROM countries WHERE id = $1 LIMIT 1', [
-        updatedRow.country_id,
-      ]);
+      const cRes = await db.query(
+        `SELECT name, COALESCE(approval_status, 'approved') AS approval_status
+         FROM countries
+         WHERE id = $1
+         LIMIT 1`,
+        [updatedRow.country_id]
+      );
       countryName = cRes.rows[0]?.name || null;
+      countryApprovalStatus = cRes.rows[0]?.approval_status || 'approved';
     }
 
     const refreshedToken = signSessionToken(updatedRow);
 
     return res.json({
-      message: 'Perfil, rol por defecto y ubicación actualizados correctamente.',
+      message: proposedCountryCreated
+        ? `Comunidad "${countryName}" registrada en revisión por TrustLink y asociada a tu domicilio.`
+        : 'Perfil, rol por defecto y ubicación actualizados correctamente.',
       ...(refreshedToken ? { token: refreshedToken } : {}),
       account: {
         ...updatedRow,
         country_name: countryName,
+        country_approval_status: countryApprovalStatus,
       },
     });
   } catch (err) {

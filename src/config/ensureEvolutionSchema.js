@@ -182,14 +182,18 @@ async function ensureEvolutionSchema() {
         ON public.provider_subscriptions (user_id, status, ends_at DESC)
       `);
 
-      // 5. Asegurar columnas de licenciamiento B2B y ventana de Antecedentes Penales por barrio en `countries`
+      // 5. Asegurar columnas de licenciamiento B2B, ventana de Antecedentes Penales y moderación de barrios propuestos en `countries`
       await db.query(`
         ALTER TABLE public.countries
+        ADD COLUMN IF NOT EXISTS city VARCHAR(120) NULL,
+        ADD COLUMN IF NOT EXISTS province VARCHAR(120) NULL,
         ADD COLUMN IF NOT EXISTS plan_code VARCHAR(40) NOT NULL DEFAULT 'pilot',
         ADD COLUMN IF NOT EXISTS billing_status VARCHAR(20) NOT NULL DEFAULT 'active',
         ADD COLUMN IF NOT EXISTS subscription_ends_at TIMESTAMP WITHOUT TIME ZONE NULL,
         ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL,
-        ADD COLUMN IF NOT EXISTS criminal_record_max_age_days INTEGER NOT NULL DEFAULT 180
+        ADD COLUMN IF NOT EXISTS criminal_record_max_age_days INTEGER NOT NULL DEFAULT 180,
+        ADD COLUMN IF NOT EXISTS approval_status VARCHAR(20) NOT NULL DEFAULT 'approved',
+        ADD COLUMN IF NOT EXISTS requested_by_user_id INTEGER NULL REFERENCES public.users(id) ON DELETE SET NULL
       `);
 
       // 6. Asegurar columnas de Mercado Pago Checkout Pro en `transactions`

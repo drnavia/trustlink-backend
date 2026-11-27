@@ -52,12 +52,14 @@ const ensurePasswordResetTable = async () => {
  */
 const listPublicCountries = async (_req, res) => {
   try {
-    // Consulta únicamente las comunidades activas para poblar el selector público
+    await ensureEvolutionSchema();
+    // Consulta únicamente las comunidades activas y aprobadas por TrustLink para el selector público
     const result = await db.query(
-      `SELECT id, name
+      `SELECT id, name, city, province
        FROM countries
        WHERE is_active = TRUE
-       ORDER BY id ASC`
+         AND COALESCE(approval_status, 'approved') = 'approved'
+       ORDER BY LOWER(name) ASC, id ASC`
     );
     return res.status(200).json({ countries: result.rows });
   } catch (error) {
@@ -110,15 +112,14 @@ const register = async (req, res) => {
       });
     }
 
-    const isProviderRole = normalizedRole === 'provider';
     const cleanDni = dni !== undefined && dni !== null && String(dni).trim() !== '' ? String(dni).trim() : null;
     const cleanPhone = phone !== undefined && phone !== null && String(phone).trim() !== '' ? String(phone).trim() : null;
 
-    if (!first_name || !last_name || !email || !password || (!isProviderRole && !cleanDni)) {
+    if (!first_name || !last_name || !email || !password) {
       return res.status(400).json({ error: 'Faltan campos obligatorios para el registro.' });
     }
-    if (isProviderRole && !cleanDni && !cleanPhone) {
-      return res.status(400).json({ error: 'Ingresá tu número de celular para crear tu cuenta de prestador.' });
+    if (!cleanDni && !cleanPhone) {
+      return res.status(400).json({ error: 'Ingresá tu número de celular para crear tu cuenta.' });
     }
 
     // 3. Sanitizar identificadores y validar unicidad de email (insensible a mayúsculas) o DNI (si fue provisto)
@@ -162,8 +163,8 @@ const register = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    // 6. Insertar registro en `users` con `initial_role` inmutable, `portals_configured = TRUE` y soporte N0 OTP
-    const needsPhoneOtp = Boolean(require_phone_otp) || (isProviderRole && !cleanDni);
+    // 6. Insertar registro en `users` con `initial_role` inmutable, `portals_configured = TRUE` y soporte SMS OTP
+    const needsPhoneOtp = Boolean(require_phone_otp) || (!cleanDni && Boolean(cleanPhone));
     const otpCode = needsPhoneOtp
       ? String(process.env.SMS_MOCK_CODE || '1234').slice(0, 6)
       : null;
@@ -324,9 +325,13 @@ const login = async (req, res) => {
     await ensureEvolutionSchema();
     const { email, password } = req.body;
 
-    const result = await db.query('SELECT * FROM users WHERE LOWER(email) = LOWER($1)', [
-      String(email || '').trim(),
-    ]);
+    const result = await db.query(
+      `SELECT u.*, c.name AS country_name, COALESCE(c.approval_status, 'approved') AS country_approval_status
+       FROM users u
+       LEFT JOIN countries c ON c.id = u.country_id
+       WHERE LOWER(u.email) = LOWER($1)`,
+      [String(email || '').trim()]
+    );
     if (result.rows.length === 0) {
       return res.status(401).json({ error: 'Credenciales inválidas.' });
     }
@@ -364,6 +369,8 @@ const login = async (req, res) => {
         email: user.email,
         role: user.role,
         country_id: user.country_id,
+        country_name: user.country_name || null,
+        country_approval_status: user.country_id ? user.country_approval_status || 'approved' : null,
         fraction_type: user.fraction_type || 'na',
         fraction_number: user.fraction_number || null,
         lot_number: user.lot_number || null,

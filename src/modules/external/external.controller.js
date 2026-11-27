@@ -74,7 +74,9 @@ const ensureCountriesColumns = async () => {
       ADD COLUMN IF NOT EXISTS billing_status VARCHAR(20) NOT NULL DEFAULT 'active',
       ADD COLUMN IF NOT EXISTS subscription_ends_at TIMESTAMP WITHOUT TIME ZONE NULL,
       ADD COLUMN IF NOT EXISTS monthly_pass_quota INTEGER NULL,
-      ADD COLUMN IF NOT EXISTS criminal_record_max_age_days INTEGER NOT NULL DEFAULT 180;
+      ADD COLUMN IF NOT EXISTS criminal_record_max_age_days INTEGER NOT NULL DEFAULT 180,
+      ADD COLUMN IF NOT EXISTS approval_status VARCHAR(20) NOT NULL DEFAULT 'approved',
+      ADD COLUMN IF NOT EXISTS requested_by_user_id INTEGER NULL REFERENCES public.users(id) ON DELETE SET NULL;
   `);
 
   // Paso 2: Inspeccionar columnas reales para soportar esquemas legacy con `locality` o `location`
@@ -647,10 +649,12 @@ const listCountries = async (req, res) => {
     const conditions = [];
     const params = [];
 
-    if (status === 'active') {
-      conditions.push('c.is_active = TRUE');
+    if (status === 'pending') {
+      conditions.push(`COALESCE(c.approval_status, 'approved') = 'pending'`);
+    } else if (status === 'active') {
+      conditions.push(`c.is_active = TRUE AND COALESCE(c.approval_status, 'approved') <> 'rejected'`);
     } else if (status === 'inactive') {
-      conditions.push('c.is_active = FALSE');
+      conditions.push(`(c.is_active = FALSE OR COALESCE(c.approval_status, 'approved') = 'rejected')`);
     }
 
     if (search) {
@@ -663,17 +667,20 @@ const listCountries = async (req, res) => {
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // Etapa 2: Calcular total filtrado y acotar la página solicitada al rango válido
-    const countRes = await db.query(
-      `SELECT COUNT(*)::int AS total FROM countries c ${whereClause}`,
-      params
-    );
+    // Etapa 2: Calcular total filtrado, pendientes de moderación y acotar la página solicitada al rango válido
+    const [countRes, pendingSummaryRes] = await Promise.all([
+      db.query(`SELECT COUNT(*)::int AS total FROM countries c ${whereClause}`, params),
+      db.query(
+        `SELECT COUNT(*)::int AS pending_count FROM countries WHERE COALESCE(approval_status, 'approved') = 'pending'`
+      ),
+    ]);
     const total = countRes.rows[0]?.total || 0;
+    const pendingApprovalCount = pendingSummaryRes.rows[0]?.pending_count || 0;
     const totalPages = Math.max(Math.ceil(total / limit), 1);
     const safePage = Math.min(page, totalPages);
     const safeOffset = (safePage - 1) * limit;
 
-    // Etapa 3: Consultar página de comunidades con subconsultas de claves activas y consumo QR mensual
+    // Etapa 3: Consultar página de comunidades con subconsultas de claves activas, consumo QR y solicitante
     const listParams = [...params, limit, safeOffset];
     const result = await db.query(
       `
@@ -690,6 +697,10 @@ const listCountries = async (req, res) => {
           c.subscription_ends_at,
           c.monthly_pass_quota,
           COALESCE(c.criminal_record_max_age_days, 180) AS criminal_record_max_age_days,
+          COALESCE(c.approval_status, 'approved') AS approval_status,
+          c.requested_by_user_id,
+          TRIM(COALESCE(req_u.first_name, '') || ' ' || COALESCE(req_u.last_name, '')) AS requested_by_name,
+          req_u.email AS requested_by_email,
           c.created_at,
           (SELECT COUNT(*)::int FROM country_integrations ci WHERE ci.country_id = c.id AND ci.is_active = TRUE) AS active_keys_count,
           (
@@ -700,8 +711,11 @@ const listCountries = async (req, res) => {
               AND gal.created_at >= date_trunc('month', NOW())
           ) AS monthly_qr_used
         FROM countries c
+        LEFT JOIN users req_u ON req_u.id = c.requested_by_user_id
         ${whereClause}
-        ORDER BY c.id ASC
+        ORDER BY
+          CASE WHEN COALESCE(c.approval_status, 'approved') = 'pending' THEN 0 ELSE 1 END ASC,
+          c.id ASC
         LIMIT $${listParams.length - 1} OFFSET $${listParams.length}
       `,
       listParams
@@ -716,6 +730,7 @@ const listCountries = async (req, res) => {
     return res.status(200).json({
       countries: enrichedCountries,
       b2b_plans: COMMUNITY_B2B_PLANS,
+      pending_approval_count: pendingApprovalCount,
       pagination: {
         page: safePage,
         limit,
@@ -889,6 +904,56 @@ const updateCountry = async (req, res) => {
  * @param {import('express').Request} req - Param `id`; body opcional `{ is_active?: boolean }`.
  * @param {import('express').Response} res - Respuesta HTTP con el registro actualizado.
  */
+/**
+ * Aprueba o rechaza una comunidad/barrio propuesto por un residente (`approval_status`).
+ * PATCH /api/v1/external/countries/:id/approval (Exclusivo `superadmin`).
+ *
+ * @param {import('express').Request} req - Param `id`; body `{ approval_status: 'approved' | 'rejected' }`.
+ * @param {import('express').Response} res - Respuesta HTTP con la comunidad actualizada.
+ */
+const updateCountryApproval = async (req, res) => {
+  try {
+    await ensureCountriesColumns();
+    const countryId = parseInt(req.params.id, 10);
+    if (Number.isNaN(countryId)) {
+      return res.status(400).json({ error: 'ID de comunidad inválido.' });
+    }
+
+    const nextStatus = String(req.body?.approval_status || '').trim().toLowerCase();
+    if (!['approved', 'rejected'].includes(nextStatus)) {
+      return res.status(400).json({
+        error: 'approval_status inválido. Valores permitidos: approved o rejected.',
+      });
+    }
+
+    const nextActive = nextStatus === 'approved';
+    const updated = await db.query(
+      `UPDATE countries
+       SET approval_status = $1,
+           is_active = $2,
+           billing_status = CASE WHEN $1 = 'approved' AND billing_status = 'trial' THEN 'active' ELSE billing_status END
+       WHERE id = $3
+       RETURNING id, name, address, postal_code, city, province, is_active, approval_status, billing_status, criminal_record_max_age_days, created_at`,
+      [nextStatus, nextActive, countryId]
+    );
+
+    if (updated.rows.length === 0) {
+      return res.status(404).json({ error: 'Comunidad no encontrada.' });
+    }
+
+    return res.status(200).json({
+      message:
+        nextStatus === 'approved'
+          ? `Comunidad "${updated.rows[0].name}" aprobada y publicada en el catálogo.`
+          : `Propuesta de comunidad "${updated.rows[0].name}" rechazada.`,
+      country: updated.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al moderar comunidad propuesta:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar la validación de la comunidad.' });
+  }
+};
+
 const toggleCountryStatus = async (req, res) => {
   try {
     // Validar ID y comprobar existencia previa
@@ -2262,6 +2327,7 @@ module.exports = {
   listCountries,
   createCountry,
   updateCountry,
+  updateCountryApproval,
   toggleCountryStatus,
   updateCountryBilling,
   getMyCommunityBilling,

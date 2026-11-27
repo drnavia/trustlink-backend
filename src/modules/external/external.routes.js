@@ -14,6 +14,7 @@ const {
   listCountries,
   createCountry,
   updateCountry,
+  updateCountryApproval,
   toggleCountryStatus,
   updateCountryBilling,
   getMyCommunityBilling,
@@ -73,6 +74,7 @@ router.get('/status', verifyToken, verifyRole(['superadmin']), getExternalDiagno
 router.get('/countries', verifyToken, verifyRole(['superadmin']), listCountries);
 router.post('/countries', verifyToken, verifyRole(['superadmin']), createCountry);
 router.patch('/countries/:id', verifyToken, verifyRole(['superadmin']), updateCountry);
+router.patch('/countries/:id/approval', verifyToken, verifyRole(['superadmin']), updateCountryApproval);
 router.patch('/countries/:id/toggle', verifyToken, verifyRole(['superadmin']), toggleCountryStatus);
 router.patch('/countries/:id/billing', verifyToken, verifyRole(['superadmin']), updateCountryBilling);
 
