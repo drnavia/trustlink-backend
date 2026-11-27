@@ -190,6 +190,8 @@ const ensureVisitRequestsTable = async () => {
       lot_number VARCHAR(100) NULL,
       preferred_date VARCHAR(50) NULL,
       preferred_end_date VARCHAR(40) NULL,
+      service_title VARCHAR(160) NULL,
+      service_specialty VARCHAR(120) NULL,
       notes TEXT NULL,
       messages JSONB NOT NULL DEFAULT '[]'::jsonb,
       status VARCHAR(30) NOT NULL DEFAULT 'pending_provider',
@@ -203,6 +205,8 @@ const ensureVisitRequestsTable = async () => {
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS lot_number VARCHAR(100) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS preferred_date VARCHAR(50) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS preferred_end_date VARCHAR(40) NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS service_title VARCHAR(160) NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS service_specialty VARCHAR(120) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS notes TEXT NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS messages JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'pending_provider';`);
@@ -978,6 +982,8 @@ const createVisitCoordination = async (req, res) => {
       preferred_date,
       preferred_end_date,
       duration_minutes,
+      service_title,
+      service_specialty,
       notes,
     } = req.body;
 
@@ -987,15 +993,18 @@ const createVisitCoordination = async (req, res) => {
       });
     }
 
-    if (!provider_id || !notes || !String(notes).trim()) {
+    const cleanServiceTitle = service_title ? String(service_title).trim().slice(0, 160) : '';
+    const cleanNotes = String(notes || '').trim() || cleanServiceTitle;
+
+    if (!provider_id || !cleanNotes) {
       return res.status(400).json({
-        error: 'Indicá el prestador y el detalle/mensaje de coordinación de la visita.',
+        error: 'Indicá el prestador y el trabajo o mensaje de coordinación de la visita.',
       });
     }
 
-    // Etapa 2: Comprobar existencia del prestador destino y obtener comunidad de respaldo
+    // Etapa 2: Comprobar existencia del prestador destino y obtener comunidad/rubro de respaldo
     const providerCheck = await db.query(
-      `SELECT p.id, u.country_id
+      `SELECT p.id, p.specialty, u.country_id
        FROM providers p
        LEFT JOIN users u ON u.id = p.user_id
        WHERE p.id = $1
@@ -1015,7 +1024,9 @@ const createVisitCoordination = async (req, res) => {
 
     // Etapa 4: Inicializar el hilo de mensajería y persistir la solicitud en `visit_requests`
     const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
-    const cleanNotes = String(notes).trim();
+    const cleanServiceSpecialty =
+      (service_specialty ? String(service_specialty).trim().slice(0, 120) : '') ||
+      (providerCheck.rows[0].specialty ? String(providerCheck.rows[0].specialty).trim().slice(0, 120) : null);
     const initialMessages = [
       {
         id: `msg-${Date.now()}`,
@@ -1036,9 +1047,10 @@ const createVisitCoordination = async (req, res) => {
     const inserted = await db.query(
       `INSERT INTO visit_requests (
          country_id, owner_id, provider_id, fraction_number, lot_number,
-         preferred_date, preferred_end_date, notes, messages, status
+         preferred_date, preferred_end_date, service_title, service_specialty,
+         notes, messages, status
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'pending_provider')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, 'pending_provider')
        RETURNING *`,
       [
         effectiveCountryId,
@@ -1048,6 +1060,8 @@ const createVisitCoordination = async (req, res) => {
         locationResult.lotNumber,
         cleanPreferredDate,
         cleanPreferredEndDate,
+        cleanServiceTitle || null,
+        cleanServiceSpecialty,
         cleanNotes,
         JSON.stringify(initialMessages),
       ]
@@ -1560,12 +1574,15 @@ const respondVisitRequestAsResident = async (req, res) => {
 const createPass = async (req, res) => {
   try {
     await ensureAuthorizedEmployeesColumn();
+    await db.query(`ALTER TABLE public.access_passes ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;`);
 
     // Etapa 1: Validar campos obligatorios y existencia del prestador (junto a fechas de compliance)
     const ownerId = Number(req.user?.userId || req.user?.id);
+    const userRole = String(req.user?.role || '').toLowerCase();
     const countryId = req.user?.countryId ? Number(req.user.countryId) : null;
     const {
       provider_id,
+      visit_request_id,
       fraction_number,
       lot_number,
       vehicle_plate,
@@ -1578,6 +1595,23 @@ const createPass = async (req, res) => {
       return res.status(400).json({
         error: 'Faltan campos obligatorios (provider_id, start_time, end_time).',
       });
+    }
+
+    let resolvedVisitRequestId = null;
+    if (visit_request_id !== undefined && visit_request_id !== null && String(visit_request_id).trim() !== '') {
+      const numericVisitId = Number(visit_request_id);
+      if (!Number.isNaN(numericVisitId) && numericVisitId > 0) {
+        await ensureVisitRequestsTable();
+        const vrCheck = await db.query(
+          'SELECT id, owner_id FROM visit_requests WHERE id = $1 LIMIT 1',
+          [numericVisitId]
+        );
+        if (vrCheck.rows.length > 0) {
+          if (userRole === 'superadmin' || Number(vrCheck.rows[0].owner_id) === ownerId) {
+            resolvedVisitRequestId = numericVisitId;
+          }
+        }
+      }
     }
 
     const providerCheck = await db.query(
@@ -1641,16 +1675,16 @@ const createPass = async (req, res) => {
 
     const insertSql = supportsPlate
       ? `INSERT INTO access_passes (
-           country_id, owner_id, provider_id, fraction_number, lot_number,
+           country_id, owner_id, provider_id, visit_request_id, fraction_number, lot_number,
            vehicle_plate, authorized_employees, qr_token, start_time, end_time, status
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, 'pending')
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, 'pending')
          RETURNING *`
       : `INSERT INTO access_passes (
-           country_id, owner_id, provider_id, fraction_number, lot_number,
+           country_id, owner_id, provider_id, visit_request_id, fraction_number, lot_number,
            authorized_employees, qr_token, start_time, end_time, status
          )
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, 'pending')
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, 'pending')
          RETURNING *`;
 
     // Armar arreglo de parámetros posicionales acorde al esquema detectado (con o sin `vehicle_plate`)
@@ -1659,6 +1693,7 @@ const createPass = async (req, res) => {
           effectiveCountryId,
           ownerId,
           Number(provider_id),
+          resolvedVisitRequestId,
           locationResult.fractionDisplay,
           locationResult.lotNumber,
           vehicle_plate ? String(vehicle_plate).trim().toUpperCase() : null,
@@ -1671,6 +1706,7 @@ const createPass = async (req, res) => {
           effectiveCountryId,
           ownerId,
           Number(provider_id),
+          resolvedVisitRequestId,
           locationResult.fractionDisplay,
           locationResult.lotNumber,
           JSON.stringify(authorizedEmployees),
@@ -1717,18 +1753,21 @@ const getMyPasses = async (req, res) => {
   try {
     // Etapa 1: Sincronizar esquema/vencimientos y resolver proyección opcional de patente
     await ensureAuthorizedEmployeesColumn();
+    await ensureVisitRequestsTable();
+    await db.query(`ALTER TABLE public.access_passes ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;`);
     await expireOverduePasses();
     const ownerId = req.user.userId;
     const supportsPlate = await hasVehiclePlateColumn();
     const plateSelect = supportsPlate ? 'ap.vehicle_plate,' : 'NULL::text AS vehicle_plate,';
 
-    // Etapa 2: Consultar pases emitidos por el residente enriquecidos con prestador y comunidad
+    // Etapa 2: Consultar pases emitidos por el residente enriquecidos con prestador, servicio y comunidad
     const result = await db.query(
       `SELECT
          ap.id,
          ap.country_id,
          ap.owner_id,
          ap.provider_id,
+         ap.visit_request_id,
          ap.fraction_number,
          ap.lot_number,
          ${plateSelect}
@@ -1738,11 +1777,14 @@ const getMyPasses = async (req, res) => {
          ap.end_time,
          ap.status,
          ap.created_at,
+         vr.service_title AS visit_service_title,
+         vr.service_specialty AS visit_service_specialty,
          TRIM(CONCAT(COALESCE(u_prov.first_name, ''), ' ', COALESCE(u_prov.last_name, ''))) AS provider_name,
          u_prov.phone AS provider_phone,
          p.specialty AS provider_specialty,
          c.name AS country_name
        FROM access_passes ap
+       LEFT JOIN visit_requests vr ON vr.id = ap.visit_request_id
        LEFT JOIN providers p ON ap.provider_id = p.id
        LEFT JOIN users u_prov ON p.user_id = u_prov.id
        LEFT JOIN countries c ON ap.country_id = c.id

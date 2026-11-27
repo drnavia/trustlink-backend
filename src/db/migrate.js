@@ -654,6 +654,51 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 025: Identidad del servicio en solicitudes de visita (`service_title`, `service_specialty`)
+  // Permite que cada solicitud nazca con el título del trabajo y rubro específico solicitado,
+  // habilitando trazabilidad centrada en el servicio contratado (Fase 1 de Mis Servicios).
+  // ---------------------------------------------------------------------------
+  {
+    id: '025_visit_requests_service_identity',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.visit_requests
+          ADD COLUMN IF NOT EXISTS service_title VARCHAR(160) NULL,
+          ADD COLUMN IF NOT EXISTS service_specialty VARCHAR(120) NULL;
+      `);
+    },
+  },
+
+  // ---------------------------------------------------------------------------
+  // 026: Trazabilidad punta a punta de servicios (`visit_request_id` en `access_passes` y `service_contracts`)
+  // Vincula la cadena completa Solicitud de Visita -> Pase QR -> Orden/Contrato -> Reseñas
+  // para unificar cada trabajo del hogar en un único expediente evolutivo (Fase 2).
+  // ---------------------------------------------------------------------------
+  {
+    id: '026_service_case_traceability_links',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.access_passes
+          ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;
+      `);
+      await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_access_passes_visit_request_id
+        ON public.access_passes (visit_request_id)
+        WHERE visit_request_id IS NOT NULL;
+      `);
+      await db.query(`
+        ALTER TABLE public.service_contracts
+          ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;
+      `);
+      await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_service_contracts_visit_request_id
+        ON public.service_contracts (visit_request_id)
+        WHERE visit_request_id IS NOT NULL;
+      `);
+    },
+  },
 ];
 
 /**

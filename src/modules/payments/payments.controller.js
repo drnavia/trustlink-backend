@@ -55,7 +55,12 @@ const ensureCompletionAndDisputesSchema = async () => {
   await db.query(`
     ALTER TABLE public.service_contracts
       ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP WITHOUT TIME ZONE NULL,
-      ADD COLUMN IF NOT EXISTS completion_notes TEXT NULL;
+      ADD COLUMN IF NOT EXISTS completion_notes TEXT NULL,
+      ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;
+  `);
+  await db.query(`
+    ALTER TABLE public.access_passes
+      ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;
   `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS public.service_disputes (
@@ -197,6 +202,7 @@ const listMyContracts = async (req, res) => {
         sc.owner_id,
         sc.provider_id,
         sc.pass_id,
+        COALESCE(sc.visit_request_id, ap.visit_request_id) AS visit_request_id,
         sc.description,
         sc.agreed_amount,
         sc.status,
@@ -222,6 +228,7 @@ const listMyContracts = async (req, res) => {
           LIMIT 1
         ) AS latest_dispute_status
       FROM service_contracts sc
+      LEFT JOIN access_passes ap ON sc.pass_id = ap.id
       JOIN providers p ON sc.provider_id = p.id
       JOIN users u ON p.user_id = u.id
       WHERE sc.owner_id = $1
@@ -252,10 +259,11 @@ const listMyContracts = async (req, res) => {
  */
 const createContract = async (req, res) => {
   try {
+    await ensureCompletionAndDisputesSchema();
     // Etapa 1: Validar descripción obligatoria y monto acordado estrictamente mayor a cero
     const ownerId = Number(req.user.userId);
     const userRole = String(req.user.role || '').toLowerCase();
-    const { provider_id, pass_id, description, agreed_amount } = req.body || {};
+    const { provider_id, pass_id, visit_request_id, description, agreed_amount } = req.body || {};
 
     const cleanDescription = String(description || '').trim();
     const numericAmount = Number(agreed_amount);
@@ -268,12 +276,16 @@ const createContract = async (req, res) => {
 
     let resolvedProviderId = provider_id ? Number(provider_id) : null;
     let resolvedPassId = pass_id ? Number(pass_id) : null;
+    let resolvedVisitRequestId =
+      visit_request_id && !Number.isNaN(Number(visit_request_id))
+        ? Number(visit_request_id)
+        : null;
     let effectiveCountryId = req.user.countryId ? Number(req.user.countryId) : null;
 
-    // Etapa 2: Si se vincula a un pase QR, validar existencia, propiedad del residente y heredar prestador/comunidad
+    // Etapa 2: Si se vincula a un pase QR, validar existencia, propiedad del residente y heredar prestador/comunidad/visita
     if (resolvedPassId) {
       const passRes = await db.query(
-        'SELECT id, owner_id, provider_id, country_id FROM access_passes WHERE id = $1 LIMIT 1',
+        'SELECT id, owner_id, provider_id, country_id, visit_request_id FROM access_passes WHERE id = $1 LIMIT 1',
         [resolvedPassId]
       );
       if (passRes.rows.length === 0) {
@@ -287,6 +299,30 @@ const createContract = async (req, res) => {
       }
       resolvedProviderId = resolvedProviderId || Number(passRow.provider_id);
       effectiveCountryId = effectiveCountryId || (passRow.country_id ? Number(passRow.country_id) : null);
+      resolvedVisitRequestId =
+        resolvedVisitRequestId || (passRow.visit_request_id ? Number(passRow.visit_request_id) : null);
+    }
+
+    // Etapa 2.5: Si viene vinculado a una solicitud de visita, validar pertenencia y heredar prestador si faltara
+    if (resolvedVisitRequestId) {
+      const vrRes = await db
+        .query(
+          'SELECT id, owner_id, provider_id, country_id FROM visit_requests WHERE id = $1 LIMIT 1',
+          [resolvedVisitRequestId]
+        )
+        .catch(() => ({ rows: [] }));
+      if (vrRes.rows.length > 0) {
+        const vrRow = vrRes.rows[0];
+        if (userRole !== 'superadmin' && Number(vrRow.owner_id) !== ownerId) {
+          resolvedVisitRequestId = null;
+        } else {
+          resolvedProviderId = resolvedProviderId || Number(vrRow.provider_id);
+          effectiveCountryId =
+            effectiveCountryId || (vrRow.country_id ? Number(vrRow.country_id) : null);
+        }
+      } else {
+        resolvedVisitRequestId = null;
+      }
     }
 
     // Etapa 3: Validar existencia del prestador y resolver `country_id` de respaldo desde su usuario
@@ -314,15 +350,16 @@ const createContract = async (req, res) => {
     // Etapa 4: Insertar la orden de servicio en estado `'pending'` con monto normalizado a 2 decimales
     const insertRes = await db.query(
       `INSERT INTO service_contracts (
-         country_id, owner_id, provider_id, pass_id, description, agreed_amount, status
+         country_id, owner_id, provider_id, pass_id, visit_request_id, description, agreed_amount, status
        )
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
        RETURNING *`,
       [
         effectiveCountryId,
         ownerId,
         resolvedProviderId,
         resolvedPassId,
+        resolvedVisitRequestId,
         cleanDescription,
         Number(numericAmount.toFixed(2)),
       ]
