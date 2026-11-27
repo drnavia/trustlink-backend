@@ -8,8 +8,8 @@
  * Escala oficial v2 (Eje de Confianza y Seguridad — nunca se compra):
  * - `N0 · Cuenta creada` *(oculto)*: falta celular validado, DNI validado o especialidad visible.
  * - `N1 · Perfil Básico` *(visible · solo consultas)*: celular + DNI validado + ≥ 1 especialidad visible.
- * - `N2 · Seguro en revisión` / `Doc. en validación` *(visible · solo consultas)*: N1 + Seguro AP o ART vigente cargado (y opcionalmente Antecedentes cargados esperando auditoría).
- * - `N3 · Habilitado · Pase QR` *(visible · Pase QR habilitado)*: N2 + Antecedentes Penales vigentes dentro de la ventana del barrio + aprobación documental de TrustLink.
+ * - `N2 · En verificación` *(visible · solo consultas)*: N1 + Seguro AP o ART vigente cargado (y opcionalmente Antecedentes cargados esperando auditoría).
+ * - `N3 · Pase QR habilitado` *(visible · Pase QR habilitado)*: N2 + Antecedentes Penales vigentes dentro de la ventana del barrio + aprobación documental de TrustLink.
  * - `N4 · Verificado` *(tilde oficial estilo X/Instagram)*: N3 + cotejo automático/cruzado de PDFs (`autoVerified = true`).
  *
  * Eje Comercial paralelo (`is_featured_partner`): membresía/destacado habilitada exclusivamente desde `N3` o `N4` vigente, sin alterar el nivel de seguridad.
@@ -42,23 +42,23 @@ const TRUST_LEVEL_CATALOG = [
   {
     level: 2,
     tier: 'insurance_review',
-    label: 'Seguro en revisión',
-    short_label: 'Nivel 2 · Cobertura cargada',
-    tone: 'sky',
+    label: 'En verificación',
+    short_label: 'Nivel 2 · En verificación',
+    tone: 'indigo',
   },
   {
     level: 3,
     tier: 'qr_enabled',
     label: 'Pase QR habilitado',
     short_label: 'Nivel 3 · Pase QR',
-    tone: 'teal',
+    tone: 'emerald',
   },
   {
     level: 4,
     tier: 'auto_verified',
     label: 'Verificado',
     short_label: 'Nivel 4 · Verificado',
-    tone: 'emerald',
+    tone: 'sky',
   },
 ];
 
@@ -236,7 +236,7 @@ function computeProviderTrustLevel({
       tier: 'auto_verified',
       label: 'Verificado',
       sublabel: 'PDFs cotejados y Pases QR habilitados',
-      tone: 'emerald',
+      tone: 'sky',
       is_verified: true,
       is_auto_verified: true,
       is_featured_partner: featuredPartner,
@@ -268,7 +268,7 @@ function computeProviderTrustLevel({
       tier: 'qr_enabled',
       label: 'Pase QR habilitado',
       sublabel: 'Documentación validada para ingreso en garita',
-      tone: 'teal',
+      tone: 'emerald',
       is_verified: true,
       is_auto_verified: false,
       is_featured_partner: featuredPartner,
@@ -290,18 +290,18 @@ function computeProviderTrustLevel({
     };
   }
 
-  // Nivel 2: Seguro AP/ART cargado (en revisión) — y si además cargó Antecedentes, queda listo para auditoría N3
+  // Nivel 2: Seguro AP/ART cargado (en verificación) — y si además cargó Antecedentes, queda listo para auditoría N3
   if (artOk) {
     const hasBothDocs = criminalOk;
     return {
       level: 2,
       max_level: 4,
       tier: hasBothDocs ? 'docs_in_review' : 'insurance_review',
-      label: hasBothDocs ? 'Doc. en validación' : 'Seguro en revisión',
+      label: 'En verificación',
       sublabel: hasBothDocs
-        ? 'Seguro + Antecedentes cargados (en revisión)'
-        : 'Seguro AP/ART cargado — falta Antecedentes',
-      tone: 'sky',
+        ? 'Seguro y Antecedentes cargados (en revisión)'
+        : 'Seguro AP/ART cargado · falta Antecedentes',
+      tone: 'indigo',
       is_verified: false,
       is_auto_verified: false,
       is_featured_partner: false,
