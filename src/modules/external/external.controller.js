@@ -931,7 +931,7 @@ const updateCountryApproval = async (req, res) => {
       `UPDATE countries
        SET approval_status = $1,
            is_active = $2,
-           billing_status = CASE WHEN $1 = 'approved' AND billing_status = 'trial' THEN 'active' ELSE billing_status END
+           billing_status = CASE WHEN $2 = TRUE AND billing_status = 'trial' THEN 'active' ELSE billing_status END
        WHERE id = $3
        RETURNING id, name, address, postal_code, city, province, is_active, approval_status, billing_status, criminal_record_max_age_days, created_at`,
       [nextStatus, nextActive, countryId]

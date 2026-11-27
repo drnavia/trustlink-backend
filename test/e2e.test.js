@@ -2276,5 +2276,62 @@ describe('TrustLink Backend — E2E Core Suite', () => {
     assert.equal('insurance_policy_url' in publicP6, false, 'La vidriera pública nunca debe exponer documentos');
     assert.equal('vehicles' in publicP6, false, 'La vidriera pública nunca debe exponer patentes');
     assert.equal('employees' in publicP6, false, 'La vidriera pública nunca debe exponer nómina');
+
+    // 10. Propuesta de comunidad nueva por residente + moderación Superadmin (approval_status: pending -> approved)
+    const ownerAccBefore = await req('GET', '/api/v1/account/me', undefined, ownerToken);
+    const origOwnerCountryId = ownerAccBefore.data.account?.country_id || 1;
+    const proposedName = `Barrio Propuesto E2E ${Date.now()}`;
+    const proposeRes = await req(
+      'PATCH',
+      '/api/v1/account/profile',
+      {
+        proposed_country: {
+          name: proposedName,
+          city: 'Canning',
+          province: 'Buenos Aires',
+        },
+        fraction_type: 'na',
+        lot_number: '99',
+        activate_resident_portal: true,
+      },
+      ownerToken
+    );
+    assert.equal(proposeRes.status, 200);
+    assert.equal(proposeRes.data.account.country_approval_status, 'pending');
+    const proposedCountryId = proposeRes.data.account.country_id;
+    assert.ok(proposedCountryId);
+
+    // Antes de aprobar, no debe figurar en el catálogo público
+    const publicBeforeApprove = await req('GET', '/api/v1/auth/countries');
+    assert.equal(
+      publicBeforeApprove.data.countries.some((c) => Number(c.id) === Number(proposedCountryId)),
+      false
+    );
+
+    // Superadmin aprueba la comunidad propuesta -> pasa a approved y aparece en el catálogo público
+    const approveCountryRes = await req(
+      'PATCH',
+      `/api/v1/external/countries/${proposedCountryId}/approval`,
+      { approval_status: 'approved' },
+      superToken
+    );
+    assert.equal(approveCountryRes.status, 200);
+    assert.equal(approveCountryRes.data.country.approval_status, 'approved');
+    assert.equal(approveCountryRes.data.country.billing_status, 'active');
+
+    const publicAfterApprove = await req('GET', '/api/v1/auth/countries');
+    assert.equal(
+      publicAfterApprove.data.countries.some((c) => Number(c.id) === Number(proposedCountryId)),
+      true
+    );
+
+    // Limpieza: restaurar comunidad original del owner y eliminar la comunidad propuesta de prueba
+    await req(
+      'PATCH',
+      '/api/v1/account/profile',
+      { country_id: origOwnerCountryId, lot_number: '12', activate_resident_portal: true },
+      ownerToken
+    );
+    await db.query('DELETE FROM countries WHERE id = $1', [proposedCountryId]);
   });
 });
