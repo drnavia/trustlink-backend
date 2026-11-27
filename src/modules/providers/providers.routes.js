@@ -25,6 +25,7 @@ const {
   updateMyIdentityDocument,
   updateUserIdentityVerification,
   updateUserAutoVerification,
+  addSpecialtyForProviderByAdmin,
   listVerifiedProviders,
   listPublicProviderShowcase,
   listFavoriteProviders,
@@ -96,6 +97,9 @@ router.patch('/identity/verify', verifyToken, verifyRole(['superadmin']), update
 
 // Validar o revocar sello Nivel 4 Verificado TrustLink (cotejo automático/cruzado de PDFs)
 router.patch('/auto-verify', verifyToken, verifyRole(['superadmin']), updateUserAutoVerification);
+
+// Asignar una especialidad a un prestador directamente desde el panel de Compliance (exclusivo Superadmin)
+router.post('/admin/specialty', verifyToken, verifyRole(['superadmin']), addSpecialtyForProviderByAdmin);
 
 // ============================================================================
 // 3. DIRECTORIO UNIFICADO Y VIDRIERA PÚBLICA DE PRESTADORES

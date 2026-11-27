@@ -1972,6 +1972,140 @@ const updateUserAutoVerification = async (req, res) => {
 };
 
 /**
+ * Permite al rol `superadmin` asignar directamente una especialidad (de catálogo o nueva)
+ * a un prestador existente desde el panel de Compliance:
+ * - Evita duplicados (insensible a mayúsculas/tildes) para el mismo `user_id`.
+ * - Hereda la documentación vigente del prestador (Antecedentes + Seguro AP/ART) y su estado
+ *   de compliance personal (`approved` si ya está aprobado en N3/N4, o `pending` si aún no).
+ * - Marca `specialty_approval_status = 'approved'` y `is_visible_in_directory = TRUE` al ser
+ *   cargada directamente por un `superadmin`.
+ * POST /api/v1/providers/admin/specialty
+ */
+const addSpecialtyForProviderByAdmin = async (req, res) => {
+  try {
+    await ensureEvolutionSchema();
+
+    const targetUserId = parseInt(req.body?.user_id, 10);
+    const rawSpecialty = String(req.body?.specialty || '').trim();
+
+    if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+      return res.status(400).json({ error: 'Debe indicar un user_id válido.' });
+    }
+    if (!rawSpecialty || rawSpecialty.length < 2) {
+      return res.status(400).json({ error: 'Indicá un nombre de especialidad válido (mínimo 2 caracteres).' });
+    }
+
+    const userRes = await db.query(
+      'SELECT id, first_name, last_name, email, role, is_active FROM users WHERE id = $1 LIMIT 1',
+      [targetUserId]
+    );
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario prestador no encontrado.' });
+    }
+
+    const catalogMatch = resolveSpecialtyCatalogMatch(rawSpecialty);
+    const cleanSpecialty = String(catalogMatch.canonicalSpecialty || rawSpecialty).trim().slice(0, 100);
+    const isCustom = !catalogMatch.isStandard;
+
+    const existingSpecsRes = await db.query(
+      `SELECT
+         id,
+         specialty,
+         status,
+         criminal_record_url,
+         criminal_record_issued_at,
+         criminal_record_expiry,
+         COALESCE(criminal_record_metadata, '{}'::jsonb) AS criminal_record_metadata,
+         insurance_policy_url,
+         insurance_expiry,
+         COALESCE(insurance_metadata, '{}'::jsonb) AS insurance_metadata
+       FROM providers
+       WHERE user_id = $1
+       ORDER BY id DESC`,
+      [targetUserId]
+    );
+
+    const normalizeKey = (s) =>
+      String(s || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .trim()
+        .toLowerCase();
+
+    const targetNorm = normalizeKey(cleanSpecialty);
+    const alreadyExists = existingSpecsRes.rows.some((r) => normalizeKey(r.specialty) === targetNorm);
+    if (alreadyExists) {
+      return res.status(409).json({
+        error: `El prestador ya tiene cargada la especialidad "${cleanSpecialty}".`,
+      });
+    }
+
+    const approvedBase = existingSpecsRes.rows.find((r) => r.status === 'approved') || null;
+    const docsBase =
+      approvedBase ||
+      existingSpecsRes.rows.find(
+        (r) =>
+          r.criminal_record_url ||
+          r.insurance_policy_url ||
+          r.criminal_record_expiry ||
+          r.insurance_expiry
+      ) ||
+      null;
+
+    const initialStatus = approvedBase ? 'approved' : 'pending';
+
+    const insertRes = await db.query(
+      `INSERT INTO providers (
+         user_id,
+         specialty,
+         criminal_record_url,
+         criminal_record_issued_at,
+         criminal_record_expiry,
+         criminal_record_metadata,
+         insurance_policy_url,
+         insurance_expiry,
+         insurance_metadata,
+         is_custom_specialty,
+         specialty_approval_status,
+         is_visible_in_directory,
+         status
+       )
+       VALUES ($1, $2, $3, $4::date, $5::date, $6::jsonb, $7, $8::date, $9::jsonb, $10, 'approved', TRUE, $11::provider_status)
+       RETURNING
+         id,
+         user_id,
+         specialty,
+         is_custom_specialty,
+         specialty_approval_status,
+         is_visible_in_directory,
+         status,
+         created_at`,
+      [
+        targetUserId,
+        cleanSpecialty,
+        docsBase?.criminal_record_url || null,
+        docsBase?.criminal_record_issued_at || null,
+        docsBase?.criminal_record_expiry || null,
+        JSON.stringify(docsBase?.criminal_record_metadata || {}),
+        docsBase?.insurance_policy_url || null,
+        docsBase?.insurance_expiry || null,
+        JSON.stringify(docsBase?.insurance_metadata || {}),
+        isCustom,
+        initialStatus,
+      ]
+    );
+
+    return res.status(201).json({
+      message: `Especialidad "${cleanSpecialty}" agregada correctamente al prestador.`,
+      provider: insertRes.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al agregar especialidad desde Superadmin:', error);
+    return res.status(500).json({ error: 'Error interno al agregar la especialidad.' });
+  }
+};
+
+/**
  * Lista los prestadores verificados y visibles en el directorio público del Portal Residente,
  * unificados por usuario (`u.id`) y rankeados priorizando miembros Socio Verificado (`verified_pro`),
  * luego membresía activa y finalmente mejor calificación promedio (`rating_avg`).
@@ -3656,6 +3790,7 @@ module.exports = {
   updateMyIdentityDocument,
   updateUserIdentityVerification,
   updateUserAutoVerification,
+  addSpecialtyForProviderByAdmin,
   listVerifiedProviders,
   listPublicProviderShowcase,
   listFavoriteProviders,

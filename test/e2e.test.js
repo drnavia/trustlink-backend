@@ -2333,5 +2333,34 @@ describe('TrustLink Backend — E2E Core Suite', () => {
       ownerToken
     );
     await db.query('DELETE FROM countries WHERE id = $1', [proposedCountryId]);
+
+    // 11. Alta de especialidad a un prestador por Superadmin (POST /api/v1/providers/admin/specialty)
+    //     Un prestador común recibe 403; Superadmin la agrega con 201 heredando estado approved; duplicada -> 409
+    const forbiddenSpecRes = await req(
+      'POST',
+      '/api/v1/providers/admin/specialty',
+      { user_id: p6UserId, specialty: 'Carpintero' },
+      p6Token
+    );
+    assert.equal(forbiddenSpecRes.status, 403);
+
+    const adminSpecRes = await req(
+      'POST',
+      '/api/v1/providers/admin/specialty',
+      { user_id: p6UserId, specialty: 'Carpintero' },
+      superToken
+    );
+    assert.equal(adminSpecRes.status, 201);
+    assert.equal(adminSpecRes.data.provider.specialty, 'Carpintero');
+    assert.equal(adminSpecRes.data.provider.status, 'approved');
+    assert.equal(adminSpecRes.data.provider.specialty_approval_status, 'approved');
+
+    const dupSpecRes = await req(
+      'POST',
+      '/api/v1/providers/admin/specialty',
+      { user_id: p6UserId, specialty: 'carpintero' },
+      superToken
+    );
+    assert.equal(dupSpecRes.status, 409);
   });
 });
