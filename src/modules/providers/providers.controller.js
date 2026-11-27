@@ -109,6 +109,34 @@ const ensureProviderEmployeesColumns = async () => {
 };
 
 /**
+ * Asegura de forma idempotente la tabla `provider_service_packages` para el catálogo
+ * de servicios con precio fijo publicados por cada prestador.
+ *
+ * @returns {Promise<void>}
+ */
+const ensureServicePackagesTable = async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS public.provider_service_packages (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+      provider_id INTEGER NULL REFERENCES public.providers(id) ON DELETE SET NULL,
+      specialty VARCHAR(120) NOT NULL,
+      title VARCHAR(160) NOT NULL,
+      includes_description TEXT NULL,
+      fixed_price NUMERIC(12, 2) NOT NULL CHECK (fixed_price > 0),
+      estimated_duration_minutes INTEGER NOT NULL DEFAULT 60,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+    );
+  `);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_provider_service_packages_user_id
+    ON public.provider_service_packages (user_id);
+  `);
+};
+
+/**
  * Inserta una nueva versión documental en `provider_document_versions` sin modificar ni eliminar
  * versiones anteriores, garantizando trazabilidad histórica de compliance.
  * Si `documentUrl` viene vacío o solo con espacios, omite el registro y devuelve `null`.
@@ -1466,6 +1494,16 @@ const getMyProviderProfile = async (req, res) => {
           service_bio: '',
         };
 
+    await ensureServicePackagesTable();
+    const servicePackagesRes = await db.query(
+      `SELECT id, user_id, provider_id, specialty, title, includes_description,
+              fixed_price, estimated_duration_minutes, is_active, created_at, updated_at
+       FROM public.provider_service_packages
+       WHERE user_id = $1
+       ORDER BY is_active DESC, id DESC`,
+      [userId]
+    );
+
     return res.status(200).json({
       dni: userIdentityRow.dni || null,
       dni_document_url: userIdentityRow.dni_document_url || null,
@@ -1490,6 +1528,7 @@ const getMyProviderProfile = async (req, res) => {
       response_stats: responseStats,
       commercial_profile: commercialProfile,
       public_questions: publicQuestionsRes.rows,
+      service_packages: servicePackagesRes.rows,
       standard_specialties_catalog: STANDARD_SPECIALTIES_CATALOG,
     });
   } catch (error) {
@@ -2424,28 +2463,53 @@ const listVerifiedProviders = async (req, res) => {
 
     const result = await db.query(query, [viewerUserId, viewerCountryId]);
 
-    // Etapa 2.5: Consultar en batch hilos de `visit_requests` para calcular tiempo promedio de respuesta
+    // Etapa 2.5: Consultar en batch hilos de `visit_requests` y catálogo de servicios con precio fijo
+    await ensureServicePackagesTable();
     const providerUserIds = result.rows.map((r) => Number(r.user_id)).filter(Boolean);
     const visitsByUserId = new Map();
+    const packagesByUserId = new Map();
     if (providerUserIds.length > 0) {
-      const visitsRes = await db
-        .query(
-          `
-            SELECT p.user_id, vr.created_at, vr.messages
-            FROM visit_requests vr
-            JOIN providers p ON p.id = vr.provider_id
-            WHERE p.user_id = ANY($1::int[])
-            ORDER BY vr.id DESC
-            LIMIT 1000
-          `,
-          [providerUserIds]
-        )
-        .catch(() => ({ rows: [] }));
+      const [visitsRes, packagesRes] = await Promise.all([
+        db
+          .query(
+            `
+              SELECT p.user_id, vr.created_at, vr.messages
+              FROM visit_requests vr
+              JOIN providers p ON p.id = vr.provider_id
+              WHERE p.user_id = ANY($1::int[])
+              ORDER BY vr.id DESC
+              LIMIT 1000
+            `,
+            [providerUserIds]
+          )
+          .catch(() => ({ rows: [] })),
+        db
+          .query(
+            `
+              SELECT id, user_id, provider_id, specialty, title, includes_description,
+                     fixed_price, estimated_duration_minutes, is_active
+              FROM public.provider_service_packages
+              WHERE user_id = ANY($1::int[]) AND is_active = TRUE
+              ORDER BY fixed_price ASC, id DESC
+            `,
+            [providerUserIds]
+          )
+          .catch(() => ({ rows: [] })),
+      ]);
 
       for (const vr of visitsRes.rows) {
         const uid = Number(vr.user_id);
         if (!visitsByUserId.has(uid)) visitsByUserId.set(uid, []);
         visitsByUserId.get(uid).push(vr);
+      }
+      for (const pkg of packagesRes.rows) {
+        const uid = Number(pkg.user_id);
+        if (!packagesByUserId.has(uid)) packagesByUserId.set(uid, []);
+        packagesByUserId.get(uid).push({
+          ...pkg,
+          fixed_price: Number(pkg.fixed_price || 0),
+          estimated_duration_minutes: Number(pkg.estimated_duration_minutes || 60),
+        });
       }
     }
 
@@ -2508,6 +2572,7 @@ const listVerifiedProviders = async (req, res) => {
         community_activity_count: communityActivityCount,
         avg_response_minutes: responseStats.avg_response_minutes,
         response_label: responseStats.response_label,
+        service_packages: packagesByUserId.get(Number(row.user_id)) || [],
         reputation,
       };
     });
@@ -2745,6 +2810,34 @@ const listPublicProviderShowcase = async (req, res) => {
       })),
     ]);
 
+    await ensureServicePackagesTable();
+    const showcaseUserIds = showcaseRes.rows.map((r) => Number(r.user_id)).filter(Boolean);
+    const showcasePackagesByUserId = new Map();
+    if (showcaseUserIds.length > 0) {
+      const spRes = await db
+        .query(
+          `SELECT id, user_id, provider_id, specialty, title, includes_description,
+                  fixed_price, estimated_duration_minutes
+           FROM public.provider_service_packages
+           WHERE user_id = ANY($1::int[]) AND is_active = TRUE
+           ORDER BY fixed_price ASC, id DESC`,
+          [showcaseUserIds]
+        )
+        .catch(() => ({ rows: [] }));
+      for (const pkg of spRes.rows) {
+        const uid = Number(pkg.user_id);
+        if (!showcasePackagesByUserId.has(uid)) showcasePackagesByUserId.set(uid, []);
+        showcasePackagesByUserId.get(uid).push({
+          id: Number(pkg.id),
+          specialty: pkg.specialty,
+          title: pkg.title,
+          includes_description: pkg.includes_description || null,
+          fixed_price: Number(pkg.fixed_price || 0),
+          estimated_duration_minutes: Number(pkg.estimated_duration_minutes || 60),
+        });
+      }
+    }
+
     const enriched = showcaseRes.rows.map((row) => {
       const hasExpiredDocs = Boolean(row.has_expired_docs);
       const trustBadge = computeProviderTrustLevel({
@@ -2811,6 +2904,7 @@ const listPublicProviderShowcase = async (req, res) => {
         trust_badge: trustBadge,
         is_verified: trustBadge.is_verified,
         can_issue_pass: trustBadge.can_issue_pass,
+        service_packages: showcasePackagesByUserId.get(Number(row.user_id)) || [],
         reputation,
       };
     });
@@ -3773,6 +3867,240 @@ const listExpiryAlertsForAdmin = async (req, res) => {
   }
 };
 
+/**
+ * Lista los servicios con precio fijo publicados por el prestador autenticado.
+ * GET /api/v1/providers/service-packages
+ */
+const listMyServicePackages = async (req, res) => {
+  try {
+    await ensureServicePackagesTable();
+    const userId = Number(req.user.userId);
+    const result = await db.query(
+      `SELECT id, user_id, provider_id, specialty, title, includes_description,
+              fixed_price, estimated_duration_minutes, is_active, created_at, updated_at
+       FROM public.provider_service_packages
+       WHERE user_id = $1
+       ORDER BY is_active DESC, id DESC`,
+      [userId]
+    );
+    return res.status(200).json({ service_packages: result.rows });
+  } catch (error) {
+    console.error('Error al listar servicios con precio fijo:', error);
+    return res.status(500).json({ error: 'Error interno al consultar tus servicios con precio fijo.' });
+  }
+};
+
+/**
+ * Crea un nuevo servicio estandarizado con precio fijo en el catálogo del prestador.
+ * POST /api/v1/providers/service-packages
+ */
+const createServicePackage = async (req, res) => {
+  try {
+    await ensureServicePackagesTable();
+    const userId = Number(req.user.userId);
+    const {
+      specialty,
+      title,
+      includes_description,
+      fixed_price,
+      estimated_duration_minutes,
+    } = req.body || {};
+
+    const cleanTitle = String(title || '').trim().slice(0, 160);
+    const cleanIncludes = includes_description ? String(includes_description).trim().slice(0, 500) : null;
+    const numericPrice = Number(fixed_price);
+    const rawDuration = Number(estimated_duration_minutes || 60);
+    const safeDuration = Number.isFinite(rawDuration)
+      ? Math.min(480, Math.max(30, Math.round(rawDuration)))
+      : 60;
+
+    if (cleanTitle.length < 3) {
+      return res.status(400).json({ error: 'Indicá un nombre claro para el servicio (mínimo 3 caracteres).' });
+    }
+    if (!Number.isFinite(numericPrice) || numericPrice <= 0) {
+      return res.status(400).json({ error: 'Ingresá un precio fijo válido mayor a cero.' });
+    }
+
+    const profilesRes = await db.query(
+      `SELECT id, specialty
+       FROM providers
+       WHERE user_id = $1
+       ORDER BY CASE WHEN status = 'approved'::provider_status THEN 0 ELSE 1 END, id ASC`,
+      [userId]
+    );
+    if (profilesRes.rows.length === 0) {
+      return res.status(400).json({ error: 'Registrá primero al menos una especialidad en tu perfil.' });
+    }
+
+    const requestedSpec = String(specialty || '').trim();
+    const matchedProfile =
+      profilesRes.rows.find(
+        (p) => requestedSpec && String(p.specialty || '').trim().toLowerCase() === requestedSpec.toLowerCase()
+      ) || profilesRes.rows[0];
+    const resolvedSpecialty = requestedSpec || matchedProfile.specialty || 'Servicio General';
+
+    const inserted = await db.query(
+      `INSERT INTO public.provider_service_packages (
+         user_id, provider_id, specialty, title, includes_description,
+         fixed_price, estimated_duration_minutes, is_active
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
+       RETURNING *`,
+      [
+        userId,
+        Number(matchedProfile.id),
+        resolvedSpecialty.slice(0, 120),
+        cleanTitle,
+        cleanIncludes,
+        Number(numericPrice.toFixed(2)),
+        safeDuration,
+      ]
+    );
+
+    return res.status(201).json({
+      message: `Servicio "${cleanTitle}" publicado con precio fijo.`,
+      service_package: inserted.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al crear servicio con precio fijo:', error);
+    return res.status(500).json({ error: 'Error interno al crear el servicio con precio fijo.' });
+  }
+};
+
+/**
+ * Edita o pausa/activa un servicio con precio fijo propio del prestador.
+ * PATCH /api/v1/providers/service-packages/:id
+ */
+const updateServicePackage = async (req, res) => {
+  try {
+    await ensureServicePackagesTable();
+    const userId = Number(req.user.userId);
+    const pkgId = Number(req.params.id);
+    if (!Number.isInteger(pkgId) || pkgId <= 0) {
+      return res.status(400).json({ error: 'ID de servicio inválido.' });
+    }
+
+    const existingRes = await db.query(
+      'SELECT * FROM public.provider_service_packages WHERE id = $1 AND user_id = $2 LIMIT 1',
+      [pkgId, userId]
+    );
+    if (existingRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Servicio con precio fijo no encontrado.' });
+    }
+    const current = existingRes.rows[0];
+    const body = req.body || {};
+
+    const nextTitle =
+      body.title !== undefined ? String(body.title).trim().slice(0, 160) : current.title;
+    if (nextTitle.length < 3) {
+      return res.status(400).json({ error: 'El nombre del servicio debe tener al menos 3 caracteres.' });
+    }
+
+    const nextPrice =
+      body.fixed_price !== undefined ? Number(body.fixed_price) : Number(current.fixed_price);
+    if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
+      return res.status(400).json({ error: 'Ingresá un precio fijo válido mayor a cero.' });
+    }
+
+    const nextDurationRaw =
+      body.estimated_duration_minutes !== undefined
+        ? Number(body.estimated_duration_minutes)
+        : Number(current.estimated_duration_minutes || 60);
+    const nextDuration = Number.isFinite(nextDurationRaw)
+      ? Math.min(480, Math.max(30, Math.round(nextDurationRaw)))
+      : 60;
+
+    const nextIncludes =
+      body.includes_description !== undefined
+        ? body.includes_description
+          ? String(body.includes_description).trim().slice(0, 500)
+          : null
+        : current.includes_description;
+
+    const nextIsActive =
+      typeof body.is_active === 'boolean' ? body.is_active : Boolean(current.is_active);
+
+    let nextSpecialty = current.specialty;
+    let nextProviderId = current.provider_id;
+    if (body.specialty !== undefined && String(body.specialty).trim()) {
+      const requestedSpec = String(body.specialty).trim().slice(0, 120);
+      nextSpecialty = requestedSpec;
+      const specMatch = await db.query(
+        `SELECT id FROM providers
+         WHERE user_id = $1 AND LOWER(TRIM(COALESCE(specialty, ''))) = LOWER(TRIM($2))
+         ORDER BY id ASC LIMIT 1`,
+        [userId, requestedSpec]
+      );
+      if (specMatch.rows.length > 0) {
+        nextProviderId = Number(specMatch.rows[0].id);
+      }
+    }
+
+    const updated = await db.query(
+      `UPDATE public.provider_service_packages
+       SET provider_id = $1,
+           specialty = $2,
+           title = $3,
+           includes_description = $4,
+           fixed_price = $5,
+           estimated_duration_minutes = $6,
+           is_active = $7,
+           updated_at = NOW()
+       WHERE id = $8 AND user_id = $9
+       RETURNING *`,
+      [
+        nextProviderId,
+        nextSpecialty,
+        nextTitle,
+        nextIncludes,
+        Number(nextPrice.toFixed(2)),
+        nextDuration,
+        nextIsActive,
+        pkgId,
+        userId,
+      ]
+    );
+
+    return res.status(200).json({
+      message: 'Servicio actualizado correctamente.',
+      service_package: updated.rows[0],
+    });
+  } catch (error) {
+    console.error('Error al actualizar servicio con precio fijo:', error);
+    return res.status(500).json({ error: 'Error interno al actualizar el servicio.' });
+  }
+};
+
+/**
+ * Elimina un servicio con precio fijo del catálogo del prestador.
+ * DELETE /api/v1/providers/service-packages/:id
+ */
+const deleteServicePackage = async (req, res) => {
+  try {
+    await ensureServicePackagesTable();
+    const userId = Number(req.user.userId);
+    const pkgId = Number(req.params.id);
+    if (!Number.isInteger(pkgId) || pkgId <= 0) {
+      return res.status(400).json({ error: 'ID de servicio inválido.' });
+    }
+
+    const deleted = await db.query(
+      'DELETE FROM public.provider_service_packages WHERE id = $1 AND user_id = $2 RETURNING id, title',
+      [pkgId, userId]
+    );
+    if (deleted.rows.length === 0) {
+      return res.status(404).json({ error: 'Servicio no encontrado o sin permisos.' });
+    }
+
+    return res.status(200).json({
+      message: `Servicio "${deleted.rows[0].title}" eliminado de tu catálogo.`,
+    });
+  } catch (error) {
+    console.error('Error al eliminar servicio con precio fijo:', error);
+    return res.status(500).json({ error: 'Error interno al eliminar el servicio.' });
+  }
+};
+
 module.exports = {
   updateProviderProfile,
   editProviderProfile,
@@ -3783,6 +4111,10 @@ module.exports = {
   addProviderEmployee,
   updateProviderEmployee,
   deleteProviderEmployee,
+  listMyServicePackages,
+  createServicePackage,
+  updateServicePackage,
+  deleteServicePackage,
   getMyProviderProfile,
   listAllProvidersForOps,
   updateComplianceStatus,

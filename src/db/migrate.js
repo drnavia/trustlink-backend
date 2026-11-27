@@ -719,6 +719,40 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 028: Catálogo de Servicios con Precio Fijo (`provider_service_packages`)
+  // Permite que cada prestador publique servicios estandarizados con precio
+  // cerrado y duración estimada, vinculables a `visit_requests.service_package_id`.
+  // ---------------------------------------------------------------------------
+  {
+    id: '028_provider_service_packages',
+    run: async () => {
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS public.provider_service_packages (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+          provider_id INTEGER NULL REFERENCES public.providers(id) ON DELETE SET NULL,
+          specialty VARCHAR(120) NOT NULL,
+          title VARCHAR(160) NOT NULL,
+          includes_description TEXT NULL,
+          fixed_price NUMERIC(12, 2) NOT NULL CHECK (fixed_price > 0),
+          estimated_duration_minutes INTEGER NOT NULL DEFAULT 60,
+          is_active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+        );
+      `);
+      await db.query(`
+        CREATE INDEX IF NOT EXISTS idx_provider_service_packages_user_id
+        ON public.provider_service_packages (user_id);
+      `);
+      await db.query(`
+        ALTER TABLE public.visit_requests
+          ADD COLUMN IF NOT EXISTS service_package_id INTEGER NULL;
+      `);
+    },
+  },
 ];
 
 /**

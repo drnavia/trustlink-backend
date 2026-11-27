@@ -18,6 +18,10 @@ const {
   addProviderEmployee,
   updateProviderEmployee,
   deleteProviderEmployee,
+  listMyServicePackages,
+  createServicePackage,
+  updateServicePackage,
+  deleteServicePackage,
   getMyProviderProfile,
   listAllProvidersForOps,
   updateComplianceStatus,
@@ -79,6 +83,12 @@ router.get('/employees', verifyToken, verifyRoleOrPortal(['provider', 'superadmi
 router.post('/employees', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), addProviderEmployee);
 router.patch('/employees/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), updateProviderEmployee);
 router.delete('/employees/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), deleteProviderEmployee);
+
+// CRUD de catálogo de servicios estandarizados con precio fijo del prestador
+router.get('/service-packages', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), listMyServicePackages);
+router.post('/service-packages', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), createServicePackage);
+router.patch('/service-packages/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), updateServicePackage);
+router.delete('/service-packages/:id', verifyToken, verifyRoleOrPortal(['provider', 'superadmin'], 'provider'), deleteServicePackage);
 
 // ============================================================================
 // 2. AUDITORÍA CENTRALIZADA DE COMPLIANCE — OPS TRUSTLINK (Exclusivo Superadmin)

@@ -213,9 +213,65 @@ const ensureVisitRequestsTable = async () => {
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS quote_status VARCHAR(30) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS quoted_at TIMESTAMP WITHOUT TIME ZONE NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS quote_decided_at TIMESTAMP WITHOUT TIME ZONE NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS service_package_id INTEGER NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS notes TEXT NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS messages JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'pending_provider';`);
+};
+
+/**
+ * Crea de forma idempotente el contrato (`service_contracts`) vinculado a una visita
+ * cuyo precio ya fue acordado (presupuesto aprobado o reserva de servicio con precio fijo).
+ *
+ * @param {Object} visit - Registro de `visit_requests`.
+ * @returns {Promise<Object|null>} Contrato existente o recién creado.
+ */
+const ensureContractForApprovedVisit = async (visit) => {
+  const visitId = Number(visit?.id);
+  const agreedAmount = Number(visit?.quote_amount || 0);
+  if (!visitId || agreedAmount <= 0) return null;
+
+  await db.query(`ALTER TABLE public.service_contracts ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;`);
+  await db.query(`ALTER TABLE public.access_passes ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;`);
+
+  const existingContractRes = await db.query(
+    'SELECT * FROM service_contracts WHERE visit_request_id = $1 ORDER BY id DESC LIMIT 1',
+    [visitId]
+  );
+  if (existingContractRes.rows.length > 0) {
+    return existingContractRes.rows[0];
+  }
+
+  const passRes = await db.query(
+    `SELECT id FROM access_passes
+     WHERE visit_request_id = $1 AND status <> 'cancelled'
+     ORDER BY id DESC
+     LIMIT 1`,
+    [visitId]
+  );
+  const linkedPassId = passRes.rows[0]?.id ? Number(passRes.rows[0].id) : null;
+  const contractDescription =
+    String(visit.service_title || '').trim() ||
+    String(visit.quote_description || '').trim() ||
+    `Servicio acordado · Visita #${visitId}`;
+
+  const insertedContract = await db.query(
+    `INSERT INTO service_contracts (
+       country_id, owner_id, provider_id, pass_id, visit_request_id, description, agreed_amount, status
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+     RETURNING *`,
+    [
+      visit.country_id ? Number(visit.country_id) : null,
+      Number(visit.owner_id),
+      Number(visit.provider_id),
+      linkedPassId,
+      visitId,
+      contractDescription,
+      Number(agreedAmount.toFixed(2)),
+    ]
+  );
+  return insertedContract.rows[0] || null;
 };
 
 /**
@@ -990,6 +1046,7 @@ const createVisitCoordination = async (req, res) => {
       duration_minutes,
       service_title,
       service_specialty,
+      service_package_id,
       notes,
     } = req.body;
 
@@ -999,10 +1056,11 @@ const createVisitCoordination = async (req, res) => {
       });
     }
 
-    const cleanServiceTitle = service_title ? String(service_title).trim().slice(0, 160) : '';
-    const cleanNotes = String(notes || '').trim() || cleanServiceTitle;
+    const requestedPackageId = service_package_id ? Number(service_package_id) : null;
+    let cleanServiceTitle = service_title ? String(service_title).trim().slice(0, 160) : '';
+    let cleanNotes = String(notes || '').trim() || cleanServiceTitle;
 
-    if (!provider_id || !cleanNotes) {
+    if (!provider_id || (!cleanNotes && !requestedPackageId)) {
       return res.status(400).json({
         error: 'Indicá el prestador y el trabajo o mensaje de coordinación de la visita.',
       });
@@ -1023,13 +1081,43 @@ const createVisitCoordination = async (req, res) => {
     }
 
     let resolvedProviderId = Number(providerCheck.rows[0].id);
-    const requestedSpecialty = service_specialty ? String(service_specialty).trim().slice(0, 120) : '';
+    let requestedSpecialty = service_specialty ? String(service_specialty).trim().slice(0, 120) : '';
     const baseSpecialty = providerCheck.rows[0].specialty
       ? String(providerCheck.rows[0].specialty).trim()
       : '';
 
+    // Si viene un `service_package_id`, validar el paquete de precio fijo y precargar precio/título/rubro/duración
+    let matchedPackage = null;
+    if (requestedPackageId && Number.isInteger(requestedPackageId) && requestedPackageId > 0) {
+      const pkgRes = await db.query(
+        `SELECT id, user_id, provider_id, specialty, title, includes_description,
+                fixed_price, estimated_duration_minutes, is_active
+         FROM public.provider_service_packages
+         WHERE id = $1 AND user_id = $2 AND is_active = TRUE
+         LIMIT 1`,
+        [requestedPackageId, Number(providerCheck.rows[0].user_id)]
+      );
+      if (pkgRes.rows.length === 0) {
+        return res.status(404).json({
+          error: 'El servicio con precio fijo seleccionado ya no se encuentra disponible.',
+        });
+      }
+      matchedPackage = pkgRes.rows[0];
+      cleanServiceTitle = String(matchedPackage.title || cleanServiceTitle).trim().slice(0, 160);
+      requestedSpecialty = String(matchedPackage.specialty || requestedSpecialty).trim().slice(0, 120);
+      if (matchedPackage.provider_id) {
+        resolvedProviderId = Number(matchedPackage.provider_id);
+      }
+      const formattedPkgPrice = Number(matchedPackage.fixed_price).toLocaleString('es-AR');
+      const extraUserNote = String(notes || '').trim();
+      cleanNotes = extraUserNote
+        ? `Reserva con precio fijo: ${cleanServiceTitle} ($${formattedPkgPrice}). ${extraUserNote}`
+        : `Reserva con precio fijo: ${cleanServiceTitle} ($${formattedPkgPrice}).`;
+    }
+
     // Si el prestador tiene múltiples rubros, imputar la visita al `provider_id` exacto del rubro solicitado
     if (
+      !matchedPackage?.provider_id &&
       requestedSpecialty &&
       providerCheck.rows[0].user_id &&
       requestedSpecialty.toLowerCase() !== baseSpecialty.toLowerCase()
@@ -1067,20 +1155,29 @@ const createVisitCoordination = async (req, res) => {
       },
     ];
 
+    const effectiveDurationMin = matchedPackage
+      ? Math.max(60, Number(matchedPackage.estimated_duration_minutes || 60))
+      : duration_minutes || 60;
     const cleanPreferredDate = preferred_date ? String(preferred_date).trim() : null;
     const cleanPreferredEndDate = resolveVisitEndDate(
       cleanPreferredDate,
       preferred_end_date,
-      duration_minutes || 60
+      effectiveDurationMin
     );
 
     const inserted = await db.query(
       `INSERT INTO visit_requests (
          country_id, owner_id, provider_id, fraction_number, lot_number,
          preferred_date, preferred_end_date, service_title, service_specialty,
+         service_package_id, quote_amount, quote_description, quote_notes,
+         quote_status, quoted_at, quote_decided_at,
          notes, messages, status
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, 'pending_provider')
+       VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8, $9,
+         $10, $11, $12, $13, $14, $15, $16,
+         $17, $18::jsonb, 'pending_provider'
+       )
        RETURNING *`,
       [
         effectiveCountryId,
@@ -1092,6 +1189,13 @@ const createVisitCoordination = async (req, res) => {
         cleanPreferredEndDate,
         cleanServiceTitle || null,
         cleanServiceSpecialty,
+        matchedPackage ? Number(matchedPackage.id) : null,
+        matchedPackage ? Number(matchedPackage.fixed_price) : null,
+        matchedPackage ? String(matchedPackage.includes_description || matchedPackage.title) : null,
+        matchedPackage ? 'Precio fijo publicado en catálogo' : null,
+        matchedPackage ? 'approved' : null,
+        matchedPackage ? new Date() : null,
+        matchedPackage ? new Date() : null,
         cleanNotes,
         JSON.stringify(initialMessages),
       ]
@@ -1100,7 +1204,9 @@ const createVisitCoordination = async (req, res) => {
     const row = inserted.rows[0];
     // Retornar solicitud creada con el hilo de mensajes normalizado como arreglo
     return res.status(201).json({
-      message: 'Solicitud enviada al prestador. Esperá o coordiná su confirmación antes de emitir el QR.',
+      message: matchedPackage
+        ? `Reserva enviada por $${Number(matchedPackage.fixed_price).toLocaleString('es-AR')} (precio fijo). Al confirmar el turno se genera tu orden de servicio automáticamente.`
+        : 'Solicitud enviada al prestador. Esperá o coordiná su confirmación antes de emitir el QR.',
       visit: {
         ...row,
         messages: parseMessagesArray(row.messages),
@@ -1424,10 +1530,21 @@ const respondVisitRequest = async (req, res) => {
     }
 
     const row = updated.rows[0];
+    let autoCreatedContract = null;
+    if (
+      normalizedAction === 'confirm' &&
+      String(row.quote_status || '').toLowerCase() === 'approved' &&
+      Number(row.quote_amount || 0) > 0
+    ) {
+      autoCreatedContract = await ensureContractForApprovedVisit(row);
+    }
+
     return res.status(200).json({
       message:
         normalizedAction === 'confirm'
-          ? 'Disponibilidad confirmada y horario bloqueado en tu agenda.'
+          ? autoCreatedContract
+            ? `Turno confirmado y contrato generado por $${Number(row.quote_amount).toLocaleString('es-AR')} (precio fijo).`
+            : 'Disponibilidad confirmada y horario bloqueado en tu agenda.'
           : normalizedAction === 'decline'
           ? 'Visita marcada como sin disponibilidad.'
           : 'Contrapropuesta enviada al residente. Esperando su confirmación.',
@@ -1435,6 +1552,7 @@ const respondVisitRequest = async (req, res) => {
         ...row,
         messages: parseMessagesArray(row.messages),
       },
+      contract: autoCreatedContract,
     });
   } catch (error) {
     console.error('Error al responder solicitud de visita:', error);
@@ -1573,10 +1691,21 @@ const respondVisitRequestAsResident = async (req, res) => {
     }
 
     const row = updated.rows[0];
+    let autoCreatedContract = null;
+    if (
+      normalizedAction === 'accept' &&
+      String(row.quote_status || '').toLowerCase() === 'approved' &&
+      Number(row.quote_amount || 0) > 0
+    ) {
+      autoCreatedContract = await ensureContractForApprovedVisit(row);
+    }
+
     return res.status(200).json({
       message:
         normalizedAction === 'accept'
-          ? '¡Visita acordada por ambas partes! Ya quedó reservada en la agenda del prestador y habilitaste el Pase QR.'
+          ? autoCreatedContract
+            ? `¡Turno acordado! Tu orden de servicio por $${Number(row.quote_amount).toLocaleString('es-AR')} (precio fijo) quedó lista en Mis Servicios.`
+            : '¡Visita acordada por ambas partes! Ya quedó reservada en la agenda del prestador y habilitaste el Pase QR.'
           : normalizedAction === 'cancel'
           ? 'Solicitud de visita cancelada.'
           : 'Nueva propuesta enviada al prestador. Esperando su confirmación.',
@@ -1584,6 +1713,7 @@ const respondVisitRequestAsResident = async (req, res) => {
         ...row,
         messages: parseMessagesArray(row.messages),
       },
+      contract: autoCreatedContract,
     });
   } catch (error) {
     console.error('Error al responder visita desde residente:', error);
@@ -2647,47 +2777,11 @@ const respondVisitQuoteAsResident = async (req, res) => {
     }
 
     // Acción 'approve': garantizar columnas de trazabilidad y generar contrato automáticamente (idempotente)
-    await db.query(`ALTER TABLE public.service_contracts ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;`);
-    await db.query(`ALTER TABLE public.access_passes ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;`);
-
-    const existingContractRes = await db.query(
-      'SELECT * FROM service_contracts WHERE visit_request_id = $1 ORDER BY id DESC LIMIT 1',
-      [visitId]
-    );
-
-    let contractRow = existingContractRes.rows[0] || null;
-    if (!contractRow) {
-      const passRes = await db.query(
-        `SELECT id FROM access_passes
-         WHERE visit_request_id = $1 AND status <> 'cancelled'
-         ORDER BY id DESC
-         LIMIT 1`,
-        [visitId]
-      );
-      const linkedPassId = passRes.rows[0]?.id ? Number(passRes.rows[0].id) : null;
-      const contractDescription =
-        String(visit.quote_description || '').trim() ||
-        String(visit.service_title || '').trim() ||
-        `Servicio acordado · Visita #${visitId}`;
-
-      const insertedContract = await db.query(
-        `INSERT INTO service_contracts (
-           country_id, owner_id, provider_id, pass_id, visit_request_id, description, agreed_amount, status
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-         RETURNING *`,
-        [
-          visit.country_id ? Number(visit.country_id) : null,
-          Number(visit.owner_id),
-          Number(visit.provider_id),
-          linkedPassId,
-          visitId,
-          contractDescription,
-          Number(quoteAmount.toFixed(2)),
-        ]
-      );
-      contractRow = insertedContract.rows[0];
-    }
+    const contractRow = await ensureContractForApprovedVisit({
+      ...visit,
+      quote_description: visit.quote_description || visit.service_title,
+      quote_amount: quoteAmount,
+    });
 
     currentMsgs.push({
       id: `msg-${Date.now()}`,
