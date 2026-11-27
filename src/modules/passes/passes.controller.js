@@ -1002,9 +1002,9 @@ const createVisitCoordination = async (req, res) => {
       });
     }
 
-    // Etapa 2: Comprobar existencia del prestador destino y obtener comunidad/rubro de respaldo
+    // Etapa 2: Comprobar existencia del prestador destino y resolver el `provider_id` exacto del rubro elegido
     const providerCheck = await db.query(
-      `SELECT p.id, p.specialty, u.country_id
+      `SELECT p.id, p.user_id, p.specialty, u.country_id
        FROM providers p
        LEFT JOIN users u ON u.id = p.user_id
        WHERE p.id = $1
@@ -1016,6 +1016,32 @@ const createVisitCoordination = async (req, res) => {
       return res.status(404).json({ error: 'El prestador seleccionado no existe.' });
     }
 
+    let resolvedProviderId = Number(providerCheck.rows[0].id);
+    const requestedSpecialty = service_specialty ? String(service_specialty).trim().slice(0, 120) : '';
+    const baseSpecialty = providerCheck.rows[0].specialty
+      ? String(providerCheck.rows[0].specialty).trim()
+      : '';
+
+    // Si el prestador tiene múltiples rubros, imputar la visita al `provider_id` exacto del rubro solicitado
+    if (
+      requestedSpecialty &&
+      providerCheck.rows[0].user_id &&
+      requestedSpecialty.toLowerCase() !== baseSpecialty.toLowerCase()
+    ) {
+      const specialtyMatch = await db.query(
+        `SELECT id
+         FROM providers
+         WHERE user_id = $1
+           AND LOWER(TRIM(COALESCE(specialty, ''))) = LOWER(TRIM($2))
+         ORDER BY CASE WHEN status = 'approved'::provider_status THEN 0 ELSE 1 END, id ASC
+         LIMIT 1`,
+        [Number(providerCheck.rows[0].user_id), requestedSpecialty]
+      );
+      if (specialtyMatch.rows.length > 0) {
+        resolvedProviderId = Number(specialtyMatch.rows[0].id);
+      }
+    }
+
     // Etapa 3: Resolver y validar la ubicación residencial registrada del solicitante
     const locationResult = await resolveResidentLocation(ownerId, fraction_number, lot_number);
     if (locationResult.error) {
@@ -1024,9 +1050,7 @@ const createVisitCoordination = async (req, res) => {
 
     // Etapa 4: Inicializar el hilo de mensajería y persistir la solicitud en `visit_requests`
     const effectiveCountryId = countryId || providerCheck.rows[0].country_id || null;
-    const cleanServiceSpecialty =
-      (service_specialty ? String(service_specialty).trim().slice(0, 120) : '') ||
-      (providerCheck.rows[0].specialty ? String(providerCheck.rows[0].specialty).trim().slice(0, 120) : null);
+    const cleanServiceSpecialty = requestedSpecialty || (baseSpecialty ? baseSpecialty.slice(0, 120) : null);
     const initialMessages = [
       {
         id: `msg-${Date.now()}`,
@@ -1055,7 +1079,7 @@ const createVisitCoordination = async (req, res) => {
       [
         effectiveCountryId,
         ownerId,
-        Number(provider_id),
+        resolvedProviderId,
         locationResult.fractionDisplay,
         locationResult.lotNumber,
         cleanPreferredDate,
@@ -1598,21 +1622,25 @@ const createPass = async (req, res) => {
     }
 
     let resolvedVisitRequestId = null;
+    let visitProviderId = null;
     if (visit_request_id !== undefined && visit_request_id !== null && String(visit_request_id).trim() !== '') {
       const numericVisitId = Number(visit_request_id);
       if (!Number.isNaN(numericVisitId) && numericVisitId > 0) {
         await ensureVisitRequestsTable();
         const vrCheck = await db.query(
-          'SELECT id, owner_id FROM visit_requests WHERE id = $1 LIMIT 1',
+          'SELECT id, owner_id, provider_id FROM visit_requests WHERE id = $1 LIMIT 1',
           [numericVisitId]
         );
         if (vrCheck.rows.length > 0) {
           if (userRole === 'superadmin' || Number(vrCheck.rows[0].owner_id) === ownerId) {
             resolvedVisitRequestId = numericVisitId;
+            visitProviderId = Number(vrCheck.rows[0].provider_id) || null;
           }
         }
       }
     }
+
+    const effectiveProviderId = visitProviderId || Number(provider_id);
 
     const providerCheck = await db.query(
       `SELECT p.id, p.criminal_record_expiry, p.criminal_record_issued_at, p.insurance_expiry, u.country_id
@@ -1620,7 +1648,7 @@ const createPass = async (req, res) => {
        LEFT JOIN users u ON u.id = p.user_id
        WHERE p.id = $1
        LIMIT 1`,
-      [Number(provider_id)]
+      [effectiveProviderId]
     );
 
     if (providerCheck.rows.length === 0) {
@@ -1649,7 +1677,7 @@ const createPass = async (req, res) => {
 
     // Etapa 3: Construir snapshot de ayudantes y bloquear emisión ante vencimiento documental (titular o cuadrilla)
     const authorizedEmployees = await resolveAuthorizedEmployeesSnapshot(
-      Number(provider_id),
+      effectiveProviderId,
       employee_ids
     );
 
@@ -1692,7 +1720,7 @@ const createPass = async (req, res) => {
       ? [
           effectiveCountryId,
           ownerId,
-          Number(provider_id),
+          effectiveProviderId,
           resolvedVisitRequestId,
           locationResult.fractionDisplay,
           locationResult.lotNumber,
@@ -1705,7 +1733,7 @@ const createPass = async (req, res) => {
       : [
           effectiveCountryId,
           ownerId,
-          Number(provider_id),
+          effectiveProviderId,
           resolvedVisitRequestId,
           locationResult.fractionDisplay,
           locationResult.lotNumber,
@@ -1723,7 +1751,7 @@ const createPass = async (req, res) => {
 
     // Etapa 5: Reservar automáticamente la franja horaria en la agenda del prestador
     await upsertScheduleBlock({
-      providerId: Number(provider_id),
+      providerId: effectiveProviderId,
       blockType: 'trustlink_pass',
       title: `Pase QR #${createdPass.id} (${locationResult.fractionDisplay} · Lote ${locationResult.lotNumber})`,
       startAt: start_time,
