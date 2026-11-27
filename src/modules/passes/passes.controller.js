@@ -207,6 +207,12 @@ const ensureVisitRequestsTable = async () => {
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS preferred_end_date VARCHAR(40) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS service_title VARCHAR(160) NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS service_specialty VARCHAR(120) NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS quote_amount NUMERIC(12, 2) NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS quote_description TEXT NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS quote_notes TEXT NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS quote_status VARCHAR(30) NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS quoted_at TIMESTAMP WITHOUT TIME ZONE NULL;`);
+  await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS quote_decided_at TIMESTAMP WITHOUT TIME ZONE NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS notes TEXT NULL;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS messages JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await db.query(`ALTER TABLE visit_requests ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'pending_provider';`);
@@ -2464,6 +2470,257 @@ const verifyPassByQR = async (req, res) => {
   }
 };
 
+/**
+ * Permite al prestador enviar o actualizar un presupuesto formal sobre una solicitud de visita activa.
+ * Registra alcance, monto y nota opcional, cambia `quote_status` a `'sent'` e incorpora el evento al chat.
+ * POST /api/v1/passes/visit-requests/:id/quote
+ *
+ * @param {import('express').Request} req - Body: `{ amount, description, notes? }`.
+ * @param {import('express').Response} res - Respuesta HTTP 200 con la visita actualizada.
+ */
+const submitVisitQuote = async (req, res) => {
+  try {
+    await ensureVisitRequestsTable();
+    const visitId = Number(req.params.id);
+    const requesterId = Number(req.user?.userId || req.user?.id);
+    const userRole = String(req.user?.role || '').toLowerCase();
+    const { amount, description, notes } = req.body || {};
+
+    const numericAmount = Number(amount);
+    const cleanDescription = String(description || '').trim().slice(0, 500);
+    const cleanNotes = notes ? String(notes).trim().slice(0, 400) : null;
+
+    if (!visitId || Number.isNaN(numericAmount) || numericAmount <= 0 || !cleanDescription) {
+      return res.status(400).json({
+        error: 'Indicá el detalle del trabajo presupuestado y un monto mayor a cero.',
+      });
+    }
+
+    const found = await db.query(
+      `SELECT vr.*, p.user_id AS provider_user_id
+       FROM visit_requests vr
+       LEFT JOIN providers p ON p.id = vr.provider_id
+       WHERE vr.id = $1
+       LIMIT 1`,
+      [visitId]
+    );
+    if (found.rows.length === 0) {
+      return res.status(404).json({ error: 'Solicitud de visita no encontrada.' });
+    }
+
+    const visit = found.rows[0];
+    if (userRole !== 'superadmin' && Number(visit.provider_user_id) !== requesterId) {
+      return res.status(403).json({
+        error: 'No tenés permisos para presupuestar esta solicitud.',
+      });
+    }
+
+    const visitStatus = String(visit.status || '').toLowerCase();
+    if (['declined', 'cancelled'].includes(visitStatus)) {
+      return res.status(409).json({
+        error: 'No podés enviar un presupuesto sobre una solicitud cerrada.',
+      });
+    }
+    if (String(visit.quote_status || '').toLowerCase() === 'approved') {
+      return res.status(409).json({
+        error: 'Este presupuesto ya fue aprobado por el residente.',
+      });
+    }
+
+    const roundedAmount = Number(numericAmount.toFixed(2));
+    const currentMsgs = parseMessagesArray(visit.messages);
+    const amountFormatted = roundedAmount.toLocaleString('es-AR');
+    currentMsgs.push({
+      id: `msg-${Date.now()}`,
+      sender_role: 'provider',
+      sender_id: requesterId,
+      text: `Presupuesto enviado: $${amountFormatted} — ${cleanDescription}${cleanNotes ? ` (${cleanNotes})` : ''}`,
+      created_at: new Date().toISOString(),
+    });
+
+    const updated = await db.query(
+      `UPDATE visit_requests
+       SET quote_amount = $1,
+           quote_description = $2,
+           quote_notes = $3,
+           quote_status = 'sent',
+           quoted_at = NOW(),
+           quote_decided_at = NULL,
+           messages = $4::jsonb
+       WHERE id = $5
+       RETURNING *`,
+      [roundedAmount, cleanDescription, cleanNotes, JSON.stringify(currentMsgs), visitId]
+    );
+
+    const row = updated.rows[0];
+    return res.status(200).json({
+      message: `Presupuesto por $${amountFormatted} enviado al residente.`,
+      visit: {
+        ...row,
+        messages: parseMessagesArray(row.messages),
+      },
+    });
+  } catch (error) {
+    console.error('Error al enviar presupuesto de visita:', error);
+    return res.status(500).json({ error: 'Error interno al enviar el presupuesto.' });
+  }
+};
+
+/**
+ * Permite al residente aprobar un presupuesto enviado por el prestador (generando automáticamente
+ * el acuerdo/contrato en `service_contracts` vinculado al expediente) o pedir un ajuste.
+ * POST /api/v1/passes/visit-requests/:id/quote-respond
+ *
+ * @param {import('express').Request} req - Body: `{ action: 'approve'|'request_changes', feedback? }`.
+ * @param {import('express').Response} res - Respuesta HTTP 200 con la visita y contrato creado si aplica.
+ */
+const respondVisitQuoteAsResident = async (req, res) => {
+  try {
+    await ensureVisitRequestsTable();
+    const visitId = Number(req.params.id);
+    const requesterId = Number(req.user?.userId || req.user?.id);
+    const userRole = String(req.user?.role || '').toLowerCase();
+    const { action, feedback } = req.body || {};
+    const normalizedAction = String(action || '').trim().toLowerCase();
+
+    if (!visitId || !['approve', 'request_changes'].includes(normalizedAction)) {
+      return res.status(400).json({
+        error: "Acción inválida. Usá 'approve' o 'request_changes'.",
+      });
+    }
+
+    const found = await db.query(
+      'SELECT * FROM visit_requests WHERE id = $1 LIMIT 1',
+      [visitId]
+    );
+    if (found.rows.length === 0) {
+      return res.status(404).json({ error: 'Solicitud de visita no encontrada.' });
+    }
+
+    const visit = found.rows[0];
+    if (userRole !== 'superadmin' && Number(visit.owner_id) !== requesterId) {
+      return res.status(403).json({
+        error: 'No tenés permisos para responder este presupuesto.',
+      });
+    }
+
+    const currentQuoteStatus = String(visit.quote_status || '').toLowerCase();
+    const quoteAmount = Number(visit.quote_amount || 0);
+    if (currentQuoteStatus !== 'sent' || quoteAmount <= 0) {
+      return res.status(409).json({
+        error: 'No hay un presupuesto pendiente de aprobación en esta solicitud.',
+      });
+    }
+
+    const currentMsgs = parseMessagesArray(visit.messages);
+    const amountFormatted = quoteAmount.toLocaleString('es-AR');
+
+    if (normalizedAction === 'request_changes') {
+      const cleanFeedback = String(feedback || '').trim().slice(0, 400);
+      currentMsgs.push({
+        id: `msg-${Date.now()}`,
+        sender_role: 'owner',
+        sender_id: requesterId,
+        text: cleanFeedback
+          ? `Pedido de ajuste sobre presupuesto ($${amountFormatted}): ${cleanFeedback}`
+          : `Pedido de ajuste sobre presupuesto ($${amountFormatted}).`,
+        created_at: new Date().toISOString(),
+      });
+
+      const updated = await db.query(
+        `UPDATE visit_requests
+         SET quote_status = 'changes_requested',
+             quote_decided_at = NOW(),
+             messages = $1::jsonb
+         WHERE id = $2
+         RETURNING *`,
+        [JSON.stringify(currentMsgs), visitId]
+      );
+
+      return res.status(200).json({
+        message: 'Enviamos tu pedido de ajuste al prestador.',
+        visit: {
+          ...updated.rows[0],
+          messages: parseMessagesArray(updated.rows[0].messages),
+        },
+      });
+    }
+
+    // Acción 'approve': garantizar columnas de trazabilidad y generar contrato automáticamente (idempotente)
+    await db.query(`ALTER TABLE public.service_contracts ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;`);
+    await db.query(`ALTER TABLE public.access_passes ADD COLUMN IF NOT EXISTS visit_request_id INTEGER NULL;`);
+
+    const existingContractRes = await db.query(
+      'SELECT * FROM service_contracts WHERE visit_request_id = $1 ORDER BY id DESC LIMIT 1',
+      [visitId]
+    );
+
+    let contractRow = existingContractRes.rows[0] || null;
+    if (!contractRow) {
+      const passRes = await db.query(
+        `SELECT id FROM access_passes
+         WHERE visit_request_id = $1 AND status <> 'cancelled'
+         ORDER BY id DESC
+         LIMIT 1`,
+        [visitId]
+      );
+      const linkedPassId = passRes.rows[0]?.id ? Number(passRes.rows[0].id) : null;
+      const contractDescription =
+        String(visit.quote_description || '').trim() ||
+        String(visit.service_title || '').trim() ||
+        `Servicio acordado · Visita #${visitId}`;
+
+      const insertedContract = await db.query(
+        `INSERT INTO service_contracts (
+           country_id, owner_id, provider_id, pass_id, visit_request_id, description, agreed_amount, status
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+         RETURNING *`,
+        [
+          visit.country_id ? Number(visit.country_id) : null,
+          Number(visit.owner_id),
+          Number(visit.provider_id),
+          linkedPassId,
+          visitId,
+          contractDescription,
+          Number(quoteAmount.toFixed(2)),
+        ]
+      );
+      contractRow = insertedContract.rows[0];
+    }
+
+    currentMsgs.push({
+      id: `msg-${Date.now()}`,
+      sender_role: 'owner',
+      sender_id: requesterId,
+      text: `Presupuesto aprobado ($${amountFormatted}). Acuerdo registrado en Mis Servicios.`,
+      created_at: new Date().toISOString(),
+    });
+
+    const updated = await db.query(
+      `UPDATE visit_requests
+       SET quote_status = 'approved',
+           quote_decided_at = NOW(),
+           messages = $1::jsonb
+       WHERE id = $2
+       RETURNING *`,
+      [JSON.stringify(currentMsgs), visitId]
+    );
+
+    return res.status(200).json({
+      message: `Presupuesto aprobado por $${amountFormatted}. Ya podés pagar o coordinar el Pase QR de ejecución.`,
+      visit: {
+        ...updated.rows[0],
+        messages: parseMessagesArray(updated.rows[0].messages),
+      },
+      contract: contractRow,
+    });
+  } catch (error) {
+    console.error('Error al responder presupuesto de visita:', error);
+    return res.status(500).json({ error: 'Error interno al responder el presupuesto.' });
+  }
+};
+
 // Exportaciones públicas del módulo de agenda, coordinación de visitas, pases QR y Consola Garita
 module.exports = {
   getProviderSchedule,
@@ -2477,6 +2734,8 @@ module.exports = {
   addVisitRequestMessage,
   respondVisitRequest,
   respondVisitRequestAsResident,
+  submitVisitQuote,
+  respondVisitQuoteAsResident,
   createPass,
   getMyPasses,
   listProviderPasses,

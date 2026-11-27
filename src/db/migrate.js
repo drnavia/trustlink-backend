@@ -699,6 +699,26 @@ const MIGRATIONS = [
       `);
     },
   },
+
+  // ---------------------------------------------------------------------------
+  // 027: Flujo formal de Presupuestos en `visit_requests` (`quote_*`)
+  // Permite que el prestador cotice un trabajo desde la visita y el residente
+  // apruebe (generando automáticamente el contrato/acuerdo) o pida ajustes.
+  // ---------------------------------------------------------------------------
+  {
+    id: '027_visit_requests_quotes',
+    run: async () => {
+      await db.query(`
+        ALTER TABLE public.visit_requests
+          ADD COLUMN IF NOT EXISTS quote_amount NUMERIC(12, 2) NULL,
+          ADD COLUMN IF NOT EXISTS quote_description TEXT NULL,
+          ADD COLUMN IF NOT EXISTS quote_notes TEXT NULL,
+          ADD COLUMN IF NOT EXISTS quote_status VARCHAR(30) NULL,
+          ADD COLUMN IF NOT EXISTS quoted_at TIMESTAMP WITHOUT TIME ZONE NULL,
+          ADD COLUMN IF NOT EXISTS quote_decided_at TIMESTAMP WITHOUT TIME ZONE NULL;
+      `);
+    },
+  },
 ];
 
 /**
