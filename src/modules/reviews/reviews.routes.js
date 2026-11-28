@@ -21,7 +21,7 @@ const router = Router();
 // GESTIÓN Y CONSULTA DE RESEÑAS CRUZADAS (Requiere JWT válido)
 // ============================================================================
 // Listar contratos del usuario autenticado indicando qué reseñas ya fueron emitidas o están pendientes
-router.get('/contracts', verifyToken, verifyRoleOrPortal(['owner', 'family', 'provider', 'superadmin'], 'resident'), getContractsForReviews);
+router.get('/contracts', verifyToken, verifyRoleOrPortal(['owner', 'family', 'provider', 'superadmin'], 'any'), getContractsForReviews);
 
 // Residente califica al prestador por un contrato finalizado (recalcula `rating_avg` en `providers`)
 router.post('/provider', verifyToken, verifyRoleOrPortal(['owner', 'family', 'superadmin'], 'resident'), createProviderReview);

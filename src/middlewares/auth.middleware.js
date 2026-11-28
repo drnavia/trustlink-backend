@@ -84,7 +84,7 @@ const verifyRoleOrPortal = (allowedRoles, portal) => {
     }
 
     const userId = Number(req.user.userId || req.user.id);
-    if (!userId || !['resident', 'provider'].includes(portal)) {
+    if (!userId || !['resident', 'provider', 'any'].includes(portal)) {
       return res.status(403).json({
         error: 'No tienes los permisos necesarios para ejecutar esta acción.',
       });
@@ -93,9 +93,25 @@ const verifyRoleOrPortal = (allowedRoles, portal) => {
     // Paso 2: Verificación en vivo contra PostgreSQL de cuenta activa y bandera del portal solicitado
     try {
       await ensureEvolutionSchema();
-      const col = portal === 'provider' ? 'can_use_provider' : 'can_use_resident';
+      const requestedQueryPortal = String(req.query?.portal || '').trim().toLowerCase();
+      const effectivePortal =
+        portal === 'any'
+          ? requestedQueryPortal === 'provider'
+            ? 'provider'
+            : requestedQueryPortal === 'resident'
+              ? 'resident'
+              : 'any'
+          : portal;
+
+      const allowedExpr =
+        effectivePortal === 'any'
+          ? '(COALESCE(can_use_resident, FALSE) OR COALESCE(can_use_provider, FALSE))'
+          : effectivePortal === 'provider'
+            ? 'COALESCE(can_use_provider, FALSE)'
+            : 'COALESCE(can_use_resident, FALSE)';
+
       const result = await db.query(
-        `SELECT role, ${col} AS allowed FROM users WHERE id = $1 AND is_active = TRUE LIMIT 1`,
+        `SELECT role, ${allowedExpr} AS allowed FROM users WHERE id = $1 AND is_active = TRUE LIMIT 1`,
         [userId]
       );
 
