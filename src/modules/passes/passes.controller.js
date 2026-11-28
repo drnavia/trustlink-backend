@@ -1284,16 +1284,37 @@ const listProviderVisitRequests = async (req, res) => {
       return res.status(200).json({ visits: [] });
     }
 
-    // Etapa 2: Consultar solicitudes entrantes junto a nombre y teléfono del residente
+    // Etapa 2: Garantizar tabla `owner_reviews` y consultar solicitudes junto a reputación cruzada del residente
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS owner_reviews (
+        id SERIAL PRIMARY KEY,
+        contract_id INTEGER NOT NULL REFERENCES service_contracts(id) ON DELETE CASCADE UNIQUE,
+        provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+        owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+        comment TEXT NULL,
+        created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+      );
+    `);
+
     const result = await db.query(
       `SELECT
          vr.*,
          TRIM(CONCAT(COALESCE(u_owner.first_name, ''), ' ', COALESCE(u_owner.last_name, ''))) AS owner_name,
          u_owner.phone AS owner_phone,
-         p.specialty AS provider_specialty
+         p.specialty AS provider_specialty,
+         COALESCE(orv_stats.owner_rating_avg, 0)::numeric(3,2) AS owner_rating_avg,
+         COALESCE(orv_stats.owner_reviews_count, 0)::int AS owner_reviews_count
        FROM visit_requests vr
        LEFT JOIN users u_owner ON vr.owner_id = u_owner.id
        LEFT JOIN providers p ON vr.provider_id = p.id
+       LEFT JOIN LATERAL (
+         SELECT
+           ROUND(AVG(orv.rating)::numeric, 2) AS owner_rating_avg,
+           COUNT(*)::int AS owner_reviews_count
+         FROM owner_reviews orv
+         WHERE orv.owner_id = vr.owner_id
+       ) orv_stats ON TRUE
        WHERE vr.provider_id = ANY($1::int[])
        ORDER BY vr.id DESC`,
       [providerIds]
@@ -1301,6 +1322,8 @@ const listProviderVisitRequests = async (req, res) => {
 
     const visits = result.rows.map((r) => ({
       ...r,
+      owner_rating_avg: Number(r.owner_rating_avg || 0),
+      owner_reviews_count: Number(r.owner_reviews_count || 0),
       messages: parseMessagesArray(r.messages),
     }));
 
